@@ -1343,6 +1343,15 @@ mod tests {
     /// A stand-in for `FlareSolverr`: answers every command with a fresh Cloudflare clearance and
     /// session cookie, and records the request bodies.
     async fn fake_flaresolverr() -> (u16, Arc<Mutex<Vec<serde_json::Value>>>) {
+        fake_flaresolverr_serving("<html><head><title>fake</title></head><body></body></html>")
+            .await
+    }
+
+    /// [`fake_flaresolverr`], answering every page with `page` and HTTP status 200, as the real
+    /// one does even for Cloudflare's own error pages.
+    async fn fake_flaresolverr_serving(
+        page: &'static str,
+    ) -> (u16, Arc<Mutex<Vec<serde_json::Value>>>) {
         use tokio::{
             io::{AsyncReadExt as _, AsyncWriteExt as _},
             net::TcpListener,
@@ -1386,7 +1395,7 @@ mod tests {
                         "status": "ok", "message": "", "session": "fake",
                         "solution": {
                             "url": request["url"], "status": 200, "headers": {},
-                            "response": "<html><head><title>fake</title></head><body></body></html>",
+                            "response": page,
                             "userAgent": "FakeClearanceUA/1.0",
                             "cookies": [
                                 {"name": "_otwarchive_session", "value": "fresh-session-value", "domain": ".archiveofourown.org",
@@ -1541,6 +1550,170 @@ mod tests {
             .expect_err("without the login the update cannot work, whatever is on disk");
         assert_eq!(err.kind, FailureKind::AuthFailed, "{}", err.message);
         assert!(stored.exists(), "the stored book is left untouched");
+    }
+
+    /// A downloader for one story, with `ini` as the personal.ini and no login fallback.
+    fn real_downloader(scratch: &Path, ini: &Path, url_template: &str) -> FanFicFareDownloader {
+        FanFicFareDownloader::new(
+            Arc::new(TokioProcessRunner),
+            FanFicFareConfig {
+                python: std::env::var("FFD_PYTHON").expect("set FFD_PYTHON"),
+                scratch_dir: scratch.to_path_buf(),
+                personal_ini: Some(ini.to_path_buf()),
+                timeout: Duration::from_secs(60),
+                url_template: url_template.into(),
+                redactions: vec![],
+                login_fallback: None,
+            },
+        )
+    }
+
+    /// Story 1001 of FanFicFare's offline site: its stats claim 3 chapters, it has `chapters`.
+    /// That is what an AO3 work looks like when its chapter list page was an error page.
+    fn story_1001_ini(dir: &Path, name: &str, chapters: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "[teststory:1001]\nvalid_entries:title,author,authorId,numChapters\n\
+                 title:Story 1001\nauthor:Nobody\nauthorId:1\nnumChapters:3\n\
+                 chaptertitles:{chapters}\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    /// The chapters FanFicFare itself finds in an EPUB.
+    fn chapters_in(book: &Path) -> usize {
+        let out = std::process::Command::new(std::env::var("FFD_PYTHON").unwrap())
+            .args([
+                "-I",
+                "-c",
+                "import sys; from fanficfare.epubutils import get_dcsource_chaptercount as c; \
+                 print(c(sys.argv[1])[1])",
+            ])
+            .arg(book)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    /// Regression (work 94081816 in production): a Cloudflare error page in place of AO3's
+    /// chapter list made FanFicFare write a book with only a title page and report success,
+    /// because it checks the chapter count the work's stats claim, not the chapters it found.
+    /// `FFD_PYTHON=/path/to/venv/bin/python cargo test -p fanfold-adapter-fanficfare -- --ignored`
+    #[tokio::test]
+    #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
+    async fn a_book_without_chapters_is_a_failure_not_a_download() {
+        let scratch = tempfile::tempdir().unwrap();
+        let empty = story_1001_ini(scratch.path(), "empty.ini", "");
+        let full = story_1001_ini(scratch.path(), "full.ini", "Prologue,Chapter 1");
+        let url = "http://test1.com?sid=1001";
+
+        let err = real_downloader(scratch.path(), &empty, url)
+            .download(&request(None))
+            .await
+            .expect_err("a title page alone is not a book");
+        assert_eq!(err.kind, FailureKind::SiteUnavailable, "{}", err.message);
+
+        // Nor may an update swap a good book for an empty one.
+        let good = real_downloader(scratch.path(), &full, url)
+            .download(&request(None))
+            .await
+            .unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let stored = library.path().join("Story 1001 [1001].epub");
+        std::fs::copy(&good.path, &stored).unwrap();
+        let before = std::fs::read(&stored).unwrap();
+        let err = real_downloader(scratch.path(), &empty, url)
+            .download(&request(Some(stored.clone())))
+            .await
+            .expect_err("an update that finds no chapters is a failure");
+        assert_eq!(err.kind, FailureKind::SiteUnavailable, "{}", err.message);
+        assert_eq!(
+            std::fs::read(&stored).unwrap(),
+            before,
+            "the good book stays"
+        );
+    }
+
+    /// The books the bug above already wrote must heal: FanFicFare refuses to update a book with
+    /// no chapters ("no recognizable chapters") and reports it unchanged, forever.
+    #[tokio::test]
+    #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
+    async fn a_stored_book_without_chapters_is_downloaded_again() {
+        let scratch = tempfile::tempdir().unwrap();
+        let empty = story_1001_ini(scratch.path(), "empty.ini", "");
+        let full = story_1001_ini(scratch.path(), "full.ini", "Prologue,Chapter 1");
+        // Such a book, written the way the bug wrote it: FanFicFare's CLI, no checks.
+        let library = tempfile::tempdir().unwrap();
+        let stored = library.path().join("Story 1001 [1001].epub");
+        let made = std::process::Command::new(std::env::var("FFD_PYTHON").expect("set FFD_PYTHON"))
+            .args([
+                "-I",
+                "-m",
+                "fanficfare.cli",
+                "--non-interactive",
+                "-f",
+                "epub",
+                "-c",
+            ])
+            .arg(&empty)
+            .arg("-o")
+            .arg(format!("output_filename={}", stored.display()))
+            .arg("http://test1.com?sid=1001")
+            .current_dir(scratch.path())
+            .output()
+            .unwrap();
+        assert!(stored.exists(), "{}", String::from_utf8_lossy(&made.stderr));
+        assert_eq!(chapters_in(&stored), 0);
+
+        let book = real_downloader(scratch.path(), &full, "http://test1.com?sid=1001")
+            .download(&request(Some(stored.clone())))
+            .await
+            .unwrap();
+        assert!(book.changed, "{}", book.log);
+        assert_eq!(chapters_in(&book.path), 2, "{}", book.log);
+    }
+
+    /// Cloudflare's error page as `FlareSolverr` returned it for AO3 (trimmed): HTTP 200.
+    const CLOUDFLARE_525: &str = "<html><head><title>archiveofourown.org | 525: SSL handshake \
+        failed</title></head><body><div id=\"cf-wrapper\"><div id=\"cf-error-details\" \
+        class=\"cf-error-details-wrapper\"><h1>SSL handshake failed</h1>\
+        <span class=\"cf-error-type\">Error code 525</span></div></div></body></html>";
+
+    /// The root of the bug above: `FlareSolverr` reports 200 for Cloudflare's error pages, so
+    /// FanFicFare parsed "525: SSL handshake failed" as the AO3 page it had asked for.
+    #[tokio::test]
+    #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
+    async fn a_cloudflare_error_page_through_flaresolverr_is_an_unavailable_site() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (port, seen) = fake_flaresolverr_serving(CLOUDFLARE_525).await;
+        let ini = scratch.path().join("personal.ini");
+        std::fs::write(
+            &ini,
+            format!(
+                "[defaults]\nuse_flaresolverr_proxy:true\nflaresolverr_proxy_protocol:http\n\
+                 flaresolverr_proxy_address:127.0.0.1\nflaresolverr_proxy_port:{port}\n\
+                 flaresolverr_proxy_timeout:10000\n\n[archiveofourown.org]\nis_adult:true\n"
+            ),
+        )
+        .unwrap();
+        let err = real_downloader(
+            scratch.path(),
+            &ini,
+            "https://archiveofourown.org/works/{id}",
+        )
+        .download(&request(None))
+        .await
+        .expect_err("an error page is not AO3's page");
+        assert_eq!(err.kind, FailureKind::SiteUnavailable, "{}", err.message);
+        assert!(err.message.contains("525"), "{}", err.message);
+        assert!(
+            !seen.lock().unwrap().is_empty(),
+            "it went through FlareSolverr"
+        );
     }
 
     /// Opt-in: drives the *real* worker against FanFicFare's offline `test1.com` site.
