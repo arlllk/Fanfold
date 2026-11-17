@@ -92,6 +92,15 @@ impl JobAdmin {
         Ok(job)
     }
 
+    /// `Succeeded | Failed | Cancelled -> Queued`, downloading from scratch: the stored book
+    /// is ignored (and replaced once the new download succeeds), not updated.
+    pub async fn force_retry(&self, id: JobId) -> Result<Job, AdminError> {
+        let mut job = self.load(id).await?;
+        job.force_retry(self.clock.now())?;
+        self.store(&job).await?;
+        Ok(job)
+    }
+
     /// `Queued -> Cancelled`.
     pub async fn cancel(&self, id: JobId) -> Result<Job, AdminError> {
         let mut job = self.load(id).await?;

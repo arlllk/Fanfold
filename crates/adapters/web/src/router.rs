@@ -381,6 +381,26 @@ async fn retry_job(
     }
 }
 
+async fn force_retry_job(
+    State(deps): State<Deps>,
+    headers: HeaderMap,
+    Path(raw): Path<String>,
+) -> Response {
+    let result = match parse_job_id(&raw) {
+        Ok(id) => deps
+            .admin
+            .force_retry(id)
+            .await
+            .map(|_| id)
+            .map_err(|e| admin_problem(&e)),
+        Err(problem) => Err(problem),
+    };
+    match result {
+        Ok(id) => Redirect::to(&format!("/jobs/{id}?forced={id}")).into_response(),
+        Err(problem) => problem_response(&headers, problem),
+    }
+}
+
 async fn cancel_job(
     State(deps): State<Deps>,
     headers: HeaderMap,
@@ -575,6 +595,7 @@ pub fn ui_router(deps: Deps) -> Router {
         .route("/jobs/retry-failed", post(retry_failed))
         .route("/jobs/{id}", get(job_page))
         .route("/jobs/{id}/retry", post(retry_job))
+        .route("/jobs/{id}/force-retry", post(force_retry_job))
         .route("/jobs/{id}/cancel", post(cancel_job))
         .route(
             "/session",
