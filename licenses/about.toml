@@ -1,0 +1,26 @@
+# cargo-about: the third-party Rust licenses shipped in the container image.
+#
+# The image build fails if any dependency that ends up in the binary has a license that is not
+# listed in `accepted`, so a new license is a deliberate decision, never a surprise.
+#   cargo about generate --locked -m crates/server/Cargo.toml -c licenses/about.toml licenses/about.hbs
+# All permissive. Anything else (a copyleft license, a new unknown one) fails the build until
+# someone reads it and decides.
+accepted = [
+    "0BSD",
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0", # root certificate data (webpki-roots)
+]
+
+# Only what is linked into the Linux binary: not other platforms, not tools used to build it,
+# not test-only code.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Fanfold's own crates (publish = false) are covered by the project's license, not listed here.
+private = { ignore = true }

@@ -1,0 +1,9 @@
+# Production code may not panic; tests may.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-print-in-tests = true
+avoid-breaking-exported-api = false
+# Proper nouns used in docs without backticks.
+doc-valid-idents = ["FanFicFare", "AO3", "PostgreSQL", "Syncthing", "ConfigMap", "Kubernetes", "OpenTelemetry", ".."]

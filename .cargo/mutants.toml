@@ -1,0 +1,12 @@
+# cargo-mutants: mutate the logic crates; skip glue and test support.
+exclude_globs = [
+    "crates/testkit/**",
+    "crates/server/src/main.rs",
+    "crates/adapters/postgres/**",
+]
+exclude_re = [
+    # Formatting impls: output is diagnostic only.
+    "impl (std::)?fmt::(Debug|Display)",
+]
+additional_cargo_test_args = ["--workspace"]
+timeout_multiplier = 3.0

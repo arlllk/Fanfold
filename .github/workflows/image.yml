@@ -1,0 +1,161 @@
+# Builds the container image, smoke-tests it hardened (read-only root, no capabilities, a
+# non-default uid), and publishes it to ghcr.io/<owner>/<repo> from main and version tags.
+#
+# Cost control, in order of effect:
+#  * path filters: nothing runs for docs-only changes;
+#  * the Dockerfile separates the dependency build from our own code (cargo-chef), and every
+#    layer is exported to the GitHub Actions cache from main, so a source change recompiles
+#    only our crates and a dependency change is the only expensive build;
+#  * pull requests read that cache but never write it (no cache churn, and a PR cannot
+#    poison it);
+#  * one runner, one platform (linux/amd64: emulated arm64 is ~10x slower), and the publish
+#    step re-uses the layers the test step just built, so nothing is compiled twice;
+#  * a new push to a pull request cancels the run still going for it.
+name: image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths: &paths
+      - Dockerfile
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - fuzz/**
+      - licenses/**
+      - LICENSE-*
+      - .github/workflows/image.yml
+  pull_request:
+    paths: *paths
+  workflow_dispatch:
+
+concurrency:
+  group: image-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+env:
+  # Pull requests (including Renovate's) only read the cache.
+  CACHE_WRITE: ${{ github.event_name != 'pull_request' }}
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write # publishing from main/tags; read-only for forks automatically
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Registry names must be lowercase, and the repository is `arlllk/Fanfold`.
+      - name: Image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Build once into the local image store; publishing later re-uses these layers.
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: fanfold:ci
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=image
+          cache-to: ${{ env.CACHE_WRITE == 'true' && 'type=gha,scope=image,mode=max,ignore-error=true' || '' }}
+
+      # The image has to work the way it is meant to be deployed: read-only root, no
+      # capabilities, no privilege escalation, an arbitrary uid, and only the three writable
+      # directories mounted (as empty tmpfs). `check-config` needs no network or database.
+      - name: Smoke test, hardened
+        env:
+          UID_X: "4242"
+          GID_X: "10001"
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/config.toml" <<'TOML'
+          [database]
+          host = "postgres"
+          name = "fanfold"
+          user = "fanfold"
+          password = { env = "DB_PASSWORD" }
+          [library]
+          path = "/library"
+          [downloader]
+          python = "/opt/venv/bin/python"
+          [downloader.flaresolverr]
+          url = "http://flaresolverr:8191"
+          TOML
+
+          hardened=(--read-only --cap-drop ALL --security-opt no-new-privileges
+            --user "$UID_X:$GID_X"
+            --tmpfs "/tmp/fanfold:rw,nosuid,nodev,noexec,mode=0770,uid=$UID_X,gid=$GID_X"
+            --tmpfs "/run/fanfold:rw,nosuid,nodev,noexec,mode=0700,uid=$UID_X,gid=$GID_X"
+            --tmpfs "/library:rw,nosuid,nodev,noexec,mode=0770,uid=$UID_X,gid=$GID_X"
+            -e DB_PASSWORD=ci
+            -v "$RUNNER_TEMP/config.toml:/etc/fanfold/config.toml:ro")
+
+          echo "::group::configuration is valid"
+          docker run --rm "${hardened[@]}" fanfold:ci check-config
+          echo "::endgroup::"
+
+          echo "::group::FanFicFare is importable by the pinned interpreter"
+          docker run --rm "${hardened[@]}" --entrypoint /opt/venv/bin/python fanfold:ci \
+            -I -c "import fanficfare; print('FanFicFare', fanficfare.__file__)"
+          echo "::endgroup::"
+
+          echo "::group::the root filesystem really is read-only, and the mounts really are writable"
+          docker run --rm "${hardened[@]}" --entrypoint sh fanfold:ci -c '
+            for p in /etc /usr /opt/venv /home; do
+              if touch "$p/probe" 2>/dev/null; then echo "FAIL: $p is writable"; exit 1; fi
+            done
+            for p in /tmp/fanfold /run/fanfold /library; do
+              touch "$p/probe" || { echo "FAIL: $p is not writable"; exit 1; }
+            done
+            test "$(id -u)" != 0 || { echo "FAIL: running as root"; exit 1; }
+            echo ok'
+          echo "::endgroup::"
+
+          echo "::group::and as the image default user, with nothing mounted at all"
+          docker run --rm -e DB_PASSWORD=ci -v "$RUNNER_TEMP/config.toml:/etc/fanfold/config.toml:ro" \
+            --read-only --cap-drop ALL fanfold:ci check-config
+          echo "::endgroup::"
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Same inputs as the build above, so every layer is a cache hit: this only pushes.
+      - name: Publish
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=image

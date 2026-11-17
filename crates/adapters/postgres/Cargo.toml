@@ -1,0 +1,24 @@
+[package]
+name = "fanfold-adapter-postgres"
+description = "JobRepository and BookCatalog adapter on PostgreSQL."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+fanfold-app = { workspace = true }
+fanfold-domain = { workspace = true }
+async-trait = { workspace = true }
+sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros", "json"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+fanfold-testkit = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
