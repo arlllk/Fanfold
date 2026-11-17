@@ -25,6 +25,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import traceback
 import zipfile
@@ -62,6 +63,67 @@ TEXT_RULES = (
 
 # Lines FanFicFare's CLI prints before giving up without raising or calling its failure callback.
 FATAL_PRINTS = ("Login Failed on non-interactive process",)
+
+# Cloudflare's own error page (5xx origin errors, 1xxx blocks). FlareSolverr renders it in its
+# browser and reports HTTP 200, so FanFicFare would parse it as the page it asked for.
+CLOUDFLARE_ERROR_PAGE = re.compile(r'id="cf-error-details"')
+CLOUDFLARE_ERROR_CODE = re.compile(r"Error code:?\s*(\d{3,4})", re.IGNORECASE)
+
+
+def cloudflare_error(text):
+    """The error code if `text` is a Cloudflare error page, else None."""
+    if not isinstance(text, str) or not CLOUDFLARE_ERROR_PAGE.search(text):
+        return None
+    match = CLOUDFLARE_ERROR_CODE.search(text)
+    return int(match.group(1)) if match else 520
+
+
+def status_for_cloudflare(code):
+    """The HTTP status that classifies a Cloudflare error code like the real response would."""
+    if code < 1000:
+        return code  # 520-530: the origin (AO3) is unreachable
+    return 429 if code == 1015 else 403  # 1015 is Cloudflare's rate limit, other 1xxx are blocks
+
+
+def install_cloudflare_guard():
+    """Make FanFicFare's FlareSolverr fetcher fail on a Cloudflare error page.
+
+    Without this, an AO3 page that came back as Cloudflare's "525: SSL handshake failed"
+    is taken for a real page: a chapter list with no chapters gives a book with only a
+    title page, and FanFicFare reports success.
+    """
+    from fanficfare import exceptions
+    from fanficfare.fetchers import fetcher_flaresolverr_proxy as module
+
+    fetcher = module.FlareSolverr_ProxyFetcher
+    if getattr(fetcher.request, "_cloudflare_guard", False):
+        return
+    original = fetcher.request
+
+    def request(self, method, url, headers=None, parameters=None):
+        response = original(self, method, url, headers=headers, parameters=parameters)
+        code = cloudflare_error(getattr(response, "content", None))
+        if code is not None:
+            raise exceptions.HTTPErrorFFF(
+                url,
+                status_for_cloudflare(code),
+                "Cloudflare error code: %d (through FlareSolverr)" % code,
+                None,
+            )
+        return response
+
+    request._cloudflare_guard = True
+    fetcher.request = request
+
+
+def chapter_count(path):
+    """How many chapters FanFicFare finds in an EPUB (None if it cannot read one)."""
+    from fanficfare.epubutils import get_dcsource_chaptercount
+
+    try:
+        return get_dcsource_chaptercount(path)[1]
+    except Exception:  # noqa: BLE001 - not an EPUB FanFicFare can update
+        return None
 
 
 def classify_text(text):
@@ -265,6 +327,7 @@ def main():
     try:
         from fanficfare import cli
 
+        install_cloudflare_guard()
         if request.get("clearance") and request.get("cookies"):
             try:
                 apply_clearance(request)
@@ -272,6 +335,11 @@ def main():
                 emit({"status": "error", "kind": "site_unavailable", "message": str(exc), "log": ""})
                 return
         existing = request.get("existing")
+        if existing and chapter_count(existing) == 0:
+            # A book with no chapters (written before the checks below existed) cannot be
+            # updated: FanFicFare refuses it as "no recognizable chapters", forever. Replace it.
+            print("the stored book has no chapters: downloading it again", file=buffer)
+            existing = None
         before = sha256(existing) if existing else None
         out_path, failures = attempt(cli, request, existing, buffer)
 
@@ -291,6 +359,18 @@ def main():
             return
 
         produced = os.path.exists(out_path) and os.path.getsize(out_path) > 0
+        if produced and chapter_count(out_path) == 0:
+            # FanFicFare checks the chapter count the site *claims* (AO3's work stats), not the
+            # chapters it found, so an error page in place of the chapter list gives a book with
+            # only a title page, "successfully". On an update it would replace a good book.
+            log = buffer.getvalue()
+            emit({
+                "status": "error",
+                "kind": classify_text(log) or "site_unavailable",
+                "message": "FanFicFare found no chapters (the site probably sent an error page)",
+                "log": tail(log),
+            })
+            return
         if produced:
             changed = before is None or sha256(out_path) != before
             emit({
