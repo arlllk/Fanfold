@@ -215,15 +215,15 @@ async fn main() {
         ))),
     )
     .await;
-    log(&repo, flaky, ago(9), LogLevel::Info, "starting attempt 1").await;
-    log(
-        &repo,
-        flaky,
-        ago(9),
-        LogLevel::Error,
-        "failed (site_unavailable): HTTP Error 525 from archiveofourown.org; retrying",
-    )
-    .await;
+    for (minutes, error) in [
+        (9, "HTTP Error 525 from archiveofourown.org"),
+        (4, "Cloudflare error code: 525 (through FlareSolverr)"),
+    ] {
+        let at = ago(minutes);
+        log(&repo, flaky, at, LogLevel::Info, "starting attempt 1").await;
+        let line = format!("failed (site_unavailable): {error}; retrying");
+        log(&repo, flaky, at, LogLevel::Error, &line).await;
+    }
     job(&repo, 2002, "", 40, Some(Err((FailureKind::AuthFailed, "Login failed: check the AO3 username and password. (This story is restricted.)\nsecond line of detail that is not shown in the list")))).await;
     // In progress.
     job(&repo, 3001, "A Study in Unreasonable Doubt, Volume II: The Reckoning of Small Hours and Other Long Titles", 1, None).await;

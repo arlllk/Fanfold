@@ -77,6 +77,8 @@ pub enum Notice {
     Added(JobId),
     AlreadyQueued(JobId),
     Retried(JobId),
+    /// Queued again to download from scratch.
+    ForceRetried(JobId),
     Cancelled(JobId),
     Bulk {
         retried: u32,
@@ -109,6 +111,8 @@ impl Notice {
             Some(Self::AlreadyQueued(job))
         } else if let Some(job) = id("retried_one") {
             Some(Self::Retried(job))
+        } else if let Some(job) = id("forced") {
+            Some(Self::ForceRetried(job))
         } else if let Some(job) = id("cancelled") {
             Some(Self::Cancelled(job))
         } else if let Some(cookies) = num("imported") {
@@ -160,6 +164,7 @@ fn notice_view(notice: Notice) -> Markup {
             Some(id),
         ),
         Notice::Retried(id) => ("", "Queued again.", Some(id)),
+        Notice::ForceRetried(id) => ("", "Queued to download again from scratch.", Some(id)),
         Notice::Cancelled(id) => ("warn", "Cancelled.", Some(id)),
         Notice::Bulk { .. } | Notice::SessionImported { .. } => ("", "", None),
         Notice::SessionCleared => ("warn", "The browser session was forgotten.", None),
@@ -410,6 +415,14 @@ const fn is_retryable(job: &Job) -> bool {
     matches!(job.state, JobState::Failed | JobState::Cancelled)
 }
 
+/// Whether the job can be re-run from scratch, ignoring the stored book.
+const fn can_force(job: &Job) -> bool {
+    matches!(
+        job.state,
+        JobState::Succeeded | JobState::Failed | JobState::Cancelled
+    )
+}
+
 /// One history row. A stacked card on a phone; on a wide screen the same cells line up
 /// as table columns under the header row.
 fn history_row(row: &JobRow, now: Timestamp) -> Markup {
@@ -574,6 +587,9 @@ pub fn job_content(m: &JobModel) -> Markup {
                     @if job.state == JobState::Queued {
                         div { dt { "Next try" } dd { (when(m.now, job.next_attempt_at)) } }
                     }
+                    @if job.force && job.state.is_active() {
+                        div { dt { "Download" } dd { "from scratch" } }
+                    }
                     div { dt { "Updated" } dd { (when(m.now, job.updated_at)) } }
                     div { dt { "Added" } dd { (when(m.now, job.created_at)) } }
                     @if let Some(book) = &m.book { div { dt { "File" } dd class="mono" { (book.file_name) } } }
@@ -581,11 +597,19 @@ pub fn job_content(m: &JobModel) -> Markup {
                 @if let Some(error) = job.last_error.as_deref().filter(|_| job.state != JobState::Succeeded) {
                     p class="err" { (truncate(first_line(error), 400)) }
                 }
-                @if is_retryable(job) || job.state == JobState::Queued {
+                @if can_force(job) || job.state == JobState::Queued {
                     div class="actions" {
                         @if is_retryable(job) {
                             form method="post" action=(format!("/jobs/{}/retry", job.id)) {
                                 button class="btn primary" type="submit" { "Retry" }
+                            }
+                        }
+                        @if can_force(job) {
+                            form method="post" action=(format!("/jobs/{}/force-retry", job.id)) {
+                                button class="btn" type="submit"
+                                    title="Ignore the stored book and download the whole work again. The file is replaced only if the download succeeds." {
+                                    "Re-download from scratch"
+                                }
                             }
                         }
                         @if job.state == JobState::Queued {
@@ -599,12 +623,13 @@ pub fn job_content(m: &JobModel) -> Markup {
         }
         }
         section {
-            h2 { "Log" }
+            h2 { "Log" @if log_runs.len() > 1 { " " span class="hint" { "newest first" } } }
             @if log_runs.is_empty() {
                 p class="empty" { "No log lines yet." }
             } @else {
                 div class="log" tabindex="0" role="log" aria-label="Job log" {
-                    @for (n, run) in log_runs.iter().enumerate() {
+                    // Newest run first; lines within a run stay in order.
+                    @for (n, run) in log_runs.iter().enumerate().rev() {
                         div class="run" {
                             h3 { "Run " (n + 1) @if let Some(first) = run.first() { " · " (when(m.now, first.at)) } }
                             @for line in *run {
@@ -838,6 +863,10 @@ mod tests {
         assert_eq!(
             Notice::from_query(&pairs("retried_one=4")),
             Some(Notice::Retried(JobId::new(4)))
+        );
+        assert_eq!(
+            Notice::from_query(&pairs("forced=6")),
+            Some(Notice::ForceRetried(JobId::new(6)))
         );
         assert_eq!(
             Notice::from_query(&pairs("cancelled=5")),

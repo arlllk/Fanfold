@@ -95,6 +95,10 @@ struct Published {
 /// UI uses it to split a job's log into runs.
 pub const ATTEMPT_START_PREFIX: &str = "starting attempt";
 
+/// Logged at the start of a forced run.
+pub const FORCED_NOTE: &str =
+    "forced: downloading from scratch; the stored book is replaced only if this succeeds";
+
 const MAX_LOG_CHARS: usize = 20_000;
 
 impl Worker {
@@ -155,6 +159,9 @@ impl Worker {
             format!("{ATTEMPT_START_PREFIX} {}", job.attempt + 1),
         )
         .await;
+        if job.force {
+            self.log(job, LogLevel::Info, FORCED_NOTE.to_owned()).await;
+        }
         let started = self.ports.clock.now();
         let result = self.download_and_publish(job).await;
         let took = fanfold_domain::timestamp::since(self.ports.clock.now(), started);
@@ -176,7 +183,7 @@ impl Worker {
             .get(job.work)
             .await
             .map_err(|e| internal(e.to_string()))?;
-        let existing = match &record {
+        let stored = match &record {
             Some(r)
                 if self
                     .ports
@@ -189,7 +196,10 @@ impl Worker {
             }
             _ => None,
         };
-        let updated = existing.is_some();
+        let updated = stored.is_some();
+        // A forced retry replaces the stored book instead of updating it: it may be the one
+        // that was downloaded wrong. It keeps its file name (below) for the e-reader.
+        let existing = if job.force { None } else { stored };
 
         let book = self
             .ports

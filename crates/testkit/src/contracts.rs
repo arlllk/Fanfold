@@ -48,6 +48,7 @@ where
     claim_marks_running_exactly_once(&*make().await).await;
     save_and_get_roundtrip(&*make().await).await;
     save_of_unknown_job_is_not_found(&*make().await).await;
+    a_forced_retry_survives_storage_and_claiming(&*make().await).await;
     recover_requeues_only_running_jobs(&*make().await).await;
     list_matches_the_filter_definitions_and_pages(&*make().await).await;
     counts_agree_with_the_listing(&*make().await).await;
@@ -200,6 +201,24 @@ async fn save_and_get_roundtrip(repo: &dyn JobRepository) {
             .unwrap()
             .is_some()
     );
+}
+
+async fn a_forced_retry_survives_storage_and_claiming(repo: &dyn JobRepository) {
+    let mut job = unwrap_created(repo.enqueue(work(1), JobSource::Mail, t(1)).await.unwrap());
+    assert!(!job.force, "a new job is not forced");
+    job = repo.claim_next(t(2)).await.unwrap().unwrap();
+    job.succeed(t(3)).unwrap();
+    repo.save(&job).await.unwrap();
+
+    job.force_retry(t(4)).unwrap();
+    repo.save(&job).await.unwrap();
+    assert_eq!(repo.get(job.id).await.unwrap().unwrap(), job);
+    let mut claimed = repo.claim_next(t(4)).await.unwrap().unwrap();
+    assert!(claimed.force, "the worker must see the flag");
+
+    claimed.succeed(t(5)).unwrap();
+    repo.save(&claimed).await.unwrap();
+    assert!(!repo.get(job.id).await.unwrap().unwrap().force);
 }
 
 async fn save_of_unknown_job_is_not_found(repo: &dyn JobRepository) {

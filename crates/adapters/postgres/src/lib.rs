@@ -64,7 +64,7 @@ fn backend(e: &sqlx::Error) -> RepoError {
 
 macro_rules! job_columns {
     () => {
-        "id, work_id, source, state, attempt, next_attempt_at_ms, created_at_ms, updated_at_ms, last_error"
+        "id, work_id, source, state, attempt, next_attempt_at_ms, created_at_ms, updated_at_ms, last_error, force"
     };
 }
 
@@ -88,6 +88,7 @@ fn job_from_row(row: &PgRow) -> Result<Job, RepoError> {
         created_at: ts(row.try_get("created_at_ms").map_err(|e| backend(&e))?)?,
         updated_at: ts(row.try_get("updated_at_ms").map_err(|e| backend(&e))?)?,
         last_error: row.try_get("last_error").map_err(|e| backend(&e))?,
+        force: row.try_get("force").map_err(|e| backend(&e))?,
     })
 }
 
@@ -203,7 +204,8 @@ impl JobRepository for PgStore {
 
     async fn save(&self, job: &Job) -> Result<(), RepoError> {
         let result = sqlx::query(
-            "UPDATE jobs SET state = $2, attempt = $3, next_attempt_at_ms = $4, updated_at_ms = $5, last_error = $6
+            "UPDATE jobs SET state = $2, attempt = $3, next_attempt_at_ms = $4, updated_at_ms = $5, last_error = $6,
+                 force = $7
              WHERE id = $1",
         )
         .bind(job.id.get())
@@ -212,6 +214,7 @@ impl JobRepository for PgStore {
         .bind(to_millis(job.next_attempt_at))
         .bind(to_millis(job.updated_at))
         .bind(job.last_error.as_deref())
+        .bind(job.force)
         .execute(&self.pool)
         .await
         .map_err(|e| match &e {
