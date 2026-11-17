@@ -1,0 +1,20 @@
+# Keep the build context small, and keep secrets out of it.
+.env
+.env.*
+.git
+.venv
+target
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
+mutants.out*
+*.profraw
+docs
+scripts
+justfile
+Dockerfile
+.dockerignore
+.github
+renovate.json
+README.md
+config

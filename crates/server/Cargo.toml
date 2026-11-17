@@ -1,0 +1,49 @@
+[package]
+name = "fanfold-server"
+description = "Composition root: declarative config, secret resolution, adapter wiring, worker loop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "fanfold_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fanfold"
+path = "src/main.rs"
+
+[dependencies]
+fanfold-app = { workspace = true }
+fanfold-domain = { workspace = true }
+fanfold-adapter-discord = { workspace = true }
+fanfold-adapter-fanficfare = { workspace = true }
+fanfold-adapter-fs = { workspace = true }
+fanfold-adapter-jmap = { workspace = true }
+fanfold-adapter-postgres = { workspace = true }
+fanfold-adapter-web = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true, features = ["http1", "tokio"] }
+jiff = { workspace = true }
+reqwest = { workspace = true, features = ["rustls"] }
+secrecy = { workspace = true }
+serde = { workspace = true }
+sqlx = { workspace = true, features = ["postgres"] }
+thiserror = { workspace = true }
+toml = { workspace = true, features = ["parse", "serde"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = { workspace = true }
+url = { workspace = true, features = ["serde"] }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+fanfold-testkit = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+proptest = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

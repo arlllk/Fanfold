@@ -1,0 +1,21 @@
+[package]
+name = "fanfold-testkit"
+description = "In-memory fakes of every port, and contract test suites adapters must pass."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+fanfold-app = { workspace = true }
+fanfold-domain = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

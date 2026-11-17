@@ -1,0 +1,26 @@
+Third-party Rust software in the Fanfold container image
+========================================================
+
+Fanfold itself is licensed under 0BSD OR MIT OR Apache-2.0 (see LICENSE-0BSD, LICENSE-MIT and
+LICENSE-APACHE). The binary also contains the open-source Rust libraries below, each under its
+own license. This file is generated at build time by cargo-about from Cargo.lock.
+
+Summary
+-------
+{{#each overview}}
+{{{count}}} x {{{name}}} ({{{id}}})
+{{/each}}
+
+{{#each licenses}}
+========================================================================
+{{{name}}}  [{{{id}}}]
+========================================================================
+
+Used by:
+{{#each used_by}}
+  - {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}}  {{{crate.repository}}}{{/if}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

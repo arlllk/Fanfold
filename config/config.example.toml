@@ -1,0 +1,87 @@
+# fanfold configuration. Static and declarative: change it, then restart.
+#
+# Secrets are never written here. A secret is a reference to where the value lives:
+#   { env  = "NAME" }    environment variable (e.g. a container or orchestrator secret)
+#   { file = "/path" }   file (e.g. a mounted secret file); trailing newline trimmed
+# A plain string in a secret position is rejected at startup.
+#
+# Durations are whole numbers with a unit: "500ms", "30s", "5m", "2h", "1d".
+
+[database]
+host = "postgres"
+port = 5432
+name = "fanfold"
+user = "fanfold"
+password = { file = "/run/secrets/postgres/password" }
+ssl_mode = "require"        # disable | prefer | require | verify-ca | verify-full
+max_connections = 5
+
+[library]
+# The folder your e-reader syncs from (e.g. via Syncthing: add ".tmp" to its .stignore).
+path = "/library"
+scratch = "/tmp/fanfold"     # per-download scratch space
+
+# AO3 login. Required, unless downloads go through FlareSolverr (see [downloader.flaresolverr]).
+# With FlareSolverr it is optional: every download is tried anonymously first, and only a work
+# that AO3 says needs a login uses these credentials (and then keeps the login it earns).
+[ao3]
+username = { env = "AO3_USERNAME" }
+password = { env = "AO3_PASSWORD" }
+
+[downloader]
+python = "/opt/venv/bin/python"   # an interpreter that can `import fanficfare`
+timeout = "10m"
+# Rendered at startup from the secrets above. Point at a memory-backed emptyDir
+# so credentials never touch disk.
+personal_ini = "/run/fanfold/personal.ini"
+
+# Optional. Fetch pages through a FlareSolverr server (a real browser that passes Cloudflare's
+# checks) instead of plain requests. Use it when AO3 answers the plain requests with Cloudflare
+# errors (525) or challenges. Works that need a login are fetched by a fallback that uses
+# FlareSolverr only to pass Cloudflare (AO3 rejects logins sent through it), so keep [ao3]
+# above if you want those; remove it if you only want public works.
+# [downloader.flaresolverr]
+# url = "http://flaresolverr:8191"   # the origin only; FanFicFare appends /v1
+# timeout = "60s"                    # per request, challenge included; below downloader.timeout
+
+[retry]
+max_attempts = 5            # failures that count against a job (outages do not)
+base = "1m"                 # first retry delay; doubles each time
+cap = "1h"
+
+[breaker]
+# After this many consecutive site-wide failures (outage, rate limit, block) stop
+# hitting the site, then probe once after `open_for`, doubling up to `max_open_for`.
+failure_threshold = 3
+open_for = "2m"
+max_open_for = "1h"
+
+[worker]
+poll_interval = "5s"
+concurrency = 1             # AO3 is rate limited; keep this at 1 unless you know better
+
+[web]
+listen = "0.0.0.0:8080"       # the UI: put your gateway's login in front of it
+ops_listen = "0.0.0.0:9090"   # /healthz /readyz /metrics: keep internal
+page_size = 20                # jobs per page in History
+
+# Optional. Without it, works are queued by hand (the UI form, `fanfold enqueue`).
+[mail]
+# Origin the JMAP session is fetched from. The server then tells the client where its API
+# lives, and THAT address must be reachable from here (resolve the server's public name to
+# it, with a valid certificate).
+jmap_url = "https://mail.example.org"
+username = "fanfold@example.org"
+password = { env = "MAIL_PASSWORD" }
+# Matched case-insensitively, ignoring punctuation, so relay-rewritten senders such as
+# "do-not-reply_at_archiveofourown_org_x" still match.
+allowed_senders = ["archiveofourown.org"]
+poll_interval = "60s"       # push wakes the poll sooner
+backfill = "7d"             # first run only: how far back to read
+batch_size = 200
+max_links_per_message = 20
+push = true
+
+# Optional. Without it, notifications are only logged.
+[discord]
+webhook = { env = "DISCORD_WEBHOOK_URL" }

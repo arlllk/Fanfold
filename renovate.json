@@ -1,0 +1,88 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "docker:pinDigests",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "enabledManagers": [
+    "cargo",
+    "dockerfile",
+    "github-actions",
+    "custom.regex"
+  ],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "before 6am on monday"
+    ]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Tool versions in Dockerfile ARGs, marked with a `# renovate: datasource=... depName=...` comment on the line above (cargo-chef, FanFicFare).",
+      "managerFilePatterns": [
+        "/(^|/)Dockerfile[^/]*$/"
+      ],
+      "matchStrings": [
+        "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+)(?:\\s+versioning=(?<versioning>\\S+))?\\s*\\n\\s*ARG\\s+\\w+=(?<currentValue>\\S+)"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "The FanFicFare pin used by `just venv` (kept in step with the Dockerfile by the group rule below).",
+      "managerFilePatterns": [
+        "/(^|/)justfile$/"
+      ],
+      "matchStrings": [
+        "fanficfare==(?<currentValue>[0-9][^'\\s]*)"
+      ],
+      "depNameTemplate": "FanFicFare",
+      "datasourceTemplate": "pypi"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "FanFicFare is pinned in two places; update both in one PR.",
+      "matchDepNames": [
+        "FanFicFare"
+      ],
+      "groupName": "FanFicFare"
+    },
+    {
+      "description": "Base images: the Rust image and the Python image move independently of Cargo/pip, so keep them out of the dependency PRs.",
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "groupName": "container base images"
+    },
+    {
+      "description": "GitHub Actions are pinned by commit; take them together.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "description": "A new Python minor/major under FanFicFare, and a new runner OS, can break the build in ways CI only half covers: propose them on the dependency dashboard and wait for approval. Patch and digest updates stay automatic.",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "python"
+      ],
+      "matchUpdateTypes": [
+        "major",
+        "minor"
+      ],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Runner images: approval first (see above).",
+      "matchDatasources": [
+        "github-runners"
+      ],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}

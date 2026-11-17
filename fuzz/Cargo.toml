@@ -1,0 +1,122 @@
+[package]
+name = "fanfold-fuzz"
+description = "cargo-fuzz targets for every parser that touches untrusted input."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+fanfold-domain = { workspace = true }
+fanfold-adapter-discord = { workspace = true }
+fanfold-adapter-fanficfare = { workspace = true }
+fanfold-adapter-fs = { workspace = true }
+fanfold-adapter-jmap = { workspace = true }
+jmap-client = { workspace = true }
+serde_json = { workspace = true }
+fanfold-adapter-postgres = { workspace = true }
+fanfold-adapter-web = { workspace = true }
+fanfold-app = { workspace = true }
+http = { workspace = true }
+fanfold-server = { workspace = true }
+libfuzzer-sys = { workspace = true }
+secrecy = { workspace = true }
+
+[[bin]]
+name = "work_url"
+path = "fuzz_targets/work_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mail_links"
+path = "fuzz_targets/mail_links.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "book_file_name"
+path = "fuzz_targets/book_file_name.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "worker_output"
+path = "fuzz_targets/worker_output.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ini_render"
+path = "fuzz_targets/ini_render.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discord_sanitize"
+path = "fuzz_targets/discord_sanitize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "form_ids"
+path = "fuzz_targets/form_ids.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "csrf"
+path = "fuzz_targets/csrf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "event_payload"
+path = "fuzz_targets/event_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "html_escape"
+path = "fuzz_targets/html_escape.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jmap_email"
+path = "fuzz_targets/jmap_email.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sender_filter"
+path = "fuzz_targets/sender_filter.rs"
+test = false
+doc = false
+bench = false
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "fanfold-adapter-discord"
+description = "Notifier adapter: Discord webhook."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+fanfold-app = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true, features = ["rustls"] }
+secrecy = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+fanfold-domain = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time"] }
+
+[lints]
+workspace = true
