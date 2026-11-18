@@ -1,8 +1,9 @@
 """One-shot FanFicFare worker.
 
-Protocol (one story per process):
-  stdin : a JSON object  {"url", "existing", "workdir", "personal_ini",
+Protocol (one story or series per process):
+  stdin : a JSON object  {"op", "url", "existing", "workdir", "personal_ini",
                           "cookies", "user_agent", "clearance"}   (the last three are optional)
+          `op` is "download" (the default) or "list_series".
           `cookies` is a Netscape cookies.txt that FanFicFare loads, and the worker writes
           it back (cookies rotate during a run) so the caller can keep them.
           `clearance` {"flaresolverr", "timeout_ms", "url"} asks the worker to have FlareSolverr
@@ -10,8 +11,12 @@ Protocol (one story per process):
   stdout: FanFicFare's own chatter is captured; the LAST line printed is a JSON
           object, either
             {"status": "ok", "path", "title", "changed", "log"}
+          or, for "list_series",
+            {"status": "listed", "name", "summary_html", "complete", "works", "raw", "log"}
           or
             {"status": "error", "kind", "message", "log"}
+          A download's "metadata" (see work_metadata) is what the site said about the work,
+          read from FanFicFare's own story object, with lists kept as lists.
           `kind` is one of: site_unavailable, rate_limited, blocked, auth_failed,
           not_found, transient, permanent  (see fanfold-domain's FailureKind).
 
@@ -20,7 +25,9 @@ knows how FanFicFare reports problems.
 """
 
 import contextlib
+import datetime
 import hashlib
+import html
 import io
 import json
 import logging
@@ -52,6 +59,7 @@ TEXT_RULES = (
     ("retry later", "rate_limited"),
     ("too many requests", "rate_limited"),
     ("login failed", "auth_failed"),
+    ("only available to registered users", "auth_failed"),
     ("adult check required", "permanent"),
     ("does not exist", "not_found"),
     ("downtime", "site_unavailable"),
@@ -114,6 +122,157 @@ def install_cloudflare_guard():
 
     request._cloudflare_guard = True
     fetcher.request = request
+
+
+# FanFicFare metadata list -> tag kind, in AO3's order.
+TAG_LISTS = (
+    ("fandoms", "fandom"),
+    ("ao3categories", "category"),
+    ("warnings", "warning"),
+    ("ships", "relationship"),
+    ("characters", "character"),
+    ("freeformtags", "freeform"),
+)
+SERIES_SLOTS = 10
+AO3_ID = re.compile(r"/(works|series|chapters|users|pseuds)/([^/?#]+)")
+
+
+def ids_in(url):
+    """{"works": "123", "users": "name", ...} from an AO3 URL."""
+    return {kind: value for kind, value in AO3_ID.findall(url or "")}
+
+
+def to_int(value):
+    """AO3 numbers come as text with thousands separators ("179,890"); None if absent."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    digits = re.sub(r"[^0-9]", "", str(value or ""))
+    return int(digits) if digits else None
+
+
+def to_date(value):
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value.strftime("%Y-%m-%d")
+    match = re.match(r"(\d{4}-\d{2}-\d{2})", str(value or ""))
+    return match.group(1) if match else None
+
+
+def json_safe(value):
+    return json.loads(json.dumps(value, default=str))
+
+
+def text(story, key):
+    return html.unescape(str(story.getMetadata(key, removeallentities=False, doreplacements=False) or ""))
+
+
+def work_metadata(adapter):
+    """What FanFicFare learned about the work, in the shape the Rust side records."""
+    story = adapter.story
+    raw = lambda key: story.getMetadataRaw(key)  # noqa: E731
+    lst = lambda key: [html.unescape(str(v)) for v in story.getList(key, doreplacements=False) if str(v).strip()]  # noqa: E731
+
+    authors = []
+    names, urls = lst("author"), lst("authorUrl")
+    for i, name in enumerate(names):
+        found = ids_in(urls[i] if i < len(urls) else "")
+        authors.append({"user": found.get("users", name), "pseud": found.get("pseuds", name)})
+
+    tags = [{"kind": kind, "name": name} for key, kind in TAG_LISTS for name in lst(key)]
+
+    series = []
+    for slot in range(SERIES_SLOTS):
+        label = text(story, "series%02d" % slot)
+        series_id = ids_in(text(story, "series%02dUrl" % slot)).get("series")
+        if not label or not series_id or not series_id.isdigit():
+            continue
+        name, part = label, None
+        match = re.match(r"^(.*) \[(\d+)\]$", label)
+        if match:
+            name, part = match.group(1), int(match.group(2))
+        series.append({"id": int(series_id), "name": name, "part": part})
+
+    chapters = []
+    for number, info in enumerate(adapter.get_chapters(), start=1):
+        chapter_id = ids_in(info.get("url", "")).get("chapters")
+        chapters.append({
+            "number": number,
+            "title": html.unescape(str(info.get("site_title") or info.get("title") or "")),
+            "ao3_id": int(chapter_id) if chapter_id and chapter_id.isdigit() else None,
+            "posted_on": to_date(info.get("date")),
+        })
+
+    posted, _, total = text(story, "chapterslashtotal").partition("/")
+    return {
+        "title": text(story, "title"),
+        "byline": text(story, "byline") or ", ".join(names),
+        "summary_html": str(story.getMetadata("description", removeallentities=False, doreplacements=False) or ""),
+        "language": text(story, "language"),
+        "rating": text(story, "rating"),
+        "restricted": bool(text(story, "restricted")),
+        "status": text(story, "status"),
+        "published_on": to_date(raw("datePublished")),
+        "updated_on": to_date(raw("dateUpdated")),
+        "chapters_posted": to_int(posted) or len(chapters) or to_int(text(story, "numChapters")) or 0,
+        "chapters_total": to_int(total),
+        "words": to_int(text(story, "numWords")) or 0,
+        "authors": authors,
+        "tags": tags,
+        "series": series,
+        "chapters": chapters,
+        "stats": {key: to_int(text(story, key)) for key in ("hits", "kudos", "comments", "bookmarks")},
+        "raw": json_safe(story.getAllMetadata(removeallentities=False, doreplacements=False)),
+    }
+
+
+class AdapterCapture:
+    """Keeps the adapter FanFicFare's CLI creates, so its metadata can be read afterwards."""
+
+    def __init__(self):
+        self.adapter = None
+
+    def install(self):
+        from fanficfare import adapters
+
+        original = adapters.getAdapter
+        if getattr(original, "_captured_by", None) is not None:
+            original = original._original
+
+        def get_adapter(*args, **kwargs):
+            adapter = original(*args, **kwargs)
+            self.adapter = adapter
+            return adapter
+
+        get_adapter._captured_by = self
+        get_adapter._original = original
+        adapters.getAdapter = get_adapter
+
+
+def list_series(cli, request, buffer):
+    """A series page: its name, summary, status and works in order."""
+    from fanficfare.geturls import GetURLs
+
+    options = build_options(cli, request, None, request["url"])
+    try:
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            configuration = cli.get_configuration(request["url"], None, None, options)
+            page = GetURLs(configuration).get_urls_from_page(request["url"])
+    finally:
+        save_cookies(options, request)
+    works = []
+    for url in page.get("urllist", []):
+        work = ids_in(url).get("works")
+        if work and work.isdigit() and int(work) not in works:
+            works.append(int(work))
+    status = page.get("status")
+    return {
+        "name": html.unescape(str(page.get("name") or "")),
+        "summary_html": str(page.get("desc") or ""),
+        "complete": {"Completed": True, "In-Progress": False}.get(status),
+        "works": works,
+        "raw": json_safe({key: page[key] for key in page if key != "desc"}),
+    }
 
 
 def chapter_count(path):
@@ -328,12 +487,27 @@ def main():
         from fanficfare import cli
 
         install_cloudflare_guard()
+        capture = AdapterCapture()
+        capture.install()
         if request.get("clearance") and request.get("cookies"):
             try:
                 apply_clearance(request)
             except ClearanceError as exc:
                 emit({"status": "error", "kind": "site_unavailable", "message": str(exc), "log": ""})
                 return
+        if request.get("op") == "list_series":
+            listing = list_series(cli, request, buffer)
+            if not listing["works"]:
+                log = buffer.getvalue()
+                emit({
+                    "status": "error",
+                    "kind": classify_text(log) or "site_unavailable",
+                    "message": "the series page listed no works (the site probably sent an error page)",
+                    "log": tail(log),
+                })
+                return
+            emit(dict(listing, status="listed", log=tail(buffer.getvalue())))
+            return
         existing = request.get("existing")
         if existing and chapter_count(existing) == 0:
             # A book with no chapters (written before the checks below existed) cannot be
@@ -373,11 +547,18 @@ def main():
             return
         if produced:
             changed = before is None or sha256(out_path) != before
+            metadata = None
+            if capture.adapter is not None:
+                try:
+                    metadata = work_metadata(capture.adapter)
+                except Exception:  # noqa: BLE001 - the book matters more than its details
+                    print("could not read the work's details:\n" + traceback.format_exc(), file=buffer)
             emit({
                 "status": "ok",
                 "path": out_path,
                 "title": epub_title(out_path),
                 "changed": changed,
+                "metadata": metadata,
                 "log": tail(buffer.getvalue()),
             })
             return

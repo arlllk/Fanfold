@@ -4,6 +4,9 @@
 //! (Syncthing) never sees a half-written EPUB. The temp file lives in `<root>/.tmp`
 //! on the same filesystem, which is what makes the rename atomic; add `.tmp` to the
 //! folder's `.stignore` so staging files are not synced.
+//!
+//! Library paths are relative (`series/<folder>/<file>`, `single/<byline>/<file>`, see
+//! `fanfold_domain::library`); their folders are created on first publish.
 
 use std::{
     fs::{self, File},
@@ -13,28 +16,13 @@ use std::{
 
 use async_trait::async_trait;
 use fanfold_app::{error::StoreError, ports::LibraryStore};
+use fanfold_domain::library::is_valid_library_path;
 
 const STAGING_DIR: &str = ".tmp";
-const MAX_NAME_BYTES: usize = 255;
 
 #[derive(Debug, Clone)]
 pub struct FsLibrary {
     root: PathBuf,
-}
-
-/// A library file name must be a plain, visible `*.epub` file name: no
-/// directories, no traversal, no control characters.
-#[must_use]
-pub fn is_valid_file_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= MAX_NAME_BYTES
-        && !name.starts_with('.')
-        && Path::new(name)
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("epub"))
-        && !name
-            .chars()
-            .any(|c| c == '/' || c == '\\' || c.is_control())
 }
 
 impl FsLibrary {
@@ -65,7 +53,11 @@ impl FsLibrary {
                 .as_file()
                 .set_permissions(fs::Permissions::from_mode(0o644))?;
         }
-        staged.persist(root.join(file_name)).map_err(|e| e.error)?;
+        let target = root.join(file_name);
+        if let Some(folder) = target.parent() {
+            fs::create_dir_all(folder)?;
+        }
+        staged.persist(target).map_err(|e| e.error)?;
         if let Err(e) = fs::remove_file(source) {
             tracing::debug!(error = %e, source = %source.display(), "could not remove published source");
         }
@@ -80,7 +72,7 @@ impl LibraryStore for FsLibrary {
     }
 
     async fn exists(&self, file_name: &str) -> Result<bool, StoreError> {
-        if !is_valid_file_name(file_name) {
+        if !is_valid_library_path(file_name) {
             return Err(StoreError::InvalidName(file_name.to_owned()));
         }
         tokio::fs::try_exists(self.root.join(file_name))
@@ -89,7 +81,7 @@ impl LibraryStore for FsLibrary {
     }
 
     async fn publish(&self, source: &Path, file_name: &str) -> Result<(), StoreError> {
-        if !is_valid_file_name(file_name) {
+        if !is_valid_library_path(file_name) {
             return Err(StoreError::InvalidName(file_name.to_owned()));
         }
         let (root, source, file_name) = (
@@ -106,7 +98,10 @@ impl LibraryStore for FsLibrary {
 
 #[cfg(test)]
 mod tests {
-    use fanfold_domain::work::{WorkId, book_file_name};
+    use fanfold_domain::{
+        library::{series_book_path, series_folder, single_book_path},
+        work::{SeriesId, WorkId},
+    };
     use proptest::prelude::*;
 
     use super::*;
@@ -181,7 +176,10 @@ mod tests {
         let src = source(dir.path(), "a.epub", "x");
         for name in [
             "../escape.epub",
-            "a/b.epub",
+            "single/../../escape.epub",
+            "a/b/c/d.epub",
+            "/abs.epub",
+            "single/.hidden/x.epub",
             "..\\x.epub",
             ".hidden.epub",
             "",
@@ -224,19 +222,62 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn books_are_filed_into_their_folders_which_are_created_on_demand() {
+        let (dir, lib) = library();
+        let folder = series_folder("The Malfoid Saga", SeriesId::new(6_704_161).unwrap());
+        let in_series = series_book_path(
+            &folder,
+            Some(2),
+            "The Diary",
+            WorkId::new(94_243_666).unwrap(),
+        );
+        let single = single_book_path("TheBrokenPokeman", "Solo", WorkId::new(7).unwrap());
+        lib.publish(&source(dir.path(), "a.epub", "series book"), &in_series)
+            .await
+            .unwrap();
+        lib.publish(&source(dir.path(), "b.epub", "single book"), &single)
+            .await
+            .unwrap();
+        let root = dir.path().join("library");
+        assert_eq!(
+            fs::read_to_string(
+                root.join("series/The Malfoid Saga 6704161/02 The Diary 94243666.epub")
+            )
+            .unwrap(),
+            "series book"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("single/TheBrokenPokeman/Solo 7.epub")).unwrap(),
+            "single book"
+        );
+        assert!(lib.exists(&in_series).await.unwrap());
+        let leftovers: Vec<_> = fs::read_dir(lib.staging_dir()).unwrap().collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
     proptest! {
-        /// The domain's file-name generator and the adapter's validator must agree:
-        /// whatever title a site hands us, the derived name is publishable.
+        /// The domain's path generator and the adapter's validator must agree: whatever a
+        /// site hands us, the derived paths are publishable.
         #[test]
-        fn every_derived_book_name_is_publishable(title in "\\PC*", id in 1u64..=i64::MAX as u64) {
-            let name = book_file_name(&title, WorkId::new(id).unwrap());
-            prop_assert!(is_valid_file_name(&name), "{name:?}");
+        fn every_derived_path_is_publishable(
+            title in "\\PC*", byline in "\\PC*", name in "\\PC*",
+            id in 1u64..=i64::MAX as u64, part in proptest::option::of(0u32..1000),
+        ) {
+            let work = WorkId::new(id).unwrap();
+            let single = single_book_path(&byline, &title, work);
+            prop_assert!(is_valid_library_path(&single), "{single:?}");
+            let folder = series_folder(&name, SeriesId::new(id).unwrap());
+            let in_series = series_book_path(&folder, part, &title, work);
+            prop_assert!(is_valid_library_path(&in_series), "{in_series:?}");
         }
 
         #[test]
-        fn names_with_separators_are_never_valid(prefix in "\\PC*", suffix in "\\PC*", sep in prop::sample::select(vec!['/', '\\'])) {
-            let name = format!("{prefix}{sep}{suffix}.epub");
-            prop_assert!(!is_valid_file_name(&name));
+        fn traversal_is_never_valid(prefix in "\\PC{0,20}", suffix in "\\PC{0,20}") {
+            let up = format!("{prefix}/../{suffix}.epub");
+            prop_assert!(!is_valid_library_path(&up));
+            let back = format!("{prefix}\\{suffix}.epub");
+            prop_assert!(!is_valid_library_path(&back));
         }
     }
 }

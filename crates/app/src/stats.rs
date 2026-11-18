@@ -297,6 +297,7 @@ mod tests {
             enqueued: 2,
             already_active: 5,
             truncated_links: 0,
+            series_followed: 0,
         };
         stats.record_poll(&report, t(500));
         stats.record_poll(&report, t(900));

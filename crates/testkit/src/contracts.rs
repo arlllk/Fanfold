@@ -10,15 +10,19 @@ use fanfold_app::{
     error::RepoError,
     ports::{
         BookCatalog, BookRecord, CursorStore, EnqueueOutcome, Event, EventSource, JobCounts,
-        JobFilter, JobRepository, LogEntry, LogLevel, SessionStore,
+        JobFilter, JobRepository, LogEntry, LogLevel, MetadataStore, SessionStore,
     },
 };
 use fanfold_domain::{
     Timestamp,
     failure::FailureKind,
-    job::{Job, JobId, JobSource, JobState},
+    job::{Job, JobId, JobSource, JobState, Target},
+    metadata::{
+        Author, Chapter, FollowSource, SeriesFacts, SeriesMetadata, SeriesPart, Tag, TagKind,
+        WorkFacts, WorkMetadata, WorkStats,
+    },
     retry::RetryPolicy,
-    work::WorkId,
+    work::{SeriesId, WorkId},
 };
 
 fn t(secs: i64) -> Timestamp {
@@ -48,6 +52,7 @@ where
     claim_marks_running_exactly_once(&*make().await).await;
     save_and_get_roundtrip(&*make().await).await;
     save_of_unknown_job_is_not_found(&*make().await).await;
+    a_work_and_a_series_with_the_same_number_are_different_targets(&*make().await).await;
     a_forced_retry_survives_storage_and_claiming(&*make().await).await;
     recover_requeues_only_running_jobs(&*make().await).await;
     list_matches_the_filter_definitions_and_pages(&*make().await).await;
@@ -58,7 +63,10 @@ where
 }
 
 async fn enqueue_creates_a_queued_job(repo: &dyn JobRepository) {
-    let EnqueueOutcome::Created(job) = repo.enqueue(work(1), JobSource::Mail, t(10)).await.unwrap()
+    let EnqueueOutcome::Created(job) = repo
+        .enqueue(Target::Work(work(1)), JobSource::Mail, t(10))
+        .await
+        .unwrap()
     else {
         panic!("first enqueue must create");
     };
@@ -73,13 +81,15 @@ async fn enqueue_creates_a_queued_job(repo: &dyn JobRepository) {
 }
 
 async fn enqueue_is_idempotent_while_active(repo: &dyn JobRepository) {
-    let EnqueueOutcome::Created(first) =
-        repo.enqueue(work(1), JobSource::Mail, t(10)).await.unwrap()
+    let EnqueueOutcome::Created(first) = repo
+        .enqueue(Target::Work(work(1)), JobSource::Mail, t(10))
+        .await
+        .unwrap()
     else {
         panic!("must create");
     };
     assert_eq!(
-        repo.enqueue(work(1), JobSource::Manual, t(11))
+        repo.enqueue(Target::Work(work(1)), JobSource::Manual, t(11))
             .await
             .unwrap(),
         EnqueueOutcome::AlreadyActive(first.id),
@@ -88,12 +98,16 @@ async fn enqueue_is_idempotent_while_active(repo: &dyn JobRepository) {
     let running = repo.claim_next(t(12)).await.unwrap().unwrap();
     assert_eq!(running.id, first.id);
     assert_eq!(
-        repo.enqueue(work(1), JobSource::Mail, t(13)).await.unwrap(),
+        repo.enqueue(Target::Work(work(1)), JobSource::Mail, t(13))
+            .await
+            .unwrap(),
         EnqueueOutcome::AlreadyActive(first.id),
         "running duplicate"
     );
-    let EnqueueOutcome::Created(other) =
-        repo.enqueue(work(2), JobSource::Mail, t(14)).await.unwrap()
+    let EnqueueOutcome::Created(other) = repo
+        .enqueue(Target::Work(work(2)), JobSource::Mail, t(14))
+        .await
+        .unwrap()
     else {
         panic!("a different work is independent");
     };
@@ -101,15 +115,20 @@ async fn enqueue_is_idempotent_while_active(repo: &dyn JobRepository) {
 }
 
 async fn finished_work_can_be_enqueued_again(repo: &dyn JobRepository) {
-    let EnqueueOutcome::Created(_) = repo.enqueue(work(1), JobSource::Mail, t(1)).await.unwrap()
+    let EnqueueOutcome::Created(_) = repo
+        .enqueue(Target::Work(work(1)), JobSource::Mail, t(1))
+        .await
+        .unwrap()
     else {
         panic!("must create");
     };
     let mut job = repo.claim_next(t(2)).await.unwrap().unwrap();
     job.succeed(t(3)).unwrap();
     repo.save(&job).await.unwrap();
-    let EnqueueOutcome::Created(again) =
-        repo.enqueue(work(1), JobSource::Mail, t(4)).await.unwrap()
+    let EnqueueOutcome::Created(again) = repo
+        .enqueue(Target::Work(work(1)), JobSource::Mail, t(4))
+        .await
+        .unwrap()
     else {
         panic!("a finished job must not block a new one (an author may update a work)");
     };
@@ -118,9 +137,21 @@ async fn finished_work_can_be_enqueued_again(repo: &dyn JobRepository) {
 
 async fn claim_respects_due_time_and_order(repo: &dyn JobRepository) {
     assert_eq!(repo.claim_next(t(100)).await.unwrap(), None, "empty queue");
-    let later = unwrap_created(repo.enqueue(work(1), JobSource::Mail, t(50)).await.unwrap());
-    let sooner = unwrap_created(repo.enqueue(work(2), JobSource::Mail, t(20)).await.unwrap());
-    let tied = unwrap_created(repo.enqueue(work(3), JobSource::Mail, t(20)).await.unwrap());
+    let later = unwrap_created(
+        repo.enqueue(Target::Work(work(1)), JobSource::Mail, t(50))
+            .await
+            .unwrap(),
+    );
+    let sooner = unwrap_created(
+        repo.enqueue(Target::Work(work(2)), JobSource::Mail, t(20))
+            .await
+            .unwrap(),
+    );
+    let tied = unwrap_created(
+        repo.enqueue(Target::Work(work(3)), JobSource::Mail, t(20))
+            .await
+            .unwrap(),
+    );
 
     assert_eq!(
         repo.claim_next(t(10)).await.unwrap(),
@@ -146,7 +177,11 @@ async fn claim_respects_due_time_and_order(repo: &dyn JobRepository) {
 }
 
 async fn claim_marks_running_exactly_once(repo: &dyn JobRepository) {
-    let queued = unwrap_created(repo.enqueue(work(1), JobSource::Mail, t(1)).await.unwrap());
+    let queued = unwrap_created(
+        repo.enqueue(Target::Work(work(1)), JobSource::Mail, t(1))
+            .await
+            .unwrap(),
+    );
     let claimed = repo.claim_next(t(5)).await.unwrap().unwrap();
     assert_eq!(claimed.id, queued.id);
     assert_eq!(claimed.state, JobState::Running);
@@ -164,7 +199,7 @@ async fn claim_marks_running_exactly_once(repo: &dyn JobRepository) {
 
 async fn save_and_get_roundtrip(repo: &dyn JobRepository) {
     unwrap_created(
-        repo.enqueue(work(1), JobSource::Manual, t(1))
+        repo.enqueue(Target::Work(work(1)), JobSource::Manual, t(1))
             .await
             .unwrap(),
     );
@@ -204,7 +239,11 @@ async fn save_and_get_roundtrip(repo: &dyn JobRepository) {
 }
 
 async fn a_forced_retry_survives_storage_and_claiming(repo: &dyn JobRepository) {
-    let mut job = unwrap_created(repo.enqueue(work(1), JobSource::Mail, t(1)).await.unwrap());
+    let mut job = unwrap_created(
+        repo.enqueue(Target::Work(work(1)), JobSource::Mail, t(1))
+            .await
+            .unwrap(),
+    );
     assert!(!job.force, "a new job is not forced");
     job = repo.claim_next(t(2)).await.unwrap().unwrap();
     job.succeed(t(3)).unwrap();
@@ -221,19 +260,50 @@ async fn a_forced_retry_survives_storage_and_claiming(repo: &dyn JobRepository) 
     assert!(!repo.get(job.id).await.unwrap().unwrap().force);
 }
 
+async fn a_work_and_a_series_with_the_same_number_are_different_targets(repo: &dyn JobRepository) {
+    let series = Target::Series(SeriesId::new(1).unwrap());
+    let as_work = unwrap_created(
+        repo.enqueue(Target::Work(work(1)), JobSource::Mail, t(1))
+            .await
+            .unwrap(),
+    );
+    let as_series = unwrap_created(repo.enqueue(series, JobSource::Manual, t(2)).await.unwrap());
+    assert_eq!(
+        repo.get(as_series.id).await.unwrap().unwrap().target,
+        series
+    );
+    assert_eq!(
+        repo.enqueue(series, JobSource::Manual, t(3)).await.unwrap(),
+        EnqueueOutcome::AlreadyActive(as_series.id)
+    );
+    let first = repo.claim_next(t(5)).await.unwrap().unwrap();
+    assert_eq!(
+        (first.id, first.target),
+        (as_work.id, Target::Work(work(1)))
+    );
+}
+
 async fn save_of_unknown_job_is_not_found(repo: &dyn JobRepository) {
     let ghost = fanfold_domain::job::Job::new(JobId::new(424_242), work(9), JobSource::Mail, t(1));
     assert_eq!(repo.save(&ghost).await, Err(RepoError::NotFound(ghost.id)));
 }
 
 async fn recover_requeues_only_running_jobs(repo: &dyn JobRepository) {
-    let orphan = unwrap_created(repo.enqueue(work(1), JobSource::Mail, t(1)).await.unwrap());
-    let waiting = unwrap_created(
-        repo.enqueue(work(2), JobSource::Mail, t(500))
+    let orphan = unwrap_created(
+        repo.enqueue(Target::Work(work(1)), JobSource::Mail, t(1))
             .await
             .unwrap(),
     );
-    let mut done = unwrap_created(repo.enqueue(work(3), JobSource::Mail, t(2)).await.unwrap());
+    let waiting = unwrap_created(
+        repo.enqueue(Target::Work(work(2)), JobSource::Mail, t(500))
+            .await
+            .unwrap(),
+    );
+    let mut done = unwrap_created(
+        repo.enqueue(Target::Work(work(3)), JobSource::Mail, t(2))
+            .await
+            .unwrap(),
+    );
     assert_eq!(repo.claim_next(t(10)).await.unwrap().unwrap().id, orphan.id);
     done = {
         let claimed = repo.claim_next(t(10)).await.unwrap().unwrap();
@@ -272,7 +342,7 @@ async fn populate(repo: &dyn JobRepository) -> Vec<JobId> {
     // queued, never failed
     ids.push(
         unwrap_created(
-            repo.enqueue(work(1), JobSource::Mail, next(1))
+            repo.enqueue(Target::Work(work(1)), JobSource::Mail, next(1))
                 .await
                 .unwrap(),
         )
@@ -280,7 +350,7 @@ async fn populate(repo: &dyn JobRepository) -> Vec<JobId> {
     );
     // succeeded
     let id = unwrap_created(
-        repo.enqueue(work(2), JobSource::Mail, next(1))
+        repo.enqueue(Target::Work(work(2)), JobSource::Mail, next(1))
             .await
             .unwrap(),
     )
@@ -291,7 +361,7 @@ async fn populate(repo: &dyn JobRepository) -> Vec<JobId> {
     ids.push(id);
     // failed for good
     let id = unwrap_created(
-        repo.enqueue(work(3), JobSource::Manual, next(1))
+        repo.enqueue(Target::Work(work(3)), JobSource::Manual, next(1))
             .await
             .unwrap(),
     )
@@ -303,7 +373,7 @@ async fn populate(repo: &dyn JobRepository) -> Vec<JobId> {
     ids.push(id);
     // queued again after a failure
     let id = unwrap_created(
-        repo.enqueue(work(4), JobSource::Mail, next(1))
+        repo.enqueue(Target::Work(work(4)), JobSource::Mail, next(1))
             .await
             .unwrap(),
     )
@@ -315,7 +385,7 @@ async fn populate(repo: &dyn JobRepository) -> Vec<JobId> {
     ids.push(id);
     // running
     let id = unwrap_created(
-        repo.enqueue(work(5), JobSource::Mail, next(1))
+        repo.enqueue(Target::Work(work(5)), JobSource::Mail, next(1))
             .await
             .unwrap(),
     )
@@ -324,7 +394,7 @@ async fn populate(repo: &dyn JobRepository) -> Vec<JobId> {
     ids.push(id);
     // cancelled
     let id = unwrap_created(
-        repo.enqueue(work(6), JobSource::Mail, next(1))
+        repo.enqueue(Target::Work(work(6)), JobSource::Mail, next(1))
             .await
             .unwrap(),
     )
@@ -423,14 +493,22 @@ async fn counts_agree_with_the_listing(repo: &dyn JobRepository) {
 }
 
 async fn save_rejects_a_second_active_job_for_one_work(repo: &dyn JobRepository) {
-    let first = unwrap_created(repo.enqueue(work(1), JobSource::Mail, t(1)).await.unwrap());
+    let first = unwrap_created(
+        repo.enqueue(Target::Work(work(1)), JobSource::Mail, t(1))
+            .await
+            .unwrap(),
+    );
     let mut failed = claim_specific(repo, first.id, t(2)).await;
     failed
         .fail(t(3), FailureKind::Permanent, "x".into(), &POLICY, 0.5)
         .unwrap();
     repo.save(&failed).await.unwrap();
     // The work is queued again (say, by a new email) while the old job is Failed.
-    let second = unwrap_created(repo.enqueue(work(1), JobSource::Mail, t(4)).await.unwrap());
+    let second = unwrap_created(
+        repo.enqueue(Target::Work(work(1)), JobSource::Mail, t(4))
+            .await
+            .unwrap(),
+    );
 
     // Retrying the old job would make two active jobs for one work.
     failed.retry(t(5)).unwrap();
@@ -471,7 +549,11 @@ where
     let (repo, events) = make().await;
     let mut rx = events.subscribe();
 
-    let job = unwrap_created(repo.enqueue(work(1), JobSource::Mail, t(1)).await.unwrap());
+    let job = unwrap_created(
+        repo.enqueue(Target::Work(work(1)), JobSource::Mail, t(1))
+            .await
+            .unwrap(),
+    );
     expect(&mut rx, Event::JobChanged(job.id)).await;
 
     let entry = LogEntry {
@@ -491,8 +573,16 @@ where
 }
 
 async fn logs_are_per_job_and_ordered(repo: &dyn JobRepository) {
-    let a = unwrap_created(repo.enqueue(work(1), JobSource::Mail, t(1)).await.unwrap());
-    let b = unwrap_created(repo.enqueue(work(2), JobSource::Mail, t(1)).await.unwrap());
+    let a = unwrap_created(
+        repo.enqueue(Target::Work(work(1)), JobSource::Mail, t(1))
+            .await
+            .unwrap(),
+    );
+    let b = unwrap_created(
+        repo.enqueue(Target::Work(work(2)), JobSource::Mail, t(1))
+            .await
+            .unwrap(),
+    );
     let entry = |secs, message: &str| LogEntry {
         at: t(secs),
         attempt: 2,
@@ -520,7 +610,11 @@ async fn logs_are_per_job_and_ordered(repo: &dyn JobRepository) {
 async fn concurrent_claims_never_double_deliver(repo: Arc<dyn JobRepository>) {
     const JOBS: u64 = 40;
     for n in 1..=JOBS {
-        unwrap_created(repo.enqueue(work(n), JobSource::Mail, t(1)).await.unwrap());
+        unwrap_created(
+            repo.enqueue(Target::Work(work(n)), JobSource::Mail, t(1))
+                .await
+                .unwrap(),
+        );
     }
     let mut tasks = Vec::new();
     for _ in 0..8 {
@@ -732,6 +826,281 @@ where
     assert!(!store.clear().await.unwrap());
 }
 
+// -------------------------------------------------------------------- metadata
+
+fn series_id(n: u64) -> SeriesId {
+    SeriesId::new(n).unwrap()
+}
+
+/// A realistic observation of work 94243666 (The Malfoid Saga, part 2).
+#[must_use]
+pub fn observed_work(n: u64) -> WorkMetadata {
+    WorkMetadata {
+        work: work(n),
+        facts: WorkFacts {
+            title: "Harry Potter and the Girl with the Diary".into(),
+            byline: "TheBrokenPokeman".into(),
+            summary_html: "<p>It's now Harry Potter's second year.</p>".into(),
+            language: "English".into(),
+            rating: "Teen And Up Audiences".into(),
+            restricted: false,
+            status: "In-Progress".into(),
+            published_on: Some(jiff_date(2026, 10, 8)),
+            updated_on: Some(jiff_date(2026, 10, 20)),
+            chapters_posted: 2,
+            chapters_total: None,
+            words: 179_890,
+        },
+        authors: vec![Author {
+            user: "TheBrokenPokeman".into(),
+            pseud: "TheBrokenPokeman".into(),
+        }],
+        tags: vec![
+            Tag {
+                kind: TagKind::Fandom,
+                name: "Harry Potter - J. K. Rowling".into(),
+            },
+            Tag {
+                kind: TagKind::Relationship,
+                name: "Draco Malfoy/Harry Potter".into(),
+            },
+            Tag {
+                kind: TagKind::Freeform,
+                name: "Enemies to Lovers".into(),
+            },
+        ],
+        series: vec![SeriesPart {
+            id: series_id(6_704_161),
+            name: "The Malfoid Saga".into(),
+            part: Some(2),
+        }],
+        chapters: vec![
+            Chapter {
+                number: 1,
+                title: "1. Making No Noise".into(),
+                ao3_id: Some(11),
+                posted_on: Some(jiff_date(2026, 10, 8)),
+            },
+            Chapter {
+                number: 2,
+                title: "2. The Diary".into(),
+                ao3_id: Some(12),
+                posted_on: Some(jiff_date(2026, 10, 9)),
+            },
+        ],
+        stats: WorkStats {
+            hits: Some(117_707),
+            kudos: Some(2874),
+            comments: Some(1907),
+            bookmarks: Some(235),
+        },
+        raw: serde_json::json!({"title": "Harry Potter and the Girl with the Diary", "numWords": "179,890"}),
+    }
+}
+
+fn jiff_date(y: i16, m: i8, d: i8) -> fanfold_domain::metadata::Date {
+    fanfold_domain::metadata::Date::new(y, m, d).unwrap()
+}
+
+/// Run every [`MetadataStore`] contract against fresh instances from `make`.
+pub async fn metadata_store<F, Fut>(make: F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<dyn MetadataStore>>,
+{
+    versions_are_written_only_for_changes(&*make().await).await;
+    spans_follow_what_the_site_shows(&*make().await).await;
+    series_are_followed_once_and_named(&*make().await).await;
+    a_series_folder_is_chosen_once(&*make().await).await;
+}
+
+async fn versions_are_written_only_for_changes(store: &dyn MetadataStore) {
+    let first = observed_work(5);
+    assert_eq!(store.work_state(work(5)).await.unwrap(), None);
+    assert!(
+        store
+            .record_work(&first, t(10), None)
+            .await
+            .unwrap()
+            .new_version
+    );
+    assert_eq!(
+        store.work_state(work(5)).await.unwrap(),
+        Some(first.state())
+    );
+
+    let mut busier = first.clone();
+    busier.stats.hits = Some(200_000);
+    busier.raw = serde_json::json!({"hits": "200,000"});
+    assert!(
+        !store
+            .record_work(&busier, t(20), None)
+            .await
+            .unwrap()
+            .new_version,
+        "statistics and the raw answer alone are not a change"
+    );
+
+    let mut updated = first.clone();
+    updated.facts.chapters_posted = 3;
+    updated.facts.restricted = true;
+    assert!(
+        store
+            .record_work(&updated, t(30), None)
+            .await
+            .unwrap()
+            .new_version
+    );
+    assert_eq!(
+        store.work_state(work(5)).await.unwrap(),
+        Some(updated.state())
+    );
+    assert_eq!(
+        store.work_state(work(6)).await.unwrap(),
+        None,
+        "other works are untouched"
+    );
+}
+
+async fn spans_follow_what_the_site_shows(store: &dyn MetadataStore) {
+    let first = observed_work(5);
+    store.record_work(&first, t(10), None).await.unwrap();
+
+    let mut retagged = first.clone();
+    retagged.tags.remove(2);
+    retagged.tags.insert(
+        0,
+        Tag {
+            kind: TagKind::Freeform,
+            name: "Yandere".into(),
+        },
+    );
+    retagged.chapters[1].title = "2. The Diary (edited)".into();
+    retagged.series[0].part = Some(3);
+    assert!(
+        store
+            .record_work(&retagged, t(20), None)
+            .await
+            .unwrap()
+            .new_version
+    );
+    let state = store.work_state(work(5)).await.unwrap().unwrap();
+    let mut tags = state.tags.clone();
+    tags.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut expected = retagged.tags.clone();
+    expected.sort_by(|a, b| a.name.cmp(&b.name));
+    assert_eq!(
+        tags, expected,
+        "the removed tag is closed, the new one open"
+    );
+    assert_eq!(state.chapters[1].title, "2. The Diary (edited)");
+    assert_eq!(state.chapters.len(), 2);
+    assert_eq!(state.series, retagged.series);
+
+    // Reordering is not a change.
+    let mut reordered = retagged.clone();
+    reordered.tags.reverse();
+    assert!(
+        !store
+            .record_work(&reordered, t(30), None)
+            .await
+            .unwrap()
+            .new_version
+    );
+}
+
+async fn series_are_followed_once_and_named(store: &dyn MetadataStore) {
+    let (a, b, c) = (series_id(1), series_id(2), series_id(3));
+    assert_eq!(
+        store.followed(&[a, b, c]).await.unwrap(),
+        Vec::<SeriesId>::new()
+    );
+    store
+        .follow_series(b, FollowSource::Mail, t(5))
+        .await
+        .unwrap();
+    store
+        .follow_series(b, FollowSource::Manual, t(6))
+        .await
+        .unwrap();
+    store
+        .follow_series(a, FollowSource::Manual, t(7))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.followed(&[c, b, a]).await.unwrap(),
+        [b, a],
+        "in the order asked"
+    );
+
+    let listing = SeriesMetadata {
+        series: a,
+        facts: SeriesFacts {
+            name: "The Malfoid Saga".into(),
+            summary_html: String::new(),
+            complete: Some(false),
+            works: vec![work(1), work(2)],
+        },
+        raw: serde_json::json!({"name": "The Malfoid Saga"}),
+    };
+    assert!(
+        store
+            .record_series(&listing, t(10), None)
+            .await
+            .unwrap()
+            .new_version
+    );
+    assert!(
+        !store
+            .record_series(&listing, t(11), None)
+            .await
+            .unwrap()
+            .new_version
+    );
+    let mut grown = listing.clone();
+    grown.facts.works.push(work(3));
+    assert!(
+        store
+            .record_series(&grown, t(12), None)
+            .await
+            .unwrap()
+            .new_version
+    );
+
+    // Series 6704161 was never listed, but a work's page named it.
+    store
+        .record_work(&observed_work(5), t(13), None)
+        .await
+        .unwrap();
+    let names = store
+        .series_names(&[a, series_id(6_704_161), c])
+        .await
+        .unwrap();
+    assert_eq!(names.get(&a).map(String::as_str), Some("The Malfoid Saga"));
+    assert_eq!(
+        names.get(&series_id(6_704_161)).map(String::as_str),
+        Some("The Malfoid Saga")
+    );
+    assert_eq!(names.get(&c), None);
+}
+
+async fn a_series_folder_is_chosen_once(store: &dyn MetadataStore) {
+    let s = series_id(9);
+    assert_eq!(
+        store.claim_series_folder(s, "First 9").await.unwrap(),
+        "First 9"
+    );
+    assert_eq!(
+        store.claim_series_folder(s, "Renamed 9").await.unwrap(),
+        "First 9"
+    );
+    assert_eq!(
+        store.followed(&[s]).await.unwrap(),
+        Vec::<SeriesId>::new(),
+        "choosing a folder does not follow"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,5 +1142,10 @@ mod tests {
     #[tokio::test]
     async fn in_memory_catalog_honours_the_contract() {
         book_catalog(|| async { Arc::new(InMemoryJobs::new()) as Arc<dyn BookCatalog> }).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_metadata_store_honours_the_contract() {
+        metadata_store(|| async { Arc::new(InMemoryJobs::new()) as Arc<dyn MetadataStore> }).await;
     }
 }

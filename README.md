@@ -2,13 +2,15 @@
 
 Fanfold keeps an e-reader library of [AO3](https://archiveofourown.org) works up to date.
 It downloads works as EPUB files into a folder you sync to your reader (with Syncthing, for
-example), and downloads them again when new chapters appear. You queue works by pasting a
-link, or automatically from AO3's subscription emails.
+example), and downloads them again when new chapters appear. You queue works or whole series
+by pasting a link, or automatically from AO3's subscription emails.
 
 - One small service plus a PostgreSQL database. A web page shows what is queued, running,
   finished or failed, and lets you retry.
-- Books keep the same file name (`Title [work id].epub`) forever, so your reader keeps your
-  place when a work is updated.
+- Books are filed by series or by author (see [the library](#the-library-and-its-history)) and
+  keep their path forever, so your reader keeps your place when a work is updated.
+- Everything AO3 says about a work is kept as a timeline: which update added a tag, when a work
+  became restricted, how chapters and words grew.
 - If AO3 has a bad day, Fanfold backs off and retries by itself instead of failing everything.
 - Optional notifications to Discord.
 
@@ -19,6 +21,7 @@ the work, keeps the library tidy and gives you the interface. It was inspired by
 ## Contents
 
 [Quick start](#quick-start) · [Configuration](#configuration) · [Adding works](#adding-works) ·
+[The library and its history](#the-library-and-its-history) ·
 [Getting past Cloudflare](#getting-past-cloudflare) · [The web interface](#the-web-interface) ·
 [The container image](#the-container-image) · [Running without Docker](#running-without-docker) ·
 [Operating it](#operating-it) · [Troubleshooting](#troubleshooting) · [Development](#development)
@@ -130,6 +133,10 @@ docker exec fanfold fanfold enqueue https://archiveofourown.org/works/123
 A work that is already queued or running is not queued twice. Links with `?view_adult=true`
 or a chapter path are understood.
 
+**A whole series.** Paste a series link (`https://archiveofourown.org/series/123`). Fanfold
+lists the series, follows it, and queues every work in it; each is filed under the series'
+folder. Pressing **List the series again** on its job later queues any works added since.
+
 **From AO3's subscription emails.** Subscribe to the works or authors you follow on AO3 and
 forward the notifications to a mailbox on a JMAP server (tested with
 [Stalwart](https://stalw.art); any JMAP server should do). Then add:
@@ -146,6 +153,9 @@ backfill = "7d"                             # first start only: how far back to 
 
 - Each notification becomes a download of the work it mentions. A burst of chapter
   notifications for the same work, even weeks of them, collapses into one download.
+- A series link in a notification (AO3's series subscriptions send one) makes Fanfold follow
+  that series: new works in it are filed under its folder. Only the works the email links are
+  downloaded; the rest of the series is not fetched again.
 - Fanfold reads the mailbox and changes nothing in it, and it remembers where it stopped, so
   a restart never re-downloads old mail.
 - The sender match ignores punctuation, so relay-rewritten senders such as
@@ -153,6 +163,48 @@ backfill = "7d"                             # first start only: how far back to 
 - JMAP servers tell clients where their API lives. That address must be reachable from where
   Fanfold runs (the server's public name must resolve to it, with a valid certificate).
 - If another tool reads the same mailbox, both will download; point one at a different mailbox.
+
+## The library and its history
+
+**Layout.** A work in a series you follow (added by link, or seen in a series email) goes under
+the series; any other work under its author line:
+
+```
+series/The Malfoid Saga 6704161/01 Harry Potter and the Girl Who Noticed Him 93774621.epub
+series/The Malfoid Saga 6704161/02 Harry Potter and the Girl with the Diary 94243666.epub
+single/Guardbro/Harry Potter and the Sorcerer's Tsundere 94081816.epub
+```
+
+- The part number is AO3's at the first download. A book's path, and a series' folder name,
+  are chosen once and never change afterwards, even if the work is renamed, the series
+  reordered, or the series followed later: e-readers key reading progress on the path.
+- A work in several followed series goes under the first one AO3 lists on the work's page.
+
+**History.** Every download records what AO3 said about the work, in PostgreSQL. A new
+*version* is written only when something changed (title, summary, rating, status, restricted,
+dates, chapter and word counts, authors, tags, series, chapters); hits, kudos, comments and
+bookmarks are recorded on every visit without counting as a change. Each tag, author, series
+membership and chapter is a span from the version that added it to the one that removed it.
+FanFicFare's full answer is kept with each version (`raw`, JSON) for anything not parsed.
+
+| Table or view | Holds |
+|---|---|
+| `work_timeline` (view) | every version of every work, with readable times |
+| `work_tag_timeline` (view) | when each tag was added and removed, and the work's update date and chapter count then |
+| `work_versions` | the versions (`raw` holds FanFicFare's answer) |
+| `work_tags`, `work_authors`, `work_series`, `work_chapters` | the spans (`added_in`, `removed_in` are version ids) |
+| `work_stats` | hits, kudos, comments and bookmarks per visit |
+| `series`, `series_versions` | followed series, their folders, and each listing |
+
+```sql
+-- With which update was a tag added?
+SELECT work_id, added_with_update_of, chapters_when_added
+FROM work_tag_timeline WHERE name = 'Yandere';
+
+-- How a work grew.
+SELECT seen_at, updated_on, chapters_posted, chapters_total, words, status, restricted
+FROM work_timeline WHERE work_id = 94243666 ORDER BY version;
+```
 
 ## Getting past Cloudflare
 
@@ -333,6 +385,10 @@ it goes stale), and, with mail configured, `fanfold_mail_polls_total{result}` an
 **Stopping and upgrading.** Stop it any time: a job interrupted mid-download is queued again
 on the next start. Upgrading is "pull the new image and restart"; database changes are
 applied automatically on start.
+
+Upgrading from a version without series support starts the library afresh: each work is filed
+under `series/` or `single/` at its next download. The old flat `Title [id].epub` files are
+left untouched; delete them once the new ones are there.
 
 **Backups.** The books are in the library folder. The queue, history, mail position and
 browser cookies are in PostgreSQL; the file names in the library are what your reader keys

@@ -388,6 +388,7 @@ mod tests {
                 from_unlisted_sender: 1,
                 without_work_links: 0,
                 enqueued: 2,
+                series_followed: 0,
                 already_active: 5,
                 truncated_links: 0,
             },

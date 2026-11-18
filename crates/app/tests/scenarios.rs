@@ -18,15 +18,19 @@ use std::{sync::Arc, time::Duration};
 use fanfold_app::{
     error::{AppError, RepoError},
     ingest::{IngestConfig, Ingestor},
-    ports::{Checkpoint, JobRepository, LogLevel, MailBatch, MailMessage, NotifyEvent},
+    ports::{
+        Checkpoint, JobRepository, LogLevel, MailBatch, MailMessage, MetadataStore as _,
+        NotifyEvent,
+    },
     worker::{Outcome, Ports, Tick, Worker, WorkerConfig},
 };
 use fanfold_domain::{
     breaker::BreakerConfig,
     failure::FailureKind,
-    job::{JobId, JobSource, JobState, Resolution},
+    job::{JobId, JobSource, JobState, Resolution, Target},
+    metadata::{FollowSource, SeriesPart, Tag, TagKind},
     retry::RetryPolicy,
-    work::WorkId,
+    work::{SeriesId, WorkId},
 };
 use fanfold_testkit::memory::{
     FakeClock, FixedJitter, InMemoryJobs, InMemoryLibrary, InMemoryMail, RecordingNotifier,
@@ -55,6 +59,7 @@ impl Harness {
             Ports {
                 jobs: jobs.clone(),
                 catalog: jobs.clone(),
+                metadata: jobs.clone(),
                 downloader: downloader.clone(),
                 library: library.clone(),
                 notifier: notifier.clone(),
@@ -88,7 +93,7 @@ impl Harness {
         let outcome = self
             .jobs
             .enqueue(
-                WorkId::new(work).unwrap(),
+                Target::Work(WorkId::new(work).unwrap()),
                 JobSource::Manual,
                 self.clock_now(),
             )
@@ -136,7 +141,7 @@ async fn first_download_is_published_under_a_derived_name() {
         }
     );
     assert_eq!(h.job(id).await.state, JobState::Succeeded);
-    assert_eq!(h.library.published()[0].0, "My Story [5].epub");
+    assert_eq!(h.library.published()[0].0, "single/Author/My Story 5.epub");
     assert_eq!(h.downloader.requests()[0].existing, None);
     assert_eq!(
         h.notifier.events(),
@@ -164,7 +169,7 @@ async fn updates_keep_the_original_file_name_even_if_the_title_changes() {
     let published = h.library.published();
     assert_eq!(published.len(), 2);
     assert_eq!(
-        published[1].0, "My Story [5].epub",
+        published[1].0, "single/Author/My Story 5.epub",
         "path must not move: readers key progress on it"
     );
     assert_eq!(
@@ -172,7 +177,7 @@ async fn updates_keep_the_original_file_name_even_if_the_title_changes() {
             .existing
             .as_deref()
             .and_then(|p| p.to_str()),
-        Some("/library/My Story [5].epub"),
+        Some("/library/single/Author/My Story 5.epub"),
         "the existing file is handed over for an incremental update"
     );
     assert!(matches!(
@@ -189,7 +194,7 @@ async fn a_book_deleted_from_the_library_is_downloaded_afresh_under_its_recorded
     h.worker.run_once().await.unwrap();
 
     // The catalog still remembers the book, but the file is gone.
-    h.library.forget("My Story [5].epub");
+    h.library.forget("single/Author/My Story 5.epub");
     h.clock.advance(Duration::from_secs(3600));
     h.enqueue(5).await;
     h.downloader.push_ok("My Story");
@@ -202,7 +207,7 @@ async fn a_book_deleted_from_the_library_is_downloaded_afresh_under_its_recorded
     );
     assert_eq!(
         h.library.published()[1].0,
-        "My Story [5].epub",
+        "single/Author/My Story 5.epub",
         "same path, so the reader keeps its place"
     );
     assert!(matches!(
@@ -235,7 +240,7 @@ async fn a_forced_retry_replaces_the_stored_book_instead_of_updating_it() {
     for request in &h.downloader.requests()[1..] {
         assert_eq!(request.existing, None, "the stored book is not updated");
     }
-    assert_eq!(h.library.published()[1].0, "My Story [5].epub");
+    assert_eq!(h.library.published()[1].0, "single/Author/My Story 5.epub");
     let job = h.job(id).await;
     assert_eq!((job.state, job.force), (JobState::Succeeded, false));
     let logs = h.jobs.logs(id).await.unwrap();
@@ -608,6 +613,7 @@ fn ingestor(h: &Harness, mail: Arc<InMemoryMail>) -> Ingestor {
     Ingestor::new(
         mail,
         h.jobs.clone(),
+        h.jobs.clone(),
         h.clock.clone(),
         IngestConfig {
             allowed_senders: vec!["archiveofourown.org".into()],
@@ -685,7 +691,10 @@ async fn mail_to_epub_end_to_end() {
     ingestor(&h, mailbox).run_once().await.unwrap();
     h.downloader.push_ok("The Long Fic");
     h.worker.run_once().await.unwrap();
-    assert_eq!(h.library.published()[0].0, "The Long Fic [31337].epub");
+    assert_eq!(
+        h.library.published()[0].0,
+        "single/Author/The Long Fic 31337.epub"
+    );
 }
 
 // ------------------------------------------------------- site status and stats
@@ -743,4 +752,271 @@ async fn worker_stats_count_what_happened() {
     assert_eq!(failures(FailureKind::NotFound), 1);
     assert!(s.last_success.is_some());
     assert_eq!(s.duration.count, 6);
+}
+
+// ---------------------------------------------------------------------- series
+
+fn part(series: u64, name: &str, part: u32) -> SeriesPart {
+    SeriesPart {
+        id: SeriesId::new(series).unwrap(),
+        name: name.into(),
+        part: Some(part),
+    }
+}
+
+async fn queue_series(h: &Harness, series: u64) -> JobId {
+    match h
+        .jobs
+        .enqueue(
+            Target::Series(SeriesId::new(series).unwrap()),
+            JobSource::Manual,
+            h.clock_now(),
+        )
+        .await
+        .unwrap()
+    {
+        fanfold_app::ports::EnqueueOutcome::Created(job) => job.id,
+        fanfold_app::ports::EnqueueOutcome::AlreadyActive(id) => id,
+    }
+}
+
+#[tokio::test]
+async fn adding_a_series_lists_it_follows_it_and_files_every_work_under_it() {
+    let h = Harness::new();
+    let job = queue_series(&h, 6_704_161).await;
+    h.downloader
+        .push_listing("The Malfoid Saga", &[93_774_621, 94_243_666]);
+    h.worker.run_once().await.unwrap();
+
+    assert_eq!(h.job(job).await.state, JobState::Succeeded);
+    let series = SeriesId::new(6_704_161).unwrap();
+    let history = h.jobs.series_history(series);
+    assert_eq!(
+        history.followed.map(|(by, _)| by),
+        Some(FollowSource::Manual)
+    );
+    assert_eq!(history.folder.as_deref(), Some("The Malfoid Saga 6704161"));
+    assert_eq!(history.versions.len(), 1);
+    let logs = h.jobs.logs(job).await.unwrap();
+    assert!(
+        logs.iter().any(
+            |l| l.message == "listed \"The Malfoid Saga\": 2 works; queued 2, 0 already queued"
+        ),
+        "{logs:?}"
+    );
+
+    // The works it queued are downloaded in series order, each into the series folder.
+    h.downloader
+        .push_ok_with("Harry Potter and the Girl Who Noticed Him", |m| {
+            m.series = vec![part(6_704_161, "The Malfoid Saga", 1)];
+        });
+    h.downloader
+        .push_ok_with("Harry Potter and the Girl with the Diary", |m| {
+            // Renamed since the listing: the folder chosen first stays.
+            m.series = vec![part(6_704_161, "The Malfoid Saga (renamed)", 2)];
+        });
+    h.worker.run_once().await.unwrap();
+    h.worker.run_once().await.unwrap();
+    let published: Vec<String> = h.library.published().into_iter().map(|(p, _)| p).collect();
+    assert_eq!(
+        published,
+        [
+            "series/The Malfoid Saga 6704161/01 Harry Potter and the Girl Who Noticed Him 93774621.epub",
+            "series/The Malfoid Saga 6704161/02 Harry Potter and the Girl with the Diary 94243666.epub",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_series_page_that_lists_nothing_is_a_failure_not_an_empty_series() {
+    let h = Harness::new();
+    let job = queue_series(&h, 7).await;
+    h.downloader.push_listing("Broken", &[]);
+    let tick = h.worker.run_once().await.unwrap();
+    assert!(retrying(&tick), "{tick:?}");
+    assert!(
+        h.jobs
+            .series_history(SeriesId::new(7).unwrap())
+            .followed
+            .is_none()
+    );
+    assert!(
+        h.job(job)
+            .await
+            .last_error
+            .unwrap()
+            .contains("listed no works")
+    );
+
+    h.clock.advance(Duration::from_secs(3600));
+    h.downloader
+        .push_listing_err(FailureKind::SiteUnavailable, "HTTP 525");
+    assert!(retrying(&h.worker.run_once().await.unwrap()));
+}
+
+#[tokio::test]
+async fn a_series_email_follows_the_series_and_fetches_only_the_works_it_links() {
+    let h = Harness::new();
+    let mailbox = Arc::new(InMemoryMail::new());
+    mailbox.push(MailBatch {
+        messages: vec![mail(
+            "1",
+            "AO3 <x@archiveofourown.org>",
+            "TheBrokenPokeman posted Part 4 of https://archiveofourown.org/series/6704161 : \
+             https://archiveofourown.org/works/95739416 \
+             and an unrelated work https://archiveofourown.org/works/111",
+        )],
+        checkpoint: Checkpoint("cp".into()),
+    });
+    let report = ingestor(&h, mailbox).run_once().await.unwrap();
+    assert_eq!((report.series_followed, report.enqueued), (1, 2));
+    assert!(
+        h.downloader.listed().is_empty(),
+        "the series is not listed again"
+    );
+    let series = SeriesId::new(6_704_161).unwrap();
+    assert_eq!(
+        h.jobs.series_history(series).followed.map(|(by, _)| by),
+        Some(FollowSource::Mail)
+    );
+
+    // Which work is in the series comes from each work's own page, not the email layout.
+    h.downloader.push_ok_with("Part Four", |m| {
+        m.series = vec![part(6_704_161, "The Malfoid Saga", 4)];
+    });
+    h.downloader.push_ok("Unrelated");
+    h.worker.run_once().await.unwrap();
+    h.worker.run_once().await.unwrap();
+    let published: Vec<String> = h.library.published().into_iter().map(|(p, _)| p).collect();
+    assert_eq!(
+        published,
+        [
+            "series/The Malfoid Saga 6704161/04 Part Four 95739416.epub",
+            "single/Author/Unrelated 111.epub",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_work_in_several_series_goes_under_the_first_followed_one() {
+    let h = Harness::new();
+    h.jobs
+        .follow_series(
+            SeriesId::new(2).unwrap(),
+            FollowSource::Manual,
+            h.clock_now(),
+        )
+        .await
+        .unwrap();
+    h.enqueue(9).await;
+    h.downloader.push_ok_with("Crossover", |m| {
+        m.series = vec![part(1, "Not Followed", 3), part(2, "Followed", 5)];
+    });
+    h.worker.run_once().await.unwrap();
+    assert_eq!(
+        h.library.published()[0].0,
+        "series/Followed 2/05 Crossover 9.epub"
+    );
+}
+
+#[tokio::test]
+async fn a_book_keeps_its_path_when_its_series_is_followed_later() {
+    let h = Harness::new();
+    h.enqueue(9).await;
+    h.downloader.push_ok_with("Early", |m| {
+        m.series = vec![part(2, "Later Followed", 1)];
+    });
+    h.worker.run_once().await.unwrap();
+    h.jobs
+        .follow_series(
+            SeriesId::new(2).unwrap(),
+            FollowSource::Manual,
+            h.clock_now(),
+        )
+        .await
+        .unwrap();
+    h.clock.advance(Duration::from_secs(60));
+    h.enqueue(9).await;
+    h.downloader.push_ok_with("Early", |m| {
+        m.series = vec![part(2, "Later Followed", 1)];
+    });
+    h.worker.run_once().await.unwrap();
+    let published: Vec<String> = h.library.published().into_iter().map(|(p, _)| p).collect();
+    assert_eq!(
+        published,
+        ["single/Author/Early 9.epub", "single/Author/Early 9.epub"]
+    );
+}
+
+// --------------------------------------------------------------------- history
+
+#[tokio::test]
+async fn every_download_records_the_metadata_and_only_changes_make_versions() {
+    let h = Harness::new();
+    let work = WorkId::new(5).unwrap();
+    let id = h.enqueue(5).await;
+    h.downloader.push_ok_with("Story", |m| {
+        m.stats.hits = Some(10);
+    });
+    h.worker.run_once().await.unwrap();
+
+    // Same details, more hits: statistics only.
+    h.clock.advance(Duration::from_secs(3600));
+    h.enqueue(5).await;
+    h.downloader.push_ok_with("Story", |m| {
+        m.stats.hits = Some(20);
+    });
+    h.worker.run_once().await.unwrap();
+    let history = h.jobs.work_history(work);
+    assert_eq!(history.versions.len(), 1);
+    assert_eq!(history.stats.len(), 2);
+
+    // A new chapter and a new tag: one new version, the tag's span opens in it.
+    h.clock.advance(Duration::from_secs(3600));
+    let second = h.enqueue(5).await;
+    h.downloader.push_ok_with("Story", |m| {
+        m.facts.chapters_posted = 2;
+        m.tags.push(Tag {
+            kind: TagKind::Freeform,
+            name: "Yandere".into(),
+        });
+    });
+    h.worker.run_once().await.unwrap();
+    let history = h.jobs.work_history(work);
+    assert_eq!(history.versions.len(), 2);
+    let added = history
+        .tags
+        .iter()
+        .find(|s| s.item.name == "Yandere")
+        .unwrap();
+    assert_eq!(added.added_in, history.versions[1].id);
+    assert_eq!(history.versions[1].job, Some(second));
+    assert_eq!(history.versions[0].job, Some(id));
+    assert_eq!(history.versions[1].facts.chapters_posted, 2);
+    let logs = h.jobs.logs(second).await.unwrap();
+    assert!(
+        logs.iter()
+            .any(|l| l.message == fanfold_app::worker::METADATA_CHANGED_NOTE)
+    );
+}
+
+#[tokio::test]
+async fn a_failed_metadata_store_fails_the_run_and_publishes_nothing() {
+    let h = Harness::new();
+    let id = h.enqueue(5).await;
+    h.downloader.push_ok("Story");
+    h.jobs
+        .break_metadata_with(Some(RepoError::Backend("db down".into())));
+    let tick = h.worker.run_once().await.unwrap();
+    assert!(retrying(&tick), "{tick:?}");
+    assert!(
+        h.library.published().is_empty(),
+        "no book without its history"
+    );
+    assert_eq!(
+        h.downloader.released().len(),
+        1,
+        "scratch space is still freed"
+    );
+    assert!(h.job(id).await.last_error.unwrap().contains("metadata"));
 }
