@@ -463,7 +463,9 @@ pub async fn start_web(
         shutdown: shutdown.clone(),
         max_attempts: config.retry.max_attempts,
         page_size: config.web.page_size,
-        version: env!("CARGO_PKG_VERSION"),
+        // Releases are git tags (vX.Y.Z), not Cargo.toml bumps: the image build passes the
+        // tag's version in, and a local build falls back to the manifest's.
+        version: option_env!("FANFOLD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
     });
 
     let bind = |addr: std::net::SocketAddr| async move {

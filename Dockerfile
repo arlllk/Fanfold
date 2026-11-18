@@ -78,7 +78,11 @@ FROM deps AS build
 COPY Cargo.toml Cargo.lock clippy.toml rustfmt.toml ./
 COPY crates ./crates
 COPY fuzz ./fuzz
-RUN cargo build --release --locked --package fanfold-server \
+# The release version (the git tag without its `v`), shown by the service. Declared after the
+# dependency layer so a new version recompiles only our crates. Empty: Cargo.toml's version.
+ARG FANFOLD_VERSION=
+RUN if [ -z "${FANFOLD_VERSION}" ]; then unset FANFOLD_VERSION; else export FANFOLD_VERSION; fi \
+ && cargo build --release --locked --package fanfold-server \
  && install -D target/release/fanfold /out/fanfold
 
 # ------------------------------------------------------------------------ rust licences
