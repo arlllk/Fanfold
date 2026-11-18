@@ -60,6 +60,8 @@ TEXT_RULES = (
     ("too many requests", "rate_limited"),
     ("login failed", "auth_failed"),
     ("only available to registered users", "auth_failed"),
+    # FanFicFare's login could not even start (no usable token): only another way in helps.
+    ("failed getting login token", "auth_failed"),
     ("adult check required", "permanent"),
     ("does not exist", "not_found"),
     ("downtime", "site_unavailable"),
@@ -293,21 +295,45 @@ def classify_text(text):
     return None
 
 
+def classify_status(status):
+    if status == 429:
+        return "rate_limited"
+    if status == 403:
+        return "blocked"
+    if status in (404, 410):
+        return "not_found"
+    if status >= 500:  # includes Cloudflare 520-526
+        return "site_unavailable"
+    return "transient"
+
+
+def chained_status(exc):
+    """The HTTP status of the error that caused `exc`, following __cause__/__context__.
+
+    FanFicFare often wraps a failed request in a generic error ("Failed getting login token
+    from token_dispenser.json" around a 525): the wrapped status says what really happened.
+    """
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status = getattr(current, "status_code", None)
+        if isinstance(status, int):
+            return status
+        current = current.__cause__ or current.__context__
+    return None
+
+
 def classify_exception(exc):
     status = getattr(exc, "status_code", None)
     if isinstance(status, int):
-        if status == 429:
-            return "rate_limited"
-        if status == 403:
-            return "blocked"
-        if status in (404, 410):
-            return "not_found"
-        if status >= 500:  # includes Cloudflare 520-526
-            return "site_unavailable"
-        return "transient"
+        return classify_status(status)
     name = type(exc).__name__
     if name in EXCEPTION_KINDS:
         return EXCEPTION_KINDS[name]
+    status = chained_status(exc)
+    if status is not None:
+        return classify_status(status)
     lowered = name.lower()
     if "timeout" in lowered or "connection" in lowered:
         return "site_unavailable"
