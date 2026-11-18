@@ -143,14 +143,26 @@ async fn first_download_is_published_under_a_derived_name() {
     assert_eq!(h.job(id).await.state, JobState::Succeeded);
     assert_eq!(h.library.published()[0].0, "single/Author/My Story 5.epub");
     assert_eq!(h.downloader.requests()[0].existing, None);
+    let events = h.notifier.events();
+    let [
+        NotifyEvent::Downloaded {
+            job,
+            work,
+            title,
+            updated: false,
+            details: Some(details),
+        },
+    ] = events.as_slice()
+    else {
+        panic!("{events:?}")
+    };
     assert_eq!(
-        h.notifier.events(),
-        [NotifyEvent::Downloaded {
-            work: WorkId::new(5).unwrap(),
-            title: "My Story".into(),
-            updated: false
-        }]
+        (*job, *work, title.as_str()),
+        (id, WorkId::new(5).unwrap(), "My Story")
     );
+    assert_eq!(details.path, "single/Author/My Story 5.epub");
+    assert_eq!(details.metadata.facts.title, "My Story");
+    assert!(details.previous.is_none() && details.new_chapters.is_empty());
     assert_eq!(h.worker.run_once().await.unwrap(), Tick::Idle);
 }
 
@@ -307,13 +319,21 @@ async fn an_outage_trips_the_breaker_without_burning_any_retry_budget() {
     for _ in 0..3 {
         assert!(retrying(&h.worker.run_once().await.unwrap()));
     }
-    assert_eq!(
-        h.notifier.events(),
-        [NotifyEvent::SiteDegraded {
-            kind: FailureKind::SiteUnavailable
-        }],
-        "announced exactly once"
-    );
+    let events = h.notifier.events();
+    let [
+        NotifyEvent::SiteDegraded {
+            kind: FailureKind::SiteUnavailable,
+            message,
+            retry_at,
+            waiting: Some(waiting),
+        },
+    ] = events.as_slice()
+    else {
+        panic!("announced exactly once: {events:?}")
+    };
+    assert_eq!(message, "HTTP 525");
+    assert!(*retry_at > h.clock_now(), "the next probe is in the future");
+    assert_eq!(*waiting, 4, "every queued job waits");
     assert_eq!(
         h.worker.run_once().await.unwrap(),
         Tick::BreakerOpen,
@@ -345,9 +365,13 @@ async fn an_outage_trips_the_breaker_without_burning_any_retry_budget() {
             ..
         }
     ));
-    assert_eq!(
-        h.notifier.events().last(),
-        Some(&NotifyEvent::SiteRecovered)
+    let Some(NotifyEvent::SiteRecovered { down_since, at }) = h.notifier.events().last().cloned()
+    else {
+        panic!("recovery announced")
+    };
+    assert!(
+        down_since.is_some_and(|since| since < at),
+        "the outage has a start"
     );
     assert!(matches!(
         h.worker.run_once().await.unwrap(),
@@ -1019,4 +1043,99 @@ async fn a_failed_metadata_store_fails_the_run_and_publishes_nothing() {
         "scratch space is still freed"
     );
     assert!(h.job(id).await.last_error.unwrap().contains("metadata"));
+}
+
+// --------------------------------------------------------------- notifications
+
+#[tokio::test]
+async fn an_update_reports_exactly_the_chapters_it_added_and_what_else_changed() {
+    use fanfold_domain::metadata::Chapter;
+    let chapter = |n: u32| Chapter {
+        number: n,
+        title: format!("Chapter {n}"),
+        ao3_id: Some(u64::from(n) * 100),
+        posted_on: None,
+    };
+    let h = Harness::new();
+    h.enqueue(5).await;
+    h.downloader.push_ok_with("Story", |m| {
+        m.chapters = vec![chapter(1), chapter(2)];
+        m.facts.chapters_posted = 2;
+    });
+    h.worker.run_once().await.unwrap();
+
+    h.clock.advance(Duration::from_secs(3600));
+    let update = h.enqueue(5).await;
+    h.downloader.push_ok_with("Story", |m| {
+        // Chapter 2 was renamed in place (same AO3 id): not new.
+        let mut renamed = chapter(2);
+        renamed.title = "Chapter 2 (edited)".into();
+        m.chapters = vec![chapter(1), renamed, chapter(3), chapter(4)];
+        m.facts.chapters_posted = 4;
+        m.facts.status = "Completed".into();
+    });
+    h.worker.run_once().await.unwrap();
+
+    let Some(NotifyEvent::Downloaded {
+        job,
+        updated: true,
+        details: Some(details),
+        ..
+    }) = h.notifier.events().last().cloned()
+    else {
+        panic!("{:?}", h.notifier.events())
+    };
+    assert_eq!(job, update);
+    let added: Vec<u32> = details.new_chapters.iter().map(|c| c.number).collect();
+    assert_eq!(added, [3, 4]);
+    let before = details.previous.expect("the previous version is known");
+    assert_eq!(before.facts.chapters_posted, 2);
+    assert_eq!(details.metadata.facts.status, "Completed");
+}
+
+#[tokio::test]
+async fn giving_up_names_the_work_and_the_budget() {
+    let h = Harness::new();
+    let id = h.enqueue(5).await;
+    h.downloader.push_ok("Known Title");
+    h.worker.run_once().await.unwrap();
+    h.clock.advance(Duration::from_secs(60));
+    let again = h.enqueue(5).await;
+    assert_ne!(id, again);
+    h.downloader
+        .push_err(FailureKind::NotFound, "deleted by its author");
+    h.worker.run_once().await.unwrap();
+    let Some(NotifyEvent::GaveUp {
+        job,
+        title,
+        kind,
+        attempts,
+        max_attempts,
+        ..
+    }) = h.notifier.events().last().cloned()
+    else {
+        panic!("{:?}", h.notifier.events())
+    };
+    assert_eq!(job, again);
+    assert_eq!(title.as_deref(), Some("Known Title"));
+    assert_eq!(kind, FailureKind::NotFound);
+    assert_eq!((attempts, max_attempts), (1, 3));
+}
+
+#[tokio::test]
+async fn listing_a_series_is_announced() {
+    let h = Harness::new();
+    let job = queue_series(&h, 77).await;
+    h.downloader.push_listing("A Saga", &[1, 2, 3]);
+    h.worker.run_once().await.unwrap();
+    assert_eq!(
+        h.notifier.events(),
+        [NotifyEvent::SeriesListed {
+            job,
+            series: SeriesId::new(77).unwrap(),
+            name: "A Saga".into(),
+            works: 3,
+            queued: 3,
+        }]
+    );
 }

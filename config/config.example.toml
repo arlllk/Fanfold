@@ -84,4 +84,6 @@ push = true
 
 # Optional. Without it, notifications are only logged.
 [discord]
-webhook = { env = "DISCORD_WEBHOOK_URL" }
+webhook = { env = "DISCORD_WEBHOOK_URL" }                    # new books, new chapters, series
+failures_webhook = { env = "DISCORD_FAILURES_WEBHOOK_URL" }  # optional: failures, e.g. a muted channel
+ui_url = "https://fanfold.example.org"                       # optional: link each message to its job
