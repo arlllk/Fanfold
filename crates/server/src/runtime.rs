@@ -186,6 +186,7 @@ pub fn build_worker_with(
         Ports {
             jobs: Arc::<PgStore>::clone(store),
             catalog: Arc::<PgStore>::clone(store),
+            metadata: Arc::<PgStore>::clone(store),
             downloader: Arc::new(downloader),
             library: Arc::new(FsLibrary::new(config.library.path.clone())),
             notifier,
@@ -308,6 +309,7 @@ pub fn build_mail(
     let ingestor = Arc::new(Ingestor::new(
         source,
         Arc::<PgStore>::clone(store),
+        Arc::<PgStore>::clone(store),
         clock,
         IngestConfig {
             allowed_senders: mail.allowed_senders.clone(),
@@ -420,6 +422,7 @@ pub async fn start_web(
     let deps = Arc::new(WebDeps {
         jobs: Arc::<PgStore>::clone(store),
         catalog: Arc::<PgStore>::clone(store),
+        metadata: Arc::<PgStore>::clone(store),
         admin: Arc::new(JobAdmin::new(
             Arc::<PgStore>::clone(store),
             Arc::clone(&clock),
@@ -504,6 +507,7 @@ mod tests {
             Ports {
                 jobs: jobs.clone(),
                 catalog: jobs.clone(),
+                metadata: jobs.clone(),
                 downloader: downloader.clone(),
                 library: Arc::new(InMemoryLibrary::new()),
                 notifier: notifier.clone(),
@@ -535,7 +539,7 @@ mod tests {
     async fn enqueue(rig: &Rig, work: u64) {
         rig.jobs
             .enqueue(
-                WorkId::new(work).unwrap(),
+                WorkId::new(work).unwrap().into(),
                 JobSource::Manual,
                 SystemClock.now_for_tests(),
             )
@@ -561,6 +565,7 @@ mod tests {
         MailRuntime {
             ingestor: Arc::new(Ingestor::new(
                 mail.clone(),
+                jobs.clone(),
                 jobs.clone(),
                 Arc::new(FakeClock::at_secs(1_000)),
                 IngestConfig {

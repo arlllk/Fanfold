@@ -13,9 +13,10 @@ use async_trait::async_trait;
 use fanfold_domain::{
     Timestamp,
     failure::FailureKind,
-    job::{Job, JobId, JobSource},
+    job::{Job, JobId, JobSource, Target},
+    metadata::{FollowSource, SeriesMetadata, WorkMetadata, WorkState},
     session::BrowserSession,
-    work::WorkId,
+    work::{SeriesId, WorkId},
 };
 use tokio::sync::broadcast;
 
@@ -99,7 +100,7 @@ pub struct LogEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnqueueOutcome {
     Created(Job),
-    /// A queued or running job for this work already exists.
+    /// A queued or running job for this target already exists.
     AlreadyActive(JobId),
 }
 
@@ -180,13 +181,13 @@ pub struct JobCounts {
 /// * `claim_next` atomically moves exactly one due `Queued` job to `Running`,
 ///   oldest `next_attempt_at` first, and is safe under concurrent callers;
 /// * `save` overwrites a job's mutable fields, and fails with
-///   [`RepoError::Conflict`] if that would leave two active jobs for one work.
+///   [`RepoError::Conflict`] if that would leave two active jobs for one target.
 #[cfg_attr(any(test, feature = "mocks"), mockall::automock)]
 #[async_trait]
 pub trait JobRepository: Send + Sync {
     async fn enqueue(
         &self,
-        work: WorkId,
+        target: Target,
         source: JobSource,
         now: Timestamp,
     ) -> Result<EnqueueOutcome, RepoError>;
@@ -246,6 +247,66 @@ pub trait LibraryStore: Send + Sync {
     async fn publish(&self, source: &Path, file_name: &str) -> Result<(), StoreError>;
 }
 
+// -------------------------------------------------------------------- metadata
+
+/// Result of recording an observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recorded {
+    /// A new version was written: something changed since the last observation.
+    pub new_version: bool,
+}
+
+/// The history of what AO3 said about works and series, and which series are followed.
+/// See `fanfold_domain::metadata` for the version-and-span model.
+#[cfg_attr(any(test, feature = "mocks"), mockall::automock)]
+#[async_trait]
+pub trait MetadataStore: Send + Sync {
+    /// Record one observation of a work, atomically: always its statistics and "last
+    /// checked" time; a new version and span changes only when something changed.
+    async fn record_work(
+        &self,
+        metadata: &WorkMetadata,
+        seen_at: Timestamp,
+        job: Option<JobId>,
+    ) -> Result<Recorded, RepoError>;
+
+    /// Record one listing of a series; a new series version only when it changed.
+    async fn record_series(
+        &self,
+        metadata: &SeriesMetadata,
+        seen_at: Timestamp,
+        job: Option<JobId>,
+    ) -> Result<Recorded, RepoError>;
+
+    /// The latest recorded version and open spans of a work.
+    async fn work_state(&self, work: WorkId) -> Result<Option<WorkState>, RepoError>;
+
+    /// Start following a series. Idempotent: the first follow's time and source are kept.
+    async fn follow_series(
+        &self,
+        series: SeriesId,
+        by: FollowSource,
+        at: Timestamp,
+    ) -> Result<(), RepoError>;
+
+    /// The followed series among `candidates`, in the order given.
+    async fn followed(&self, candidates: &[SeriesId]) -> Result<Vec<SeriesId>, RepoError>;
+
+    /// The series' library folder, chosen once: the stored one if there is one, otherwise
+    /// `proposed`, which is stored.
+    async fn claim_series_folder(
+        &self,
+        series: SeriesId,
+        proposed: &str,
+    ) -> Result<String, RepoError>;
+
+    /// Best known names: the latest listing's, else the name a work's page showed.
+    async fn series_names(
+        &self,
+        series: &[SeriesId],
+    ) -> Result<HashMap<SeriesId, String>, RepoError>;
+}
+
 // ------------------------------------------------------------------ downloader
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,6 +326,8 @@ pub struct DownloadedBook {
     pub changed: bool,
     /// Diagnostic output worth keeping in the job log.
     pub log: String,
+    /// What the site said about the work during this download.
+    pub metadata: Option<WorkMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -279,6 +342,9 @@ pub struct DownloadError {
 #[async_trait]
 pub trait Downloader: Send + Sync {
     async fn download(&self, request: &DownloadRequest) -> Result<DownloadedBook, DownloadError>;
+
+    /// List a series: its facts and its works in order. Fails like a download does.
+    async fn list_series(&self, series: SeriesId) -> Result<SeriesMetadata, DownloadError>;
 
     /// Discard whatever scratch space backs `book`. Called exactly once for every
     /// book `download` returned, after it was published or abandoned. Best effort:
@@ -375,7 +441,7 @@ pub enum NotifyEvent {
         updated: bool,
     },
     GaveUp {
-        work: WorkId,
+        target: Target,
         kind: FailureKind,
         message: String,
     },

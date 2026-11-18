@@ -3,14 +3,26 @@
 //! Pure functions only, so the whole parsing surface can be unit-tested and fuzzed
 //! without spawning anything.
 
-use std::path::{Component, Path, PathBuf};
+use std::{
+    fmt::Write as _,
+    path::{Component, Path, PathBuf},
+};
 
 use fanfold_app::ports::{DownloadError, DownloadedBook};
-use fanfold_domain::failure::FailureKind;
+use fanfold_domain::{
+    failure::FailureKind,
+    metadata::{
+        Author, Chapter, Date, SeriesFacts, SeriesMetadata, SeriesPart, Tag, TagKind, WorkFacts,
+        WorkMetadata, WorkStats,
+    },
+    work::{SeriesId, WorkId},
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize)]
 pub struct WorkerRequest<'a> {
+    /// `"download"` or `"list_series"`.
+    pub op: &'a str,
     pub url: &'a str,
     pub existing: Option<&'a str>,
     pub workdir: &'a str,
@@ -44,6 +56,23 @@ pub enum WorkerResponse {
         title: String,
         #[serde(default = "default_changed")]
         changed: bool,
+        #[serde(default)]
+        log: String,
+        /// What the site said about the work; read leniently (see [`work_metadata`]).
+        #[serde(default)]
+        metadata: Option<serde_json::Value>,
+    },
+    /// A listed series.
+    #[serde(rename = "listed")]
+    Listed {
+        name: String,
+        #[serde(default)]
+        summary_html: String,
+        #[serde(default)]
+        complete: Option<bool>,
+        works: Vec<u64>,
+        #[serde(default)]
+        raw: serde_json::Value,
         #[serde(default)]
         log: String,
     },
@@ -85,25 +114,154 @@ fn failure(kind: FailureKind, message: impl Into<String>, log: String) -> Downlo
     }
 }
 
-/// Interpret a parsed response.
+#[derive(Debug, Deserialize)]
+struct WireTag {
+    kind: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireSeries {
+    id: u64,
+    name: String,
+    part: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireChapter {
+    number: u32,
+    title: String,
+    ao3_id: Option<u64>,
+    posted_on: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireWork {
+    title: String,
+    #[serde(default)]
+    byline: String,
+    #[serde(default)]
+    summary_html: String,
+    #[serde(default)]
+    language: String,
+    #[serde(default)]
+    rating: String,
+    #[serde(default)]
+    restricted: bool,
+    #[serde(default)]
+    status: String,
+    published_on: Option<String>,
+    updated_on: Option<String>,
+    #[serde(default)]
+    chapters_posted: u32,
+    chapters_total: Option<u32>,
+    #[serde(default)]
+    words: u64,
+    #[serde(default)]
+    authors: Vec<Author>,
+    #[serde(default)]
+    tags: Vec<WireTag>,
+    #[serde(default)]
+    series: Vec<WireSeries>,
+    #[serde(default)]
+    chapters: Vec<WireChapter>,
+    #[serde(default)]
+    stats: WorkStats,
+    #[serde(default)]
+    raw: serde_json::Value,
+}
+
+fn date(text: Option<&str>) -> Option<Date> {
+    text.and_then(|t| t.parse::<Date>().ok())
+}
+
+/// The worker's description of a work, as domain metadata. Unknown tag kinds, unusable
+/// series ids and unreadable dates are dropped rather than failing the whole record.
+pub fn work_metadata(value: serde_json::Value, work: WorkId) -> Result<WorkMetadata, String> {
+    let wire: WireWork = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    Ok(WorkMetadata {
+        work,
+        facts: WorkFacts {
+            title: wire.title,
+            byline: wire.byline,
+            summary_html: wire.summary_html,
+            language: wire.language,
+            rating: wire.rating,
+            restricted: wire.restricted,
+            status: wire.status,
+            published_on: date(wire.published_on.as_deref()),
+            updated_on: date(wire.updated_on.as_deref()),
+            chapters_posted: wire.chapters_posted,
+            chapters_total: wire.chapters_total,
+            words: wire.words,
+        },
+        authors: wire.authors,
+        tags: wire
+            .tags
+            .into_iter()
+            .filter_map(|t| {
+                Some(Tag {
+                    kind: t.kind.parse::<TagKind>().ok()?,
+                    name: t.name,
+                })
+            })
+            .collect(),
+        series: wire
+            .series
+            .into_iter()
+            .filter_map(|s| {
+                Some(SeriesPart {
+                    id: SeriesId::new(s.id)?,
+                    name: s.name,
+                    part: s.part,
+                })
+            })
+            .collect(),
+        chapters: wire
+            .chapters
+            .into_iter()
+            .map(|c| Chapter {
+                number: c.number,
+                title: c.title,
+                ao3_id: c.ao3_id,
+                posted_on: date(c.posted_on.as_deref()),
+            })
+            .collect(),
+        stats: wire.stats,
+        raw: wire.raw,
+    })
+}
+
+/// Interpret a parsed response to a download.
 pub fn into_result(
     response: WorkerResponse,
     workdir: &Path,
+    work: WorkId,
 ) -> Result<DownloadedBook, DownloadError> {
     match response {
         WorkerResponse::Done {
             path,
             title,
             changed,
-            log,
+            mut log,
+            metadata,
         } => {
             let path = PathBuf::from(path);
             if path_within(&path, workdir) {
+                let metadata = match metadata.map(|m| work_metadata(m, work)) {
+                    None => None,
+                    Some(Ok(m)) => Some(m),
+                    Some(Err(e)) => {
+                        let _ = write!(log, "\ncould not read the work's details: {e}");
+                        None
+                    }
+                };
                 Ok(DownloadedBook {
                     path,
                     title,
                     changed,
                     log,
+                    metadata,
                 })
             } else {
                 Err(failure(
@@ -114,6 +272,51 @@ pub fn into_result(
             }
         }
         WorkerResponse::Failed { kind, message, log } => Err(failure(kind, message, log)),
+        WorkerResponse::Listed { log, .. } => Err(failure(
+            FailureKind::Permanent,
+            "worker answered a download with a series listing",
+            log,
+        )),
+    }
+}
+
+/// Interpret a parsed response to a series listing.
+pub fn into_listing(
+    response: WorkerResponse,
+    series: SeriesId,
+) -> Result<SeriesMetadata, DownloadError> {
+    match response {
+        WorkerResponse::Listed {
+            name,
+            summary_html,
+            complete,
+            works,
+            raw,
+            ..
+        } => {
+            let mut ordered: Vec<WorkId> = Vec::new();
+            for work in works.into_iter().filter_map(WorkId::new) {
+                if !ordered.contains(&work) {
+                    ordered.push(work);
+                }
+            }
+            Ok(SeriesMetadata {
+                series,
+                facts: SeriesFacts {
+                    name,
+                    summary_html,
+                    complete,
+                    works: ordered,
+                },
+                raw,
+            })
+        }
+        WorkerResponse::Failed { kind, message, log } => Err(failure(kind, message, log)),
+        WorkerResponse::Done { log, .. } => Err(failure(
+            FailureKind::Permanent,
+            "worker answered a series listing with a download",
+            log,
+        )),
     }
 }
 
@@ -134,7 +337,8 @@ mod tests {
                 path: "/s/w/story.epub".into(),
                 title: "T".into(),
                 changed: true,
-                log: "l".into()
+                log: "l".into(),
+                metadata: None,
             })
         );
     }
@@ -216,9 +420,78 @@ mod tests {
             title: "T".into(),
             changed: true,
             log: String::new(),
+            metadata: None,
         };
-        let err = into_result(response, Path::new("/scratch/w1")).unwrap_err();
+        let err = into_result(response, Path::new("/scratch/w1"), work(1)).unwrap_err();
         assert_eq!(err.kind, FailureKind::Permanent);
+    }
+
+    fn work(n: u64) -> WorkId {
+        WorkId::new(n).unwrap()
+    }
+
+    #[test]
+    fn metadata_is_read_and_cleaned() {
+        let line = r#"{"status":"ok","path":"/s/w/story.epub","title":"T","metadata":{
+            "title":"T","byline":"A, B","rating":"Mature","restricted":true,
+            "published_on":"2026-10-08","updated_on":"not a date",
+            "chapters_posted":4,"chapters_total":null,"words":37766,
+            "authors":[{"user":"a","pseud":"A"}],
+            "tags":[{"kind":"freeform","name":"Fluff"},{"kind":"mystery","name":"x"}],
+            "series":[{"id":2000001,"name":"The Harbor Saga","part":4},{"id":0,"name":"bad","part":1}],
+            "chapters":[{"number":1,"title":"One","ao3_id":11,"posted_on":"2026-11-15"}],
+            "stats":{"hits":10,"kudos":null,"comments":1,"bookmarks":2},
+            "raw":{"numWords":"37,766"}}}"#
+            .replace('\n', " ");
+        let book = into_result(parse_response(&line).unwrap(), Path::new("/s/w"), work(9)).unwrap();
+        let m = book.metadata.unwrap();
+        assert_eq!(m.work, work(9));
+        assert_eq!(m.facts.published_on, Some(Date::new(2026, 10, 8).unwrap()));
+        assert_eq!(m.facts.updated_on, None, "an unreadable date is dropped");
+        assert_eq!(m.facts.chapters_total, None);
+        assert!(m.facts.adult() && m.facts.restricted);
+        assert_eq!(m.tags.len(), 1, "unknown tag kinds are dropped");
+        assert_eq!(m.series.len(), 1, "unusable series ids are dropped");
+        assert_eq!(m.series[0].part, Some(4));
+        assert_eq!(m.stats.kudos, None);
+        assert_eq!(m.raw["numWords"], "37,766");
+    }
+
+    #[test]
+    fn unreadable_metadata_does_not_lose_the_book() {
+        let line = r#"{"status":"ok","path":"/s/w/story.epub","title":"T","log":"l","metadata":{"words":"lots"}}"#;
+        let book = into_result(parse_response(line).unwrap(), Path::new("/s/w"), work(9)).unwrap();
+        assert_eq!(book.metadata, None);
+        assert!(
+            book.log.contains("could not read the work's details"),
+            "{}",
+            book.log
+        );
+    }
+
+    #[test]
+    fn a_listing_keeps_series_order_and_drops_duplicates_and_zero() {
+        let line = r#"{"status":"listed","name":"The Harbor Saga","complete":false,"works":[10000002,10000004,0,10000002,10000006],"raw":{"name":"The Harbor Saga"}}"#;
+        let series = SeriesId::new(2_000_001).unwrap();
+        let listing = into_listing(parse_response(line).unwrap(), series).unwrap();
+        assert_eq!(listing.series, series);
+        assert_eq!(listing.facts.complete, Some(false));
+        let works: Vec<u64> = listing.facts.works.iter().map(|w| w.get()).collect();
+        assert_eq!(works, [10_000_002, 10_000_004, 10_000_006]);
+        assert_eq!(
+            into_listing(parse_response(OK).unwrap(), series)
+                .unwrap_err()
+                .kind,
+            FailureKind::Permanent,
+            "a download is not a listing"
+        );
+        assert_eq!(
+            into_result(parse_response(line).unwrap(), Path::new("/s/w"), work(1))
+                .unwrap_err()
+                .kind,
+            FailureKind::Permanent,
+            "nor the other way round"
+        );
     }
 
     proptest! {

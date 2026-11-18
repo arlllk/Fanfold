@@ -22,12 +22,16 @@ use fanfold_app::ports::{
 };
 use fanfold_domain::{
     failure::FailureKind,
+    metadata::SeriesMetadata,
     session::{BrowserSession, parse_netscape, to_netscape},
+    work::SeriesId,
 };
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::{
-    protocol::{Clearance, WorkerRequest, into_result, parse_response},
+    protocol::{
+        Clearance, WorkerRequest, WorkerResponse, into_listing, into_result, parse_response,
+    },
     runner::{ProcessOutput, ProcessRunner, ProcessSpec, RunError},
 };
 
@@ -290,9 +294,13 @@ impl FanFicFareDownloader {
     }
 
     async fn make_workdir(&self, request: &DownloadRequest) -> Result<PathBuf, DownloadError> {
+        self.make_dir(&format!("work-{}", request.work)).await
+    }
+
+    /// A fresh scratch directory named `<label>-<pid>-<n>`.
+    async fn make_dir(&self, label: &str) -> Result<PathBuf, DownloadError> {
         let unique = format!(
-            "work-{}-{}-{}",
-            request.work,
+            "{label}-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -332,13 +340,67 @@ impl FanFicFareDownloader {
         }
     }
 
+    /// A series page's URL, from the work URL template (`.../works/{id}` -> `.../series/{id}`).
+    fn series_url(&self, series: SeriesId) -> Option<String> {
+        self.config.url_template.contains("/works/{id}").then(|| {
+            self.config
+                .url_template
+                .replace("/works/{id}", "/series/{id}")
+                .replace("{id}", &series.to_string())
+        })
+    }
+
+    fn task_url(&self, task: Task<'_>) -> Result<String, DownloadError> {
+        match task {
+            Task::Download(request) => Ok(self
+                .config
+                .url_template
+                .replace("{id}", &request.work.to_string())),
+            Task::ListSeries(series) => self.series_url(series).ok_or_else(|| {
+                self.error(
+                    FailureKind::Permanent,
+                    "series cannot be listed for this site",
+                    "",
+                )
+            }),
+        }
+    }
+
     async fn run_worker(
         &self,
         request: &DownloadRequest,
         workdir: &Path,
         attempt: Attempt,
     ) -> Result<DownloadedBook, DownloadError> {
-        let existing_copy = match &request.existing {
+        let response = self
+            .run_task(Task::Download(request), workdir, attempt)
+            .await?;
+        into_result(response, workdir, request.work)
+    }
+
+    async fn run_listing(
+        &self,
+        series: SeriesId,
+        workdir: &Path,
+        attempt: Attempt,
+    ) -> Result<SeriesMetadata, DownloadError> {
+        let response = self
+            .run_task(Task::ListSeries(series), workdir, attempt)
+            .await?;
+        into_listing(response, series)
+    }
+
+    async fn run_task(
+        &self,
+        task: Task<'_>,
+        workdir: &Path,
+        attempt: Attempt,
+    ) -> Result<WorkerResponse, DownloadError> {
+        let existing = match task {
+            Task::Download(request) => request.existing.as_ref(),
+            Task::ListSeries(_) => None,
+        };
+        let existing_copy = match existing {
             Some(path) => {
                 let copy = workdir.join("existing.epub");
                 tokio::fs::copy(path, &copy).await.map_err(|e| {
@@ -353,10 +415,7 @@ impl FanFicFareDownloader {
             None => None,
         };
 
-        let url = self
-            .config
-            .url_template
-            .replace("{id}", &request.work.to_string());
+        let url = self.task_url(task)?;
         let workdir_str = workdir.to_string_lossy();
         let existing_str = existing_copy
             .as_ref()
@@ -391,6 +450,7 @@ impl FanFicFareDownloader {
             _ => None,
         };
         let payload = serde_json::to_vec(&WorkerRequest {
+            op: task.op(),
             url: &url,
             existing: existing_str.as_deref(),
             workdir: &workdir_str,
@@ -431,16 +491,15 @@ impl FanFicFareDownloader {
                 self.error(FailureKind::Transient, e.to_string(), "")
             }
         })?;
-        self.interpret_output(&output, workdir, &secrets)
+        self.interpret_output(&output, &secrets)
     }
 
-    /// Turn what the worker printed into a book or a classified failure, scrubbing secrets.
+    /// Turn what the worker printed into an answer or a classified failure, scrubbing secrets.
     fn interpret_output(
         &self,
         output: &ProcessOutput,
-        workdir: &Path,
         secrets: &[SecretString],
-    ) -> Result<DownloadedBook, DownloadError> {
+    ) -> Result<WorkerResponse, DownloadError> {
         let Some(response) = parse_response(&output.stdout) else {
             let tail: String = output
                 .stderr
@@ -457,16 +516,57 @@ impl FanFicFareDownloader {
                 &tail,
             ));
         };
-        into_result(response, workdir)
-            .map(|mut book| {
-                book.log = redact(&book.log, secrets);
-                book
-            })
-            .map_err(|mut err| {
-                err.message = redact(&err.message, secrets);
-                err.log = redact(&err.log, secrets);
-                err
-            })
+        match response {
+            WorkerResponse::Failed { kind, message, log } => Err(DownloadError {
+                kind,
+                message: redact(&message, secrets),
+                log: redact(&log, secrets),
+            }),
+            WorkerResponse::Done {
+                path,
+                title,
+                changed,
+                log,
+                metadata,
+            } => Ok(WorkerResponse::Done {
+                path,
+                title,
+                changed,
+                log: redact(&log, secrets),
+                metadata,
+            }),
+            WorkerResponse::Listed {
+                name,
+                summary_html,
+                complete,
+                works,
+                raw,
+                log,
+            } => Ok(WorkerResponse::Listed {
+                name,
+                summary_html,
+                complete,
+                works,
+                raw,
+                log: redact(&log, secrets),
+            }),
+        }
+    }
+}
+
+/// What the worker is asked to do.
+#[derive(Debug, Clone, Copy)]
+enum Task<'a> {
+    Download(&'a DownloadRequest),
+    ListSeries(SeriesId),
+}
+
+impl Task<'_> {
+    const fn op(self) -> &'static str {
+        match self {
+            Self::Download(_) => "download",
+            Self::ListSeries(_) => "list_series",
+        }
     }
 }
 
@@ -528,6 +628,32 @@ impl Downloader for FanFicFareDownloader {
             // No book will be handed out, so nobody would call `release`.
             remove_dir(&workdir).await;
         }
+        result
+    }
+
+    async fn list_series(&self, series: SeriesId) -> Result<SeriesMetadata, DownloadError> {
+        let workdir = self.make_dir(&format!("series-{series}")).await?;
+        let result = match self.run_listing(series, &workdir, Attempt::First).await {
+            // A series of restricted works may need a login, like a work.
+            Err(refused)
+                if refused.kind == FailureKind::AuthFailed
+                    && self.config.login_fallback.is_some() =>
+            {
+                tracing::info!(%series, "AO3 asked for a login; trying the login fallback");
+                self.run_listing(series, &workdir, Attempt::Fallback)
+                    .await
+                    .map_err(|mut failed| {
+                        failed.log = format!(
+                            "The anonymous attempt failed: {}\n\nThe login fallback then failed: {}\n{}",
+                            refused.message, failed.message, failed.log
+                        );
+                        failed
+                    })
+            }
+            other => other,
+        };
+        // A listing hands nothing out: its scratch space goes now.
+        remove_dir(&workdir).await;
         result
     }
 
@@ -1297,6 +1423,7 @@ mod tests {
             title: "T".into(),
             changed: true,
             log: String::new(),
+            metadata: None,
         };
 
         dl.release(&book(foreign.join("story.epub"))).await;
@@ -1714,6 +1841,141 @@ mod tests {
             !seen.lock().unwrap().is_empty(),
             "it went through FlareSolverr"
         );
+    }
+
+    /// A synthetic AO3 series page (the markup of a real one, every text made up).
+    const AO3_SERIES_PAGE: &str = include_str!("../testdata/ao3_series.html");
+
+    fn flaresolverr_ini(dir: &Path, port: u16) -> PathBuf {
+        let ini = dir.join("personal.ini");
+        std::fs::write(
+            &ini,
+            format!(
+                "[defaults]\nuse_flaresolverr_proxy:true\nflaresolverr_proxy_protocol:http\n\
+                 flaresolverr_proxy_address:127.0.0.1\nflaresolverr_proxy_port:{port}\n\
+                 flaresolverr_proxy_timeout:10000\n\n[archiveofourown.org]\nis_adult:true\n"
+            ),
+        )
+        .unwrap();
+        ini
+    }
+
+    /// A series page lists its works in series order, through `FlareSolverr` like any page.
+    /// `FFD_PYTHON=/path/to/venv/bin/python cargo test -p fanfold-adapter-fanficfare -- --ignored`
+    #[tokio::test]
+    #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
+    async fn a_series_is_listed_in_series_order() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (port, seen) = fake_flaresolverr_serving(AO3_SERIES_PAGE).await;
+        let ini = flaresolverr_ini(scratch.path(), port);
+        let series = fanfold_domain::work::SeriesId::new(77).unwrap();
+        let listing = real_downloader(
+            scratch.path(),
+            &ini,
+            "https://archiveofourown.org/works/{id}",
+        )
+        .list_series(series)
+        .await
+        .unwrap();
+        assert_eq!(listing.series, series);
+        assert_eq!(listing.facts.name, "A Test Saga");
+        assert_eq!(listing.facts.complete, Some(false));
+        let works: Vec<u64> = listing.facts.works.iter().map(|w| w.get()).collect();
+        assert_eq!(works, [1001, 1002]);
+        assert_eq!(listing.raw["name"], "A Test Saga");
+        let asked = seen.lock().unwrap().clone();
+        assert!(
+            asked
+                .iter()
+                .any(|r| r["url"].as_str().is_some_and(|u| u.contains("/series/77"))),
+            "{asked:?}"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(scratch.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("series-"))
+            .collect();
+        assert!(leftovers.is_empty(), "a listing leaves no scratch space");
+    }
+
+    /// The same error page that once became an empty book must not become an empty series.
+    #[tokio::test]
+    #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
+    async fn a_cloudflare_error_page_is_not_an_empty_series() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (port, _seen) = fake_flaresolverr_serving(CLOUDFLARE_525).await;
+        let ini = flaresolverr_ini(scratch.path(), port);
+        let err = real_downloader(
+            scratch.path(),
+            &ini,
+            "https://archiveofourown.org/works/{id}",
+        )
+        .list_series(fanfold_domain::work::SeriesId::new(77).unwrap())
+        .await
+        .expect_err("an error page lists nothing");
+        assert_eq!(err.kind, FailureKind::SiteUnavailable, "{}", err.message);
+    }
+
+    /// A download reports what the site said about the work, lists as lists.
+    #[tokio::test]
+    #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
+    async fn a_download_reports_the_works_metadata() {
+        let scratch = tempfile::tempdir().unwrap();
+        let ini = scratch.path().join("story.ini");
+        std::fs::write(
+            &ini,
+            "[test1.com]\n\
+             extra_valid_entries:fandoms,freeformtags,hits,byline,restricted,chapterslashtotal,\
+             series00,series01,series00Url,series01Url\n\n\
+             [teststory:1002]\n\
+             valid_entries:title,author,authorId,authorUrl,byline,series00,series00Url,series01,\
+             series01Url,freeformtags_list,fandoms_list,ships_list,rating,status,numWords,hits,\
+             restricted,chapterslashtotal\n\
+             title:Two Series Story\nauthor:Nobody\nauthorId:nobody\n\
+             authorUrl:https://archiveofourown.org/users/nobody/pseuds/Nobody\nbyline:Nobody\n\
+             series00:First Saga [3]\nseries00Url:https://archiveofourown.org/series/77\n\
+             series01:Second Saga [1]\nseries01Url:https://archiveofourown.org/series/88\n\
+             freeformtags_list:Fluff,Slow Burn\nfandoms_list:Test Fandom\n\
+             ships_list:A &amp; B\nrating:Mature\nstatus:In-Progress\nnumWords:12,345\n\
+             hits:1,234\nrestricted:Restricted\nchapterslashtotal:2/?\n\
+             chaptertitles:Prologue,Chapter 1\n",
+        )
+        .unwrap();
+        let mut req = request(None);
+        req.work = WorkId::new(1002).unwrap();
+        let book = real_downloader(scratch.path(), &ini, "http://test1.com?sid={id}")
+            .download(&req)
+            .await
+            .unwrap();
+        let m = book.metadata.clone().expect("metadata");
+        assert_eq!(m.work, req.work);
+        assert_eq!(m.facts.title, "Two Series Story");
+        assert_eq!(m.facts.byline, "Nobody");
+        assert!(m.facts.restricted && m.facts.adult());
+        assert_eq!((m.facts.chapters_posted, m.facts.chapters_total), (2, None));
+        assert_eq!(m.facts.words, 12_345);
+        assert_eq!(m.stats.hits, Some(1234));
+        let series: Vec<(u64, &str, Option<u32>)> = m
+            .series
+            .iter()
+            .map(|s| (s.id.get(), s.name.as_str(), s.part))
+            .collect();
+        assert_eq!(
+            series,
+            [(77, "First Saga", Some(3)), (88, "Second Saga", Some(1))]
+        );
+        assert!(m.tags.iter().any(|t| t.name == "A & B"), "{:?}", m.tags);
+        assert!(m.tags.iter().any(|t| t.name == "Fluff"));
+        assert_eq!(m.authors[0].user, "nobody");
+        assert_eq!(m.chapters.len(), 2);
+        assert_eq!(m.raw["title"], "Two Series Story");
+        dl_release(&book).await;
+    }
+
+    async fn dl_release(book: &DownloadedBook) {
+        if let Some(dir) = book.path.parent() {
+            let _ = tokio::fs::remove_dir_all(dir).await;
+        }
     }
 
     /// Opt-in: drives the *real* worker against FanFicFare's offline `test1.com` site.

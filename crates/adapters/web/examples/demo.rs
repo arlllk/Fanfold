@@ -108,7 +108,7 @@ async fn job(
 ) -> fanfold_domain::job::JobId {
     let t0 = ago(started_minutes_ago);
     let fanfold_app::ports::EnqueueOutcome::Created(created) = repo
-        .enqueue(WorkId::new(work).unwrap(), JobSource::Mail, t0)
+        .enqueue(WorkId::new(work).unwrap().into(), JobSource::Mail, t0)
         .await
         .unwrap()
     else {
@@ -241,6 +241,7 @@ async fn main() {
     let deps = Arc::new(WebDeps {
         jobs: repo.clone(),
         catalog: repo.clone(),
+        metadata: repo.clone(),
         admin: Arc::new(JobAdmin::new(repo.clone(), clock.clone())),
         session: Arc::new(fanfold_app::session::SessionAdmin::new(
             Arc::new(fanfold_testkit::memory::InMemorySession::new()),

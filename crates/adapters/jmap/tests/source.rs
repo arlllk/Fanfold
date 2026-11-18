@@ -24,7 +24,7 @@ use fanfold_app::{
     ingest::{IngestConfig, Ingestor},
     ports::{Clock, CursorStore, MailSource},
 };
-use fanfold_domain::{Timestamp, job::JobState};
+use fanfold_domain::{Timestamp, job::JobState, work::WorkId};
 use fanfold_testkit::memory::{FakeClock, InMemoryCursors, InMemoryJobs};
 use jmap_client::client::Client;
 use secrecy::SecretString;
@@ -380,6 +380,7 @@ fn ingestor(rig: &Rig, jobs: &Arc<InMemoryJobs>) -> Ingestor {
     Ingestor::new(
         rig.source.clone(),
         jobs.clone(),
+        jobs.clone(),
         rig.clock.clone() as Arc<dyn Clock>,
         IngestConfig {
             allowed_senders: vec!["archiveofourown.org".to_owned()],
@@ -425,7 +426,12 @@ async fn the_trigger_turns_a_backlog_into_one_job_per_work() {
         (6, 2, 3, 1, 0),
         "{report:?}"
     );
-    let works: BTreeSet<u64> = jobs.all_jobs().iter().map(|j| j.work.get()).collect();
+    let works: BTreeSet<u64> = jobs
+        .all_jobs()
+        .iter()
+        .filter_map(|j| j.target.work())
+        .map(WorkId::get)
+        .collect();
     assert_eq!(works, BTreeSet::from([100, 200]));
 
     // Nothing new: nothing happens, and a restart does not replay the mailbox.

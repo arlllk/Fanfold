@@ -1,8 +1,8 @@
-//! Finding AO3 work links in an email body.
+//! Finding AO3 work and series links in an email body.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, hash::Hash};
 
-use crate::work::{WorkId, parse_work_url};
+use crate::work::{SeriesId, WorkId, parse_series_url, parse_work_url};
 
 /// Longest URL candidate considered; bounds work on hostile input.
 const MAX_URL_BYTES: usize = 2048;
@@ -16,9 +16,21 @@ const fn is_url_end(c: char) -> bool {
 }
 
 /// All distinct AO3 work ids linked in `body` (plain text or HTML), in order of
-/// first appearance. Non-work links (series, users, unsubscribe) are ignored.
+/// first appearance. Other links (series, users, unsubscribe) are ignored.
 #[must_use]
 pub fn extract_work_ids(body: &str) -> Vec<WorkId> {
+    extract(body, |url| parse_work_url(url).ok())
+}
+
+/// All distinct AO3 series ids linked in `body`, in order of first appearance. A series
+/// link does not say which of the message's works belong to it; that comes from each
+/// work's own metadata.
+#[must_use]
+pub fn extract_series_ids(body: &str) -> Vec<SeriesId> {
+    extract(body, |url| parse_series_url(url).ok())
+}
+
+fn extract<T: Eq + Hash + Copy>(body: &str, parse: impl Fn(&str) -> Option<T>) -> Vec<T> {
     let body = body.replace("&amp;", "&");
     let mut seen = HashSet::new();
     let mut found = Vec::new();
@@ -44,7 +56,7 @@ pub fn extract_work_ids(body: &str) -> Vec<WorkId> {
             .get(..end)
             .unwrap_or_default()
             .trim_end_matches(['.', ',', ';', ':', '!', '?']);
-        if let Ok(id) = parse_work_url(candidate)
+        if let Some(id) = parse(candidate)
             && seen.insert(id)
         {
             found.push(id);
@@ -66,6 +78,19 @@ mod tests {
             .into_iter()
             .map(WorkId::get)
             .collect()
+    }
+
+    #[test]
+    fn series_links_are_found_separately() {
+        let body = "Part 3 of <a href=\"https://archiveofourown.org/series/2000001\">The Harbor Saga</a>: \
+                    https://archiveofourown.org/works/10000006 and again \
+                    https://archiveofourown.org/series/2000001?page=2 https://archiveofourown.org/series/7";
+        let series: Vec<u64> = extract_series_ids(body)
+            .into_iter()
+            .map(SeriesId::get)
+            .collect();
+        assert_eq!(series, [2_000_001, 7]);
+        assert_eq!(ids(body), [10_000_006], "series links are not works");
     }
 
     #[test]

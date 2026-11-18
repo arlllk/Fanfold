@@ -6,69 +6,96 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
-/// Numeric AO3 work id. Always non-zero and representable as `i64`, so storage
-/// adapters can use a signed 64-bit column without loss.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "u64", into = "u64")]
-pub struct WorkId(NonZeroU64);
+macro_rules! ao3_id {
+    ($(#[$meta:meta])* $name:ident, $err:ident, $what:literal, $path:literal) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[serde(try_from = "u64", into = "u64")]
+        pub struct $name(NonZeroU64);
 
-/// A value that is not a valid [`WorkId`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("work id must be between 1 and {max} (got {0})", max = i64::MAX)]
-pub struct InvalidWorkId(pub u64);
+        #[doc = concat!("A value that is not a valid [`", stringify!($name), "`].")]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+        #[error("{what} id must be between 1 and {max} (got {0})", what = $what, max = i64::MAX)]
+        pub struct $err(pub u64);
 
-impl WorkId {
-    #[must_use]
-    pub fn new(id: u64) -> Option<Self> {
-        if i64::try_from(id).is_err() {
-            return None;
+        impl $name {
+            #[must_use]
+            pub fn new(id: u64) -> Option<Self> {
+                if i64::try_from(id).is_err() {
+                    return None;
+                }
+                NonZeroU64::new(id).map(Self)
+            }
+
+            #[must_use]
+            pub const fn get(self) -> u64 {
+                self.0.get()
+            }
+
+            /// Storage form; lossless by construction.
+            #[must_use]
+            pub fn to_i64(self) -> i64 {
+                i64::try_from(self.get()).unwrap_or(i64::MAX)
+            }
+
+            #[must_use]
+            pub fn from_i64(id: i64) -> Option<Self> {
+                u64::try_from(id).ok().and_then(Self::new)
+            }
+
+            #[must_use]
+            pub fn canonical_url(self) -> String {
+                format!(concat!("https://archiveofourown.org/", $path, "/{}"), self)
+            }
         }
-        NonZeroU64::new(id).map(Self)
-    }
 
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0.get()
-    }
+        impl TryFrom<u64> for $name {
+            type Error = $err;
 
-    /// Storage form; lossless by construction.
-    #[must_use]
-    pub fn to_i64(self) -> i64 {
-        i64::try_from(self.get()).unwrap_or(i64::MAX)
-    }
+            fn try_from(value: u64) -> Result<Self, Self::Error> {
+                Self::new(value).ok_or($err(value))
+            }
+        }
 
-    #[must_use]
-    pub fn from_i64(id: i64) -> Option<Self> {
-        u64::try_from(id).ok().and_then(Self::new)
-    }
+        impl From<$name> for u64 {
+            fn from(id: $name) -> Self {
+                id.get()
+            }
+        }
 
-    #[must_use]
-    pub fn canonical_url(self) -> String {
-        format!("https://archiveofourown.org/works/{self}")
-    }
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+    };
 }
 
-impl TryFrom<u64> for WorkId {
-    type Error = InvalidWorkId;
+ao3_id!(
+    /// Numeric AO3 work id. Always non-zero and representable as `i64`, so storage
+    /// adapters can use a signed 64-bit column without loss.
+    WorkId,
+    InvalidWorkId,
+    "work",
+    "works"
+);
 
-    fn try_from(value: u64) -> Result<Self, Self::Error> {
-        Self::new(value).ok_or(InvalidWorkId(value))
-    }
+ao3_id!(
+    /// Numeric AO3 series id, with the same guarantees as [`WorkId`].
+    SeriesId,
+    InvalidSeriesId,
+    "series",
+    "series"
+);
+
+/// What an AO3 link points at, among the things Fanfold can download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ao3Link {
+    Work(WorkId),
+    Series(SeriesId),
 }
 
-impl From<WorkId> for u64 {
-    fn from(id: WorkId) -> Self {
-        id.get()
-    }
-}
-
-impl fmt::Display for WorkId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-/// Why a string is not a downloadable AO3 work URL.
+/// Why a string is not a downloadable AO3 work or series URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum UrlError {
     #[error("not a valid URL")]
@@ -77,9 +104,9 @@ pub enum UrlError {
     Scheme,
     #[error("not an AO3 host")]
     Host,
-    #[error("URL does not point at a work")]
+    #[error("URL does not point at a work or a series")]
     NotAWork,
-    #[error("work id is not a valid number")]
+    #[error("the id is not a valid number")]
     BadId,
 }
 
@@ -90,11 +117,8 @@ const AO3_HOSTS: [&str; 4] = [
     "ao3.org",
 ];
 
-/// Extract the work id from an AO3 URL.
-///
-/// Accepts `/works/N`, `/works/N/chapters/M`, `/collections/X/works/N`, with or
-/// without `www.`, any query or fragment. Series and user URLs are rejected.
-pub fn parse_work_url(input: &str) -> Result<WorkId, UrlError> {
+/// The path segments of an http(s) URL on an AO3 host.
+fn ao3_segments(input: &str) -> Result<Vec<String>, UrlError> {
     let url = Url::parse(input.trim()).map_err(|_| UrlError::Malformed)?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(UrlError::Scheme);
@@ -104,64 +128,49 @@ pub fn parse_work_url(input: &str) -> Result<WorkId, UrlError> {
     if !AO3_HOSTS.contains(&host) {
         return Err(UrlError::Host);
     }
-    let segments: Vec<&str> = url.path_segments().ok_or(UrlError::NotAWork)?.collect();
-    let id = segments
-        .windows(2)
-        .find_map(|pair| match pair {
-            ["works", id] => Some(*id),
-            _ => None,
-        })
-        .ok_or(UrlError::NotAWork)?;
-    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(UrlError::BadId);
-    }
-    id.parse::<u64>()
-        .ok()
-        .and_then(WorkId::new)
-        .ok_or(UrlError::BadId)
+    Ok(url
+        .path_segments()
+        .ok_or(UrlError::NotAWork)?
+        .map(str::to_owned)
+        .collect())
 }
 
-const MAX_TITLE_BYTES: usize = 150;
+/// The number after the first `<kind>/` pair of segments, if there is such a pair.
+fn id_after(segments: &[String], kind: &str) -> Option<Result<u64, UrlError>> {
+    segments.windows(2).find_map(|pair| match pair {
+        [k, id] if k == kind => Some(
+            if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) {
+                id.parse::<u64>().map_err(|_| UrlError::BadId)
+            } else {
+                Err(UrlError::BadId)
+            },
+        ),
+        _ => None,
+    })
+}
 
-/// Stable, filesystem-safe file name for a work: `Title [id].epub`.
-///
-/// The result never contains a path separator or control character, never starts
-/// with a dot, and stays well below common 255-byte file name limits.
-#[must_use]
-pub fn book_file_name(title: &str, work: WorkId) -> String {
-    let mut cleaned = String::new();
-    let mut last_was_space = true;
-    for c in title.chars() {
-        let c = if c.is_control() || "/\\:*?\"<>|".contains(c) {
-            ' '
-        } else {
-            c
-        };
-        if c.is_whitespace() {
-            if !last_was_space {
-                cleaned.push(' ');
-            }
-            last_was_space = true;
-        } else {
-            cleaned.push(c);
-            last_was_space = false;
-        }
+/// Accepts `/works/N`, `/works/N/chapters/M`, `/collections/X/works/N`, with or
+/// without `www.`, any query or fragment. Series and user URLs are rejected.
+pub fn parse_work_url(input: &str) -> Result<WorkId, UrlError> {
+    let segments = ao3_segments(input)?;
+    let id = id_after(&segments, "works").ok_or(UrlError::NotAWork)??;
+    WorkId::new(id).ok_or(UrlError::BadId)
+}
+
+/// Accepts `/series/N`, with or without `www.`, any query or fragment.
+pub fn parse_series_url(input: &str) -> Result<SeriesId, UrlError> {
+    let segments = ao3_segments(input)?;
+    let id = id_after(&segments, "series").ok_or(UrlError::NotAWork)??;
+    SeriesId::new(id).ok_or(UrlError::BadId)
+}
+
+/// A work or a series link: what the "Add" form accepts.
+pub fn parse_ao3_link(input: &str) -> Result<Ao3Link, UrlError> {
+    match parse_work_url(input) {
+        Ok(work) => Ok(Ao3Link::Work(work)),
+        Err(UrlError::NotAWork) => parse_series_url(input).map(Ao3Link::Series),
+        Err(e) => Err(e),
     }
-    let trimmed = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
-    let mut bounded = String::new();
-    for c in trimmed.chars() {
-        if bounded.len() + c.len_utf8() > MAX_TITLE_BYTES {
-            break;
-        }
-        bounded.push(c);
-    }
-    let bounded = bounded.trim_end();
-    let stem = if bounded.is_empty() {
-        "Untitled"
-    } else {
-        bounded
-    };
-    format!("{stem} [{work}].epub")
 }
 
 #[cfg(test)]
@@ -237,29 +246,6 @@ mod tests {
     }
 
     #[test]
-    fn titles_are_cut_at_the_byte_limit_on_a_character_boundary() {
-        let name = |title: &str| book_file_name(title, id(5));
-        let exact = "a".repeat(150);
-        assert_eq!(
-            name(&exact),
-            format!("{exact} [5].epub"),
-            "exactly at the limit is kept whole"
-        );
-        assert_eq!(
-            name(&"a".repeat(151)),
-            format!("{exact} [5].epub"),
-            "one over is cut"
-        );
-        let wide = "é".repeat(75); // 2 bytes each: exactly 150 bytes
-        assert_eq!(name(&wide), format!("{wide} [5].epub"));
-        assert_eq!(
-            name(&"é".repeat(76)),
-            format!("{wide} [5].epub"),
-            "never splits a character"
-        );
-    }
-
-    #[test]
     fn serde_enforces_invariants() {
         assert_eq!(serde_json::from_str::<WorkId>("42").unwrap(), id(42));
         assert!(serde_json::from_str::<WorkId>("0").is_err());
@@ -268,13 +254,32 @@ mod tests {
     }
 
     #[test]
-    fn file_name_examples() {
-        assert_eq!(book_file_name("A/B: C?", id(5)), "A B C [5].epub");
-        assert_eq!(book_file_name("", id(5)), "Untitled [5].epub");
-        assert_eq!(book_file_name("...", id(5)), "Untitled [5].epub");
+    fn series_links_and_the_combined_parser() {
+        let series = |n: u64| SeriesId::new(n).unwrap();
+        for (input, expected) in [
+            ("https://archiveofourown.org/series/2000001", 2_000_001),
+            ("https://www.archiveofourown.org/series/12?page=2#x", 12),
+            ("http://ao3.org/series/9", 9),
+        ] {
+            assert_eq!(parse_series_url(input), Ok(series(expected)), "{input}");
+            assert_eq!(parse_ao3_link(input), Ok(Ao3Link::Series(series(expected))));
+        }
         assert_eq!(
-            book_file_name("  spaced   out  ", id(5)),
-            "spaced out [5].epub"
+            parse_ao3_link("https://archiveofourown.org/works/5/chapters/9"),
+            Ok(Ao3Link::Work(id(5)))
+        );
+        for (input, err) in [
+            ("https://archiveofourown.org/users/x", UrlError::NotAWork),
+            ("https://archiveofourown.org/series/", UrlError::BadId),
+            ("https://archiveofourown.org/series/0", UrlError::BadId),
+            ("https://archiveofourown.org/series/x1", UrlError::BadId),
+            ("https://example.com/series/1", UrlError::Host),
+        ] {
+            assert_eq!(parse_ao3_link(input), Err(err), "{input}");
+        }
+        assert_eq!(
+            series(2_000_001).canonical_url(),
+            "https://archiveofourown.org/series/2000001"
         );
     }
 
@@ -291,14 +296,9 @@ mod tests {
         }
 
         #[test]
-        fn file_name_is_always_safe(title in "\\PC*", n in 1u64..=i64::MAX as u64) {
-            let name = book_file_name(&title, id(n));
-            prop_assert!(!name.contains('/') && !name.contains('\\') && !name.contains('\0'));
-            prop_assert!(!name.starts_with('.'));
-            let suffix = format!("[{n}].epub");
-            prop_assert!(name.ends_with(&suffix));
-            prop_assert!(name.len() < 255);
-            prop_assert!(!name.chars().any(char::is_control));
+        fn series_url_roundtrips(n in 1u64..=i64::MAX as u64) {
+            let series = SeriesId::new(n).unwrap();
+            prop_assert_eq!(parse_ao3_link(&series.canonical_url()), Ok(Ao3Link::Series(series)));
         }
     }
 }

@@ -20,7 +20,13 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{Timestamp, failure::FailureKind, retry::RetryPolicy, timestamp, work::WorkId};
+use crate::{
+    Timestamp,
+    failure::FailureKind,
+    retry::RetryPolicy,
+    timestamp,
+    work::{SeriesId, WorkId},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -95,6 +101,84 @@ string_enum!(
     }
 );
 
+string_enum!(
+    /// What kind of thing a job fetches.
+    TargetKind, UnknownTargetKind, { Work => "work", Series => "series" }
+);
+
+/// What a job fetches: one work (download it), or a series (list it and queue its works).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum Target {
+    Work(WorkId),
+    Series(SeriesId),
+}
+
+impl Target {
+    #[must_use]
+    pub const fn kind(self) -> TargetKind {
+        match self {
+            Self::Work(_) => TargetKind::Work,
+            Self::Series(_) => TargetKind::Series,
+        }
+    }
+
+    /// The AO3 id, in storage form.
+    #[must_use]
+    pub fn id_i64(self) -> i64 {
+        match self {
+            Self::Work(w) => w.to_i64(),
+            Self::Series(s) => s.to_i64(),
+        }
+    }
+
+    /// Inverse of `(kind(), id_i64())`.
+    #[must_use]
+    pub fn from_parts(kind: TargetKind, id: i64) -> Option<Self> {
+        match kind {
+            TargetKind::Work => WorkId::from_i64(id).map(Self::Work),
+            TargetKind::Series => SeriesId::from_i64(id).map(Self::Series),
+        }
+    }
+
+    #[must_use]
+    pub const fn work(self) -> Option<WorkId> {
+        match self {
+            Self::Work(w) => Some(w),
+            Self::Series(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn canonical_url(self) -> String {
+        match self {
+            Self::Work(w) => w.canonical_url(),
+            Self::Series(s) => s.canonical_url(),
+        }
+    }
+}
+
+impl From<WorkId> for Target {
+    fn from(work: WorkId) -> Self {
+        Self::Work(work)
+    }
+}
+
+impl From<SeriesId> for Target {
+    fn from(series: SeriesId) -> Self {
+        Self::Series(series)
+    }
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Work(w) => write!(f, "work {w}"),
+            Self::Series(s) => write!(f, "series {s}"),
+        }
+    }
+}
+
 impl JobState {
     /// Queued or running: at most one such job may exist per work.
     #[must_use]
@@ -121,7 +205,7 @@ pub enum Resolution {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     pub id: JobId,
-    pub work: WorkId,
+    pub target: Target,
     pub source: JobSource,
     pub state: JobState,
     /// Failures that consumed retry budget so far.
@@ -138,10 +222,10 @@ pub struct Job {
 
 impl Job {
     #[must_use]
-    pub const fn new(id: JobId, work: WorkId, source: JobSource, now: Timestamp) -> Self {
+    pub fn new(id: JobId, target: impl Into<Target>, source: JobSource, now: Timestamp) -> Self {
         Self {
             id,
-            work,
+            target: target.into(),
             source,
             state: JobState::Queued,
             attempt: 0,
@@ -333,6 +417,25 @@ mod tests {
             let res = job.fail(t(10), kind, "x".into(), &POLICY, 0.5).unwrap();
             assert_eq!(res, Resolution::GaveUp, "{kind}");
         }
+    }
+
+    #[test]
+    fn targets_roundtrip_through_storage_form_and_serde() {
+        let work = Target::Work(WorkId::new(5).unwrap());
+        let series = Target::Series(SeriesId::new(5).unwrap());
+        assert_ne!(work, series, "same number, different things");
+        for t in [work, series] {
+            assert_eq!(Target::from_parts(t.kind(), t.id_i64()), Some(t));
+            let json = serde_json::to_string(&t).unwrap();
+            assert_eq!(serde_json::from_str::<Target>(&json).unwrap(), t);
+        }
+        assert_eq!(series.to_string(), "series 5");
+        assert_eq!(
+            series.canonical_url(),
+            "https://archiveofourown.org/series/5"
+        );
+        assert_eq!(Target::from_parts(TargetKind::Work, 0), None);
+        assert_eq!("series".parse::<TargetKind>(), Ok(TargetKind::Series));
     }
 
     #[test]
