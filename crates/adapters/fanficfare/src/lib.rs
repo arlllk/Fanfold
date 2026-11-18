@@ -1488,6 +1488,17 @@ mod tests {
         routes: &'static [(&'static str, &'static str)],
         default: &'static str,
     ) -> (u16, Arc<Mutex<Vec<serde_json::Value>>>) {
+        fake_flaresolverr_flaky(0, routes, default).await
+    }
+
+    /// [`fake_flaresolverr_routing`], answering the first `failures` requests with Cloudflare's
+    /// 525 page, as AO3 does during a partial outage.
+    async fn fake_flaresolverr_flaky(
+        failures: usize,
+        routes: &'static [(&'static str, &'static str)],
+        default: &'static str,
+    ) -> (u16, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         use tokio::{
             io::{AsyncReadExt as _, AsyncWriteExt as _},
             net::TcpListener,
@@ -1502,6 +1513,7 @@ mod tests {
                     return;
                 };
                 let log = Arc::clone(&log);
+                let served = Arc::clone(&served);
                 tokio::spawn(async move {
                     let mut raw = Vec::new();
                     let mut chunk = [0_u8; 4096];
@@ -1528,10 +1540,15 @@ mod tests {
                     let request: serde_json::Value =
                         serde_json::from_str(&body).unwrap_or_default();
                     let url = request["url"].as_str().unwrap_or_default();
-                    let page = routes
-                        .iter()
-                        .find(|(needle, _)| url.contains(needle))
-                        .map_or(default, |(_, page)| *page);
+                    let n = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let page = if n < failures {
+                        CLOUDFLARE_525
+                    } else {
+                        routes
+                            .iter()
+                            .find(|(needle, _)| url.contains(needle))
+                            .map_or(default, |(_, page)| *page)
+                    };
                     let reply = serde_json::json!({
                         "status": "ok", "message": "", "session": "fake",
                         "solution": {
@@ -2049,6 +2066,26 @@ mod tests {
             err.message,
             err.log
         );
+    }
+
+    /// AO3's partial outage: a few 525s in a row, then the page. The worker retries through
+    /// them instead of failing the whole download (and waiting minutes for the next try).
+    #[tokio::test]
+    #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
+    async fn a_few_cloudflare_525s_are_retried_through() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (port, seen) = fake_flaresolverr_flaky(2, &[], AO3_SERIES_PAGE).await;
+        let ini = flaresolverr_ini(scratch.path(), port);
+        let listing = real_downloader(
+            scratch.path(),
+            &ini,
+            "https://archiveofourown.org/works/{id}",
+        )
+        .list_series(fanfold_domain::work::SeriesId::new(77).unwrap())
+        .await
+        .expect("two 525s are retried through");
+        assert_eq!(listing.facts.works.len(), 2);
+        assert_eq!(seen.lock().unwrap().len(), 3, "two retries, then the page");
     }
 
     /// Opt-in: drives the *real* worker against FanFicFare's offline `test1.com` site.
