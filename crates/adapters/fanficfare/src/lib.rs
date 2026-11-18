@@ -1998,7 +1998,7 @@ mod tests {
         </div></body></html>";
 
     /// Regression (work 32088421 in production): the login token request hit AO3's 525 through
-    /// FlareSolverr; FanFicFare reports that as "Failed getting login token", which was taken
+    /// `FlareSolverr`; `FanFicFare` reports that as "Failed getting login token", which was taken
     /// for a transient error. The site was down: it is an outage, retried at no cost.
     #[tokio::test]
     #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
@@ -2025,7 +2025,7 @@ mod tests {
     }
 
     /// When the site does answer but the login cannot be done this way, it is a login problem:
-    /// the login fallback (plain HTTP after a FlareSolverr clearance) must get its turn.
+    /// the login fallback (plain HTTP after a `FlareSolverr` clearance) must get its turn.
     #[tokio::test]
     #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
     async fn a_login_token_that_cannot_be_read_asks_for_the_login_fallback() {
