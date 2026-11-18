@@ -11,6 +11,9 @@
 //! ```
 //!
 //! "Retrying" is not a state: it is `Queued` with `attempt > 0`.
+//!
+//! A *forced* retry (`force_retry`, also from `Succeeded`) re-queues with `force` set: the
+//! next download ignores the stored book and starts from scratch, until one succeeds.
 
 use std::{fmt, str::FromStr};
 
@@ -128,6 +131,9 @@ pub struct Job {
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     pub last_error: Option<String>,
+    /// Download from scratch, ignoring the stored book (a forced retry). Cleared on success.
+    #[serde(default)]
+    pub force: bool,
 }
 
 impl Job {
@@ -143,6 +149,7 @@ impl Job {
             created_at: now,
             updated_at: now,
             last_error: None,
+            force: false,
         }
     }
 
@@ -171,6 +178,7 @@ impl Job {
         self.state = JobState::Succeeded;
         self.updated_at = now;
         self.last_error = None;
+        self.force = false;
         Ok(())
     }
 
@@ -208,6 +216,21 @@ impl Job {
         self.attempt = 0;
         self.next_attempt_at = now;
         self.updated_at = now;
+        Ok(())
+    }
+
+    /// `Succeeded | Failed | Cancelled -> Queued`, with a fresh retry budget and `force` set:
+    /// for a book that was downloaded wrong, which a normal update would only extend.
+    pub fn force_retry(&mut self, now: Timestamp) -> Result<(), TransitionError> {
+        self.expect(
+            &[JobState::Succeeded, JobState::Failed, JobState::Cancelled],
+            "force a retry of",
+        )?;
+        self.state = JobState::Queued;
+        self.attempt = 0;
+        self.next_attempt_at = now;
+        self.updated_at = now;
+        self.force = true;
         Ok(())
     }
 
@@ -350,6 +373,55 @@ mod tests {
             (job.state, job.attempt, job.next_attempt_at),
             (JobState::Queued, 0, t(20))
         );
+    }
+
+    #[test]
+    fn a_forced_retry_requeues_even_a_finished_job_until_a_download_succeeds() {
+        let mut job = running();
+        job.succeed(t(10)).unwrap();
+        job.force_retry(t(20)).unwrap();
+        assert_eq!(
+            (job.state, job.attempt, job.next_attempt_at, job.force),
+            (JobState::Queued, 0, t(20), true)
+        );
+        // A failed forced run stays forced on its retries...
+        job.start(t(21)).unwrap();
+        job.fail(
+            t(22),
+            FailureKind::SiteUnavailable,
+            "525".into(),
+            &POLICY,
+            0.5,
+        )
+        .unwrap();
+        assert!(job.force && job.state == JobState::Queued);
+        // ...and a successful one ends it.
+        job.start(t(30)).unwrap();
+        job.succeed(t(31)).unwrap();
+        assert!(!job.force);
+
+        let mut failed = running();
+        failed.attempt = 4;
+        failed
+            .fail(t(10), FailureKind::Permanent, "x".into(), &POLICY, 0.5)
+            .unwrap();
+        failed.force_retry(t(11)).unwrap();
+        assert_eq!((failed.state, failed.attempt), (JobState::Queued, 0));
+    }
+
+    #[test]
+    fn a_forced_retry_of_an_active_job_is_rejected() {
+        let mut queued = Job::new(
+            JobId::new(1),
+            WorkId::new(7).unwrap(),
+            JobSource::Mail,
+            t(0),
+        );
+        assert!(queued.force_retry(t(1)).is_err());
+        assert!(!queued.force);
+        queued.start(t(1)).unwrap();
+        assert!(queued.force_retry(t(2)).is_err());
+        assert!(!queued.force);
     }
 
     #[test]

@@ -13,8 +13,11 @@
     if (live.querySelector('input:checked')) return;
     busy = true;
     try {
+      // The log is newest first: new lines push the reader's place down. Keep it where it
+      // was, unless they were at the top, watching the latest run.
       const oldLog = live.querySelector('.log');
-      const stuck = oldLog && oldLog.scrollTop + oldLog.clientHeight >= oldLog.scrollHeight - 8;
+      const atTop = !oldLog || oldLog.scrollTop <= 8;
+      const fromBottom = oldLog ? oldLog.scrollHeight - oldLog.scrollTop : 0;
       const res = await fetch(location.pathname + location.search, {
         headers: { 'X-Fragment': '1' },
         credentials: 'same-origin',
@@ -30,7 +33,7 @@
         else if (pill) pill.remove();
         live.replaceChildren(incoming.content);
         const log = live.querySelector('.log');
-        if (log && stuck) log.scrollTop = log.scrollHeight;
+        if (log && !atTop) log.scrollTop = log.scrollHeight - fromBottom;
       }
     } catch (_) {
       /* offline: the next event or visibility change retries */
@@ -49,6 +52,4 @@
   source.addEventListener('error', () => { document.documentElement.dataset.live = 'off'; });
   document.addEventListener('visibilitychange', () => { if (!document.hidden) soon(); });
   setInterval(soon, 30000); // keeps "5 min ago" honest
-  const log = live.querySelector('.log');
-  if (log) log.scrollTop = log.scrollHeight;
 })();

@@ -176,6 +176,45 @@ async fn retry_and_cancel_respect_the_job_state() {
 }
 
 #[tokio::test]
+async fn a_finished_job_can_be_forced_to_download_again() {
+    let rig = rig();
+    let done = rig.queue(1).await;
+    rig.finish(done, JobState::Succeeded).await;
+    let failed = rig.queue(2).await;
+    rig.finish(failed, JobState::Failed).await;
+    let old = rig.queue(3).await;
+    rig.finish(old, JobState::Succeeded).await;
+    rig.queue(3).await; // a fresh email queued it again
+    rig.clock.advance(Duration::from_secs(60));
+
+    for id in [done, failed] {
+        let job = rig.admin.force_retry(id).await.unwrap();
+        assert_eq!(
+            (job.state, job.attempt, job.force),
+            (JobState::Queued, 0, true)
+        );
+        assert_eq!(job.next_attempt_at, rig.clock.now(), "due immediately");
+        assert!(rig.jobs.get(id).await.unwrap().unwrap().force, "stored");
+    }
+    assert!(
+        matches!(
+            rig.admin.force_retry(done).await,
+            Err(AdminError::WrongState(_))
+        ),
+        "already queued"
+    );
+
+    assert_eq!(
+        rig.admin.force_retry(old).await.unwrap_err(),
+        AdminError::AlreadyActive(WorkId::new(3).unwrap())
+    );
+    assert_eq!(
+        rig.admin.force_retry(JobId::new(404)).await.unwrap_err(),
+        AdminError::NotFound(JobId::new(404))
+    );
+}
+
+#[tokio::test]
 async fn unknown_jobs_are_not_found() {
     let rig = rig();
     let ghost = JobId::new(404);
