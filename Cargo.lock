@@ -627,6 +627,7 @@ dependencies = [
  "fanfold-app",
  "fanfold-domain",
  "fanfold-testkit",
+ "serde_json",
  "sqlx",
  "tokio",
  "tracing",
@@ -737,6 +738,7 @@ dependencies = [
  "async-trait",
  "fanfold-app",
  "fanfold-domain",
+ "serde_json",
  "tokio",
 ]
 

@@ -1,10 +1,10 @@
-//! Use cases behind the web UI's buttons: add a link, retry, cancel.
+//! Use cases behind the web UI's buttons: add a link (a work or a series), retry, cancel.
 
 use std::sync::Arc;
 
 use fanfold_domain::{
-    job::{Job, JobId, TransitionError},
-    work::{UrlError, WorkId, parse_work_url},
+    job::{Job, JobId, JobSource, Target, TransitionError},
+    work::{Ao3Link, UrlError, parse_ao3_link},
 };
 use thiserror::Error;
 
@@ -21,8 +21,8 @@ pub enum AdminError {
     NotFound(JobId),
     #[error(transparent)]
     WrongState(#[from] TransitionError),
-    #[error("a download of work {0} is already queued or running")]
-    AlreadyActive(WorkId),
+    #[error("a job for {0} is already queued or running")]
+    AlreadyActive(Target),
     #[error(transparent)]
     Repo(RepoError),
 }
@@ -55,15 +55,14 @@ impl JobAdmin {
         Self { jobs, clock }
     }
 
-    /// Queue an AO3 work by URL.
+    /// Queue an AO3 work, or a series (which lists it and queues its works), by URL.
     pub async fn add_url(&self, url: &str) -> Result<EnqueueOutcome, AdminError> {
-        let work = parse_work_url(url)?;
+        let target = match parse_ao3_link(url)? {
+            Ao3Link::Work(work) => Target::Work(work),
+            Ao3Link::Series(series) => Target::Series(series),
+        };
         self.jobs
-            .enqueue(
-                work,
-                fanfold_domain::job::JobSource::Manual,
-                self.clock.now(),
-            )
+            .enqueue(target, JobSource::Manual, self.clock.now())
             .await
             .map_err(AdminError::Repo)
     }
@@ -79,7 +78,7 @@ impl JobAdmin {
     async fn store(&self, job: &Job) -> Result<(), AdminError> {
         self.jobs.save(job).await.map_err(|e| match e {
             RepoError::NotFound(id) => AdminError::NotFound(id),
-            RepoError::Conflict(_) => AdminError::AlreadyActive(job.work),
+            RepoError::Conflict(_) => AdminError::AlreadyActive(job.target),
             other @ RepoError::Backend(_) => AdminError::Repo(other),
         })
     }

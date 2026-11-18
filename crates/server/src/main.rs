@@ -8,7 +8,10 @@ use fanfold_app::{
     ports::{Clock, JobRepository},
     stats::MailStats,
 };
-use fanfold_domain::{job::JobSource, work::parse_work_url};
+use fanfold_domain::{
+    job::{JobSource, Target},
+    work::{Ao3Link, parse_ao3_link},
+};
 use fanfold_server::{
     cli::{Command, USAGE, parse_args},
     config::Config,
@@ -66,11 +69,15 @@ async fn run() -> Result<(), StartupError> {
             Ok(())
         }
         Command::Enqueue(url) => {
-            let work =
-                parse_work_url(&url).map_err(|e| StartupError::Usage(format!("{url}: {e}")))?;
+            let target = match parse_ao3_link(&url)
+                .map_err(|e| StartupError::Usage(format!("{url}: {e}")))?
+            {
+                Ao3Link::Work(work) => Target::Work(work),
+                Ao3Link::Series(series) => Target::Series(series),
+            };
             let store = connect_store(&config, &secrets).await?;
             let outcome = store
-                .enqueue(work, JobSource::Manual, SystemClock.now())
+                .enqueue(target, JobSource::Manual, SystemClock.now())
                 .await?;
             say(&format!("{outcome:?}"));
             Ok(())

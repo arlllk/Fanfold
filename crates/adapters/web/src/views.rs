@@ -11,7 +11,7 @@ use fanfold_app::{
 };
 use fanfold_domain::{
     Timestamp,
-    job::{Job, JobId, JobSource, JobState},
+    job::{Job, JobId, JobSource, JobState, Target},
     session::CookieStatus,
 };
 use maud::{DOCTYPE, Markup, html};
@@ -31,9 +31,22 @@ pub struct JobRow {
 
 impl JobRow {
     fn name(&self) -> String {
-        self.title
-            .clone()
-            .unwrap_or_else(|| format!("Work #{}", self.job.work))
+        self.title.clone().unwrap_or_else(|| match self.job.target {
+            Target::Work(w) => format!("Work #{w}"),
+            Target::Series(s) => format!("Series #{s}"),
+        })
+    }
+
+    /// The AO3 id as shown next to a known title: "#123" for a work, "series #45".
+    fn id_label(&self) -> String {
+        match self.job.target {
+            Target::Work(w) => format!("#{w}"),
+            Target::Series(s) => format!("series #{s}"),
+        }
+    }
+
+    const fn is_series(&self) -> bool {
+        matches!(self.job.target, Target::Series(_))
     }
 }
 
@@ -261,7 +274,8 @@ fn card(row: &JobRow, now: Timestamp) -> Markup {
                 span class="title" { (row.name()) }
                 span class="meta" {
                     span class="chip" { (status.label) }
-                    @if row.title.is_some() { span class="mono" { "#" (job.work) } }
+                    @if row.is_series() { span class="chip series" { "Series" } }
+                    @if row.title.is_some() { span class="mono" { (row.id_label()) } }
                     @if job.attempt > 0 { span { "tried " (job.attempt) "×" } }
                     @match job.state {
                         JobState::Queued if job.last_error.is_some() => { span { "next try " (when(now, job.next_attempt_at)) } }
@@ -347,10 +361,10 @@ pub fn add_form() -> Markup {
     html! {
         section class="add" {
             form method="post" action="/jobs" {
-                label for="url" { "Add a work" }
+                label for="url" { "Add a work or a series" }
                 div class="field" {
                     input id="url" name="url" type="url" required inputmode="url" autocomplete="off"
-                          autocapitalize="off" spellcheck="false" placeholder="https://archiveofourown.org/works/…";
+                          autocapitalize="off" spellcheck="false" placeholder="https://archiveofourown.org/works/… or /series/…";
                     button class="btn primary" type="submit" { "Download" }
                 }
             }
@@ -434,7 +448,7 @@ fn history_row(row: &JobRow, now: Timestamp) -> Markup {
             span class="body cells" {
                 span class="c-title" { span class="title" { (row.name()) } }
                 span class="c-status" { span class="chip" { (status.label) } }
-                @if row.title.is_some() { span class="c-id mono" { "#" (job.work) } }
+                @if row.title.is_some() || row.is_series() { span class="c-id mono" { (row.id_label()) } }
                 @if job.attempt > 0 { span class="c-tries" { "tried " (job.attempt) "×" } }
                 span class="c-when" {
                     @if job.state == JobState::Queued && job.last_error.is_some() { "next try " }
@@ -578,8 +592,10 @@ pub fn job_content(m: &JobModel) -> Markup {
                 h1 { (m.row.name()) }
                 p class="sub" {
                     span class="chip" { (status.label) } " "
-                    @if m.row.title.is_some() { span class="mono" { "work #" (job.work) } " · " }
-                    a href=(job.work.canonical_url()) rel="noopener noreferrer" { "Open on AO3" }
+                    @if m.row.title.is_some() {
+                        span class="mono" { (if m.row.is_series() { "" } else { "work " }) (m.row.id_label()) } " · "
+                    }
+                    a href=(job.target.canonical_url()) rel="noopener noreferrer" { "Open on AO3" }
                 }
                 dl class="facts" {
                     div { dt { "Source" } dd { (source_label(job.source)) } }
@@ -606,9 +622,16 @@ pub fn job_content(m: &JobModel) -> Markup {
                         }
                         @if can_force(job) {
                             form method="post" action=(format!("/jobs/{}/force-retry", job.id)) {
-                                button class="btn" type="submit"
-                                    title="Ignore the stored book and download the whole work again. The file is replaced only if the download succeeds." {
-                                    "Re-download from scratch"
+                                @if m.row.is_series() {
+                                    button class="btn" type="submit"
+                                        title="List the series again and queue every work in it that is not queued already." {
+                                        "List the series again"
+                                    }
+                                } @else {
+                                    button class="btn" type="submit"
+                                        title="Ignore the stored book and download the whole work again. The file is replaced only if the download succeeds." {
+                                        "Re-download from scratch"
+                                    }
                                 }
                             }
                         }

@@ -38,6 +38,7 @@ use fanfold_domain::{
     Timestamp,
     job::{JobSource, JobState},
     mail::extract_work_ids,
+    work::WorkId,
 };
 use fanfold_testkit::memory::{InMemoryCursors, InMemoryJobs};
 use secrecy::SecretString;
@@ -143,6 +144,7 @@ async fn the_real_mailbox_produces_the_right_downloads() {
     let ingestor = Ingestor::new(
         source.clone(),
         jobs.clone(),
+        jobs.clone(),
         Arc::new(SystemClock),
         IngestConfig {
             allowed_senders: allowed,
@@ -168,7 +170,11 @@ async fn the_real_mailbox_produces_the_right_downloads() {
 
     let queued = jobs.all_jobs();
     assert_eq!(
-        queued.iter().map(|j| j.work.get()).collect::<BTreeSet<_>>(),
+        queued
+            .iter()
+            .filter_map(|j| j.target.work())
+            .map(WorkId::get)
+            .collect::<BTreeSet<_>>(),
         expected
     );
     assert!(
