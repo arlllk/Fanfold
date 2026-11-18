@@ -10,6 +10,7 @@
 pub mod admin;
 pub mod error;
 pub mod ingest;
+pub mod library;
 pub mod ports;
 pub mod session;
 pub mod stats;

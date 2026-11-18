@@ -164,6 +164,20 @@ async fn job(
     created.id
 }
 
+/// The delete buttons, over an in-memory library.
+fn library_admin(
+    repo: &Arc<InMemoryJobs>,
+    clock: &Arc<dyn Clock>,
+) -> Arc<fanfold_app::library::LibraryAdmin> {
+    Arc::new(fanfold_app::library::LibraryAdmin::new(
+        repo.clone(),
+        repo.clone(),
+        Arc::new(fanfold_testkit::memory::InMemoryLibrary::new()),
+        repo.clone(),
+        clock.clone(),
+    ))
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -243,6 +257,7 @@ async fn main() {
         catalog: repo.clone(),
         metadata: repo.clone(),
         admin: Arc::new(JobAdmin::new(repo.clone(), clock.clone())),
+        library: library_admin(&repo, &clock),
         session: Arc::new(fanfold_app::session::SessionAdmin::new(
             Arc::new(fanfold_testkit::memory::InMemorySession::new()),
             clock.clone(),

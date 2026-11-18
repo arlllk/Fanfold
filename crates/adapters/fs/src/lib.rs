@@ -36,6 +36,28 @@ impl FsLibrary {
         self.root.join(STAGING_DIR)
     }
 
+    /// Delete the book, then each folder above it that is left empty, up to the root.
+    fn remove_blocking(root: &Path, file_name: &str) -> io::Result<bool> {
+        let target = root.join(file_name);
+        let existed = match fs::remove_file(&target) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e),
+        };
+        let mut folder = target.parent();
+        while let Some(dir) = folder {
+            if dir == root || !dir.starts_with(root) {
+                break;
+            }
+            // Fails (and stops) as soon as a folder still holds something.
+            if fs::remove_dir(dir).is_err() {
+                break;
+            }
+            folder = dir.parent();
+        }
+        Ok(existed)
+    }
+
     fn publish_blocking(root: &Path, source: &Path, file_name: &str) -> io::Result<()> {
         let staging = root.join(STAGING_DIR);
         fs::create_dir_all(&staging)?;
@@ -92,6 +114,17 @@ impl LibraryStore for FsLibrary {
         tokio::task::spawn_blocking(move || Self::publish_blocking(&root, &source, &file_name))
             .await
             .map_err(|e| StoreError::Io(format!("publish task failed: {e}")))?
+            .map_err(|e| StoreError::Io(e.to_string()))
+    }
+
+    async fn remove(&self, file_name: &str) -> Result<bool, StoreError> {
+        if !is_valid_library_path(file_name) {
+            return Err(StoreError::InvalidName(file_name.to_owned()));
+        }
+        let (root, file_name) = (self.root.clone(), file_name.to_owned());
+        tokio::task::spawn_blocking(move || Self::remove_blocking(&root, &file_name))
+            .await
+            .map_err(|e| StoreError::Io(format!("remove task failed: {e}")))?
             .map_err(|e| StoreError::Io(e.to_string()))
     }
 }
@@ -254,6 +287,47 @@ mod tests {
         assert!(lib.exists(&in_series).await.unwrap());
         let leftovers: Vec<_> = fs::read_dir(lib.staging_dir()).unwrap().collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn removing_a_book_prunes_the_folders_it_leaves_empty_and_nothing_else() {
+        let (dir, lib) = library();
+        let root = dir.path().join("library");
+        for (name, path) in [
+            ("a.epub", "series/Saga 1/01 A 1.epub"),
+            ("b.epub", "series/Saga 1/02 B 2.epub"),
+            ("c.epub", "single/Author/C 3.epub"),
+        ] {
+            lib.publish(&source(dir.path(), name, "x"), path)
+                .await
+                .unwrap();
+        }
+        assert!(lib.remove("single/Author/C 3.epub").await.unwrap());
+        assert!(
+            !root.join("single").exists(),
+            "single/Author and single/ were left empty"
+        );
+        assert!(lib.remove("series/Saga 1/01 A 1.epub").await.unwrap());
+        assert!(
+            root.join("series/Saga 1/02 B 2.epub").exists(),
+            "the sibling stays"
+        );
+        assert!(lib.remove("series/Saga 1/02 B 2.epub").await.unwrap());
+        assert!(!root.join("series").exists());
+        assert!(
+            root.exists() && lib.staging_dir().exists(),
+            "the root and staging stay"
+        );
+        assert!(
+            !lib.remove("series/Saga 1/02 B 2.epub").await.unwrap(),
+            "already gone"
+        );
+        for hostile in ["../outside.epub", "single/../../x.epub", "/etc/passwd.epub"] {
+            assert!(matches!(
+                lib.remove(hostile).await,
+                Err(StoreError::InvalidName(_))
+            ));
+        }
     }
 
     proptest! {

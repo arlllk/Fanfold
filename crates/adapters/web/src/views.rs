@@ -102,6 +102,13 @@ pub enum Notice {
         cookies: u32,
     },
     SessionCleared,
+    /// A book was deleted (`false`: there was none to delete).
+    DeletedBook(bool),
+    /// A series was deleted: books deleted, books kept for another series.
+    DeletedSeries {
+        deleted: u32,
+        kept: u32,
+    },
 }
 
 impl Notice {
@@ -128,6 +135,13 @@ impl Notice {
             Some(Self::ForceRetried(job))
         } else if let Some(job) = id("cancelled") {
             Some(Self::Cancelled(job))
+        } else if let Some(deleted) = num("deleted_series") {
+            Some(Self::DeletedSeries {
+                deleted,
+                kept: num("kept").unwrap_or(0),
+            })
+        } else if let Some(file) = num("deleted_book") {
+            Some(Self::DeletedBook(file > 0))
         } else if let Some(cookies) = num("imported") {
             Some(Self::SessionImported { cookies })
         } else if num("cleared").is_some() {
@@ -179,7 +193,15 @@ fn notice_view(notice: Notice) -> Markup {
         Notice::Retried(id) => ("", "Queued again.", Some(id)),
         Notice::ForceRetried(id) => ("", "Queued to download again from scratch.", Some(id)),
         Notice::Cancelled(id) => ("warn", "Cancelled.", Some(id)),
-        Notice::Bulk { .. } | Notice::SessionImported { .. } => ("", "", None),
+        Notice::DeletedBook(true) => (
+            "warn",
+            "The book was deleted from the library. Its history is kept.",
+            None,
+        ),
+        Notice::DeletedBook(false) => ("warn", "There was no book to delete.", None),
+        Notice::Bulk { .. } | Notice::SessionImported { .. } | Notice::DeletedSeries { .. } => {
+            ("", "", None)
+        }
         Notice::SessionCleared => ("warn", "The browser session was forgotten.", None),
     };
     html! {
@@ -189,6 +211,9 @@ fn notice_view(notice: Notice) -> Markup {
                 @if skipped > 0 { " Skipped " (skipped) " that could not be retried (already queued, or changed since you looked)." }
             } @else if let Notice::SessionImported { cookies } = notice {
                 "Imported " (cookies) " cookies. They are used from the next download."
+            } @else if let Notice::DeletedSeries { deleted, kept } = notice {
+                "The series is no longer followed. Deleted " (deleted) (if deleted == 1 { " book" } else { " books" }) "."
+                @if kept > 0 { " Kept " (kept) " that also belong to another series you follow." }
             } @else {
                 (text)
                 @if let Some(id) = job { " " a href=(format!("/jobs/{id}")) { "View job" } }
@@ -645,6 +670,7 @@ pub fn job_content(m: &JobModel) -> Markup {
             }
         }
         }
+        (delete_controls(m))
         section {
             h2 { "Log" @if log_runs.len() > 1 { " " span class="hint" { "newest first" } } }
             @if log_runs.is_empty() {
@@ -670,6 +696,35 @@ pub fn job_content(m: &JobModel) -> Markup {
         }
     };
     content
+}
+
+/// "Delete…": a book that is in the library, or a series. Folded away, so a single slip of
+/// the finger cannot delete anything.
+fn delete_controls(m: &JobModel) -> Markup {
+    let job = &m.row.job;
+    let (action, button, explain) = match job.target {
+        Target::Work(work) if m.book.is_some() => (
+            format!("/works/{work}/delete"),
+            "Delete the book",
+            "Removes the EPUB from your library and cancels queued downloads of it. Its history is kept; a new download (or an AO3 email) brings it back.",
+        ),
+        Target::Series(series) => (
+            format!("/series/{series}/delete"),
+            "Delete the series and its books",
+            "Stops following the series, cancels its queued downloads and removes its books, except those that also belong to another series you follow.",
+        ),
+        Target::Work(_) => return html! {},
+    };
+    html! {
+        details class="danger" {
+            summary { "Delete…" }
+            p { (explain) }
+            form method="post" action=(action) {
+                input type="hidden" name="job" value=(job.id);
+                button class="btn danger" type="submit" { (button) }
+            }
+        }
+    }
 }
 
 #[must_use]
