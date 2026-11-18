@@ -40,7 +40,34 @@ pub struct LogOnlyNotifier;
 #[async_trait]
 impl Notifier for LogOnlyNotifier {
     async fn notify(&self, event: &NotifyEvent) -> Result<(), NotifyError> {
-        tracing::info!(?event, "notification (no channel configured)");
+        // A one-line summary: the full event carries the work's whole metadata.
+        let summary = match event {
+            NotifyEvent::Downloaded {
+                work,
+                title,
+                updated,
+                details,
+                ..
+            } => format!(
+                "{} work {work} \"{title}\"{}",
+                if *updated { "updated" } else { "downloaded" },
+                details.as_ref().map_or_else(String::new, |d| format!(
+                    " ({} new chapters, {})",
+                    d.new_chapters.len(),
+                    d.path
+                ))
+            ),
+            NotifyEvent::SeriesListed {
+                series,
+                name,
+                queued,
+                ..
+            } => format!("listed series {series} \"{name}\", queued {queued}"),
+            NotifyEvent::GaveUp { target, kind, .. } => format!("gave up on {target} ({kind})"),
+            NotifyEvent::SiteDegraded { kind, .. } => format!("site degraded ({kind})"),
+            NotifyEvent::SiteRecovered { .. } => "site recovered".to_owned(),
+        };
+        tracing::info!(%summary, "notification (no channel configured)");
         Ok(())
     }
 }
