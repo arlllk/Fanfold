@@ -1,10 +1,15 @@
-# Every merge into main is a release: a new `vX.Y.Z` tag on the merge commit, a GitHub release
-# with generated notes, and the container image published as X.Y.Z, X.Y, X (from 1.0) and
-# latest (image.yml, linux/amd64).
+# A merge into main that changes what goes into the image is a release: a new `vX.Y.Z` tag on
+# the merge commit, a GitHub release with generated notes, and the container image published as
+# X.Y.Z, X.Y, X (from 1.0) and latest (image.yml, linux/amd64, reproducible).
 #
-# The bump comes from the merged PR's label: `release:major`, `release:minor`, or
-# `release:patch`; no label means patch, and with several the biggest wins. It is applied to
-# the highest existing vX.Y.Z tag (the first release is Cargo.toml's version).
+# A merge that changes nothing the image is built from (CI, docs, Renovate config, tests,
+# examples, fuzzing, dev tooling) is not released: it would only be the previous image again.
+# It is part of the next release instead. The `force` input releases anyway.
+#
+# The bump comes from the labels of every PR merged since the last release: `release:major`,
+# `release:minor`, or `release:patch`; no label means patch, and the biggest wins (so a minor
+# PR that was not released on its own still makes the next release a minor one). It is applied
+# to the highest existing vX.Y.Z tag (the first release is Cargo.toml's version).
 #
 # Versions live only in tags: nothing is committed back to main, so a release never puts open
 # PRs behind or in conflict. The image is built with the version passed in (FANFOLD_VERSION).
@@ -23,6 +28,10 @@ on:
         description: Merge commit on main to release (default the branch head).
         type: string
         default: ""
+      force:
+        description: Release even if nothing the image is built from changed.
+        type: boolean
+        default: false
 
 concurrency:
   group: release
@@ -43,6 +52,12 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       SHA: ${{ inputs.sha || github.sha }}
+      FORCE: ${{ inputs.force || false }}
+      # What the image is built from (see the Dockerfile's COPY lines)...
+      IMAGE_INPUTS: '^(Dockerfile|\.dockerignore|Cargo\.toml|Cargo\.lock|crates/|python/(pyproject\.toml|uv\.lock)|licenses/|LICENSE-)'
+      # ...minus what never reaches the binary.
+      # (testdata/ is only ever include_str!'d by #[cfg(test)] code.)
+      NOT_IMAGE: '^crates/(.+/)?(tests|testdata|examples|benches)/|^crates/testkit/|\.md$'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -62,8 +77,26 @@ jobs:
             exit 0
           fi
 
-          labels=$(gh api "repos/$GH_REPO/commits/$SHA/pulls" \
-                     --jq '[.[] | select(.merged_at != null) | .labels[].name] | unique | join(" ")')
+          last=$(git tag --merged "$SHA" -l 'v*' | grep -E "$semver" | sort -V | tail -n1 || true)
+
+          if [ -n "$last" ] && [ "$FORCE" != true ]; then
+            changed=$(git diff --name-only "$last" "$SHA")
+            inputs=$(grep -E "$IMAGE_INPUTS" <<<"$changed" | grep -vE "$NOT_IMAGE" || true)
+            if [ -z "$inputs" ]; then
+              echo "Nothing the image is built from changed since $last: no release."
+              echo "Changed: $(tr '\n' ' ' <<<"$changed")"
+              exit 0
+            fi
+            printf 'Image inputs changed since %s:\n%s\n' "$last" "$inputs"
+          fi
+
+          # Every PR merged since the last release counts, not only this one.
+          labels=""
+          for c in $(git rev-list --first-parent "${last:+$last..}$SHA"); do
+            labels+=" $(gh api "repos/$GH_REPO/commits/$c/pulls" \
+                          --jq '[.[] | select(.merged_at != null) | .labels[].name] | join(" ")')"
+          done
+          labels=$(tr ' ' '\n' <<<"$labels" | sort -u | tr '\n' ' ')
           case " $labels " in
             *" release:major "*) bump="major" ;;
             *" release:minor "*) bump="minor" ;;

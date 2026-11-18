@@ -9,8 +9,17 @@
 # from environment variables or files the config points at. Nothing secret is baked in.
 #
 # RENOVATE. Every version below is kept current by Renovate (see renovate.json): base images
-# are written out in full with their digest on the FROM line, and the two tool versions carry a
-# `# renovate:` comment naming their datasource. Keep that shape when editing this file.
+# are written out in full with their digest on the FROM line, the two tool versions carry a
+# `# renovate:` comment naming their datasource, and FanFicFare with everything under it is
+# locked, with hashes, in python/uv.lock. Keep that shape when editing this file.
+#
+# REPRODUCIBLE. The same commit builds the same image, byte for byte (same digest): every input
+# is pinned (base images by digest, crates by Cargo.lock, Python packages by hash, wheels only),
+# nothing is fetched from apt, and the timestamps come from SOURCE_DATE_EPOCH (the commit time)
+# with BuildKit's `rewrite-timestamp=true`. CI passes both; by hand:
+#
+#   SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) docker buildx build \
+#     --output type=docker,rewrite-timestamp=true -t fanfold .
 #
 # CACHING. The layers are ordered so that the slow steps rarely re-run: the dependency build
 # (cargo-chef) is keyed on the dependency graph only, so a source change recompiles our own
@@ -97,13 +106,21 @@ RUN mkdir /out && cargo about generate --locked --manifest-path crates/server/Ca
 
 # ----------------------------------------------------------------------- FanFicFare
 # Built apart from the runtime so no pip cache or build leftovers ship.
+FROM ghcr.io/astral-sh/uv:0.13.9@sha256:d3b601f0c7b118bc1753febf7c41cc80981df678445e0254284eecf84db79a7d AS uv
+
 FROM python-base AS venv
-# renovate: datasource=pypi depName=FanFicFare
-ARG FANFICFARE_VERSION=4.63.0
-# The venv has no pip of its own (it is not needed at run time); the base image's pip installs
-# into it from outside.
-RUN python -m venv --without-pip /opt/venv \
- && pip --python /opt/venv/bin/python install --no-cache-dir "fanficfare==${FANFICFARE_VERSION}" \
+# Reproducible bytecode: with SOURCE_DATE_EPOCH set, Python writes hash-checked .pyc files
+# instead of ones stamped with the source file's mtime.
+ARG SOURCE_DATE_EPOCH
+# Exactly what python/uv.lock says: every package pinned and hash-checked, no resolution
+# (--locked fails if pyproject.toml and the lock disagree), and wheels only (--no-build: nothing
+# is compiled here, so nothing can differ). uv itself is only in this stage, never in the image,
+# and the venv has no pip (nothing installs at run time).
+COPY --from=uv /uv /usr/local/bin/uv
+COPY python/pyproject.toml python/uv.lock /deps/
+RUN UV_PROJECT_ENVIRONMENT=/opt/venv UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 UV_NO_CACHE=1 \
+    uv sync --project /deps --locked --no-build --no-dev --python /usr/local/bin/python \
  && /opt/venv/bin/python -I -c "import fanficfare"
 # The licence notice for everything in the venv. The script exits non-zero on a licence that
 # is not allowed, which fails the build (see licenses/python_licenses.py).
@@ -119,11 +136,13 @@ FROM python-base AS runtime
 # Docker/Podman the uid is a range inside your user namespace, so the default is fine.
 ARG APP_UID=10001
 ARG APP_GID=10001
+# useradd stamps /etc/shadow with "last password change" = today; with this set it uses the
+# commit's date instead.
+ARG SOURCE_DATE_EPOCH
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
- && rm -rf /var/lib/apt/lists/* \
- && groupadd --system --gid "${APP_GID}" fanfold \
+# No apt: the base image already ships ca-certificates, and an apt install would pull whatever
+# Debian has that day (and leave logs behind), which no two builds would agree on.
+RUN groupadd --system --gid "${APP_GID}" fanfold \
  && useradd --system --uid "${APP_UID}" --gid "${APP_GID}" --no-create-home \
         --home-dir /tmp/fanfold --shell /usr/sbin/nologin fanfold \
  # The only writable places. Mount a volume at /library (the books) and an empty tmpfs or

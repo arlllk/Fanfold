@@ -96,14 +96,18 @@ jobs:
 
       # `just integration`, spelled out: a throwaway PostgreSQL (the runner ships one, not
       # started) and the pinned FanFicFare against its offline test site. No network needed.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false
+
+      # The FanFicFare the image ships: the same python/uv.lock (and --locked fails if
+      # pyproject.toml and the lock disagree).
       - name: Integration setup
         run: |
           set -euo pipefail
           pg_bin=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -n1)
           echo "$pg_bin" >> "$GITHUB_PATH"
-          fanficfare=$(grep -oP "fanficfare==\K[0-9][^'\s]*" justfile)
-          python3 -m venv .venv
-          .venv/bin/pip install --quiet --disable-pip-version-check "fanficfare==$fanficfare"
+          UV_PROJECT_ENVIRONMENT="$PWD/.venv" uv sync --project python --locked --no-build
           echo "FFD_PYTHON=$PWD/.venv/bin/python" >> "$GITHUB_ENV"
 
       - name: Integration, PostgreSQL contracts

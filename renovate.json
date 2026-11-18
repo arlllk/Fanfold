@@ -9,6 +9,7 @@
     "cargo",
     "dockerfile",
     "github-actions",
+    "pep621",
     "custom.regex"
   ],
   "automergeStrategy": "merge-commit",
@@ -22,35 +23,16 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "Tool versions in Dockerfile ARGs, marked with a `# renovate: datasource=... depName=...` comment on the line above (cargo-chef, FanFicFare).",
+      "description": "Tool versions in Dockerfile ARGs, marked with a `# renovate: datasource=... depName=...` comment on the line above (cargo-chef, cargo-about). FanFicFare is in python/pyproject.toml + uv.lock (pep621 manager; lock file maintenance refreshes everything under it).",
       "managerFilePatterns": [
         "/(^|/)Dockerfile[^/]*$/"
       ],
       "matchStrings": [
         "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+)(?:\\s+versioning=(?<versioning>\\S+))?\\s*\\n\\s*ARG\\s+\\w+=(?<currentValue>\\S+)"
       ]
-    },
-    {
-      "customType": "regex",
-      "description": "The FanFicFare pin used by `just venv` (kept in step with the Dockerfile by the group rule below).",
-      "managerFilePatterns": [
-        "/(^|/)justfile$/"
-      ],
-      "matchStrings": [
-        "fanficfare==(?<currentValue>[0-9][^'\\s]*)"
-      ],
-      "depNameTemplate": "FanFicFare",
-      "datasourceTemplate": "pypi"
     }
   ],
   "packageRules": [
-    {
-      "description": "FanFicFare is pinned in two places; update both in one PR.",
-      "matchDepNames": [
-        "FanFicFare"
-      ],
-      "groupName": "FanFicFare"
-    },
     {
       "description": "Base images: the Rust image and the Python image move independently of Cargo/pip, so keep them out of the dependency PRs.",
       "matchManagers": [
