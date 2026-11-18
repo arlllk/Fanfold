@@ -439,7 +439,7 @@ mod tests {
             409
         );
         assert_eq!(
-            status(AdminError::AlreadyActive(WorkId::new(1).unwrap())),
+            status(AdminError::AlreadyActive(WorkId::new(1).unwrap().into())),
             409
         );
         assert_eq!(

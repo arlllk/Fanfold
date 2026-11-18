@@ -151,7 +151,7 @@ personal_ini = "{ini}"
     // 1. First download.
     let work = WorkId::new(42).unwrap();
     let EnqueueOutcome::Created(job) = store
-        .enqueue(work, JobSource::Manual, SystemClock.now())
+        .enqueue(work.into(), JobSource::Manual, SystemClock.now())
         .await
         .unwrap()
     else {
@@ -166,13 +166,16 @@ personal_ini = "{ini}"
         }
     );
 
-    let book = root.join("library/Test Story Title 42 [42].epub");
+    let book = root.join("library/single/Test Author aa/Test Story Title 42 42.epub");
     let size = std::fs::metadata(&book)
         .expect("the epub is in the library")
         .len();
     assert!(size > 1000, "{size}");
     let record = store.get_book(work).await;
-    assert_eq!(record.file_name, "Test Story Title 42 [42].epub");
+    assert_eq!(
+        record.file_name,
+        "single/Test Author aa/Test Story Title 42 42.epub"
+    );
     assert_eq!(
         JobRepository::get(store.as_ref(), job.id)
             .await
@@ -209,7 +212,7 @@ personal_ini = "{ini}"
     // 2. The author "updates": a new job, but the site has nothing new.
     let modified = std::fs::metadata(&book).unwrap().modified().unwrap();
     let EnqueueOutcome::Created(update) = store
-        .enqueue(work, JobSource::Mail, SystemClock.now())
+        .enqueue(work.into(), JobSource::Mail, SystemClock.now())
         .await
         .unwrap()
     else {
@@ -431,7 +434,7 @@ ops_listen = "127.0.0.1:0"
         "Done",
         "Run 1",
         "starting attempt 1",
-        "Test Story Title 42 [42].epub",
+        "single/Test Author aa/Test Story Title 42 42.epub",
     ] {
         assert!(page.contains(text), "missing {text:?} in {page}");
     }

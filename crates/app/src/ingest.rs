@@ -2,11 +2,15 @@
 
 use std::sync::Arc;
 
-use fanfold_domain::{job::JobSource, mail::extract_work_ids};
+use fanfold_domain::{
+    job::{JobSource, Target},
+    mail::{extract_series_ids, extract_work_ids},
+    metadata::FollowSource,
+};
 
 use crate::{
     error::AppError,
-    ports::{Clock, EnqueueOutcome, JobRepository, MailMessage, MailSource},
+    ports::{Clock, EnqueueOutcome, JobRepository, MailMessage, MailSource, MetadataStore},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,12 +28,15 @@ pub struct IngestReport {
     pub without_work_links: usize,
     pub enqueued: usize,
     pub already_active: usize,
+    /// Series links seen; each is followed from then on.
+    pub series_followed: usize,
     pub truncated_links: usize,
 }
 
 pub struct Ingestor {
     mail: Arc<dyn MailSource>,
     jobs: Arc<dyn JobRepository>,
+    metadata: Arc<dyn MetadataStore>,
     clock: Arc<dyn Clock>,
     config: IngestConfig,
 }
@@ -77,12 +84,14 @@ impl Ingestor {
     pub fn new(
         mail: Arc<dyn MailSource>,
         jobs: Arc<dyn JobRepository>,
+        metadata: Arc<dyn MetadataStore>,
         clock: Arc<dyn Clock>,
         config: IngestConfig,
     ) -> Self {
         Self {
             mail,
             jobs,
+            metadata,
             clock,
             config,
         }
@@ -112,7 +121,20 @@ impl Ingestor {
             report.from_unlisted_sender += 1;
             return Ok(());
         }
-        let mut ids = extract_work_ids(&format!("{}\n{}", message.text, message.html));
+        let body = format!("{}\n{}", message.text, message.html);
+        // A series link (e.g. a series subscription email) makes the series followed: works
+        // in it are filed under its folder. Only the works the email links are fetched, so
+        // nothing is downloaded again that did not change.
+        for series in extract_series_ids(&body)
+            .into_iter()
+            .take(self.config.max_links_per_message)
+        {
+            self.metadata
+                .follow_series(series, FollowSource::Mail, self.clock.now())
+                .await?;
+            report.series_followed += 1;
+        }
+        let mut ids = extract_work_ids(&body);
         if ids.is_empty() {
             report.without_work_links += 1;
             return Ok(());
@@ -124,7 +146,7 @@ impl Ingestor {
         for work in ids {
             match self
                 .jobs
-                .enqueue(work, JobSource::Mail, self.clock.now())
+                .enqueue(Target::Work(work), JobSource::Mail, self.clock.now())
                 .await?
             {
                 EnqueueOutcome::Created(job) => {
@@ -148,7 +170,9 @@ mod tests {
     use super::*;
     use crate::{
         error::{MailError, RepoError},
-        ports::{Checkpoint, MailBatch, MockClock, MockJobRepository, MockMailSource},
+        ports::{
+            Checkpoint, MailBatch, MockClock, MockJobRepository, MockMailSource, MockMetadataStore,
+        },
     };
 
     fn message(from: &str, text: &str) -> MailMessage {
@@ -173,6 +197,11 @@ mod tests {
             allowed_senders: vec!["archiveofourown.org".into()],
             max_links_per_message: 2,
         }
+    }
+
+    /// For messages without series links: the store must not be touched.
+    fn no_series() -> Arc<MockMetadataStore> {
+        Arc::new(MockMetadataStore::new())
     }
 
     fn clock() -> Arc<MockClock> {
@@ -255,7 +284,13 @@ mod tests {
             .in_sequence(&mut seq)
             .returning(|_| Ok(()));
 
-        let ingestor = Ingestor::new(Arc::new(mail), Arc::new(jobs), clock(), config());
+        let ingestor = Ingestor::new(
+            Arc::new(mail),
+            Arc::new(jobs),
+            no_series(),
+            clock(),
+            config(),
+        );
         let report = ingestor.run_once().await.unwrap();
         assert_eq!((report.messages, report.enqueued), (1, 1));
     }
@@ -274,7 +309,13 @@ mod tests {
         jobs.expect_enqueue()
             .returning(|_, _, _| Err(RepoError::Backend("db down".into())));
 
-        let ingestor = Ingestor::new(Arc::new(mail), Arc::new(jobs), clock(), config());
+        let ingestor = Ingestor::new(
+            Arc::new(mail),
+            Arc::new(jobs),
+            no_series(),
+            clock(),
+            config(),
+        );
         assert!(matches!(ingestor.run_once().await, Err(AppError::Repo(_))));
     }
 
@@ -285,7 +326,13 @@ mod tests {
             .returning(|| Err(MailError::Backend("down".into())));
         mail.expect_commit().never();
         let jobs = MockJobRepository::new();
-        let ingestor = Ingestor::new(Arc::new(mail), Arc::new(jobs), clock(), config());
+        let ingestor = Ingestor::new(
+            Arc::new(mail),
+            Arc::new(jobs),
+            no_series(),
+            clock(),
+            config(),
+        );
         assert!(matches!(ingestor.run_once().await, Err(AppError::Mail(_))));
     }
 
@@ -311,14 +358,20 @@ mod tests {
             .times(4)
             .returning(|work, source, now| {
                 Ok(EnqueueOutcome::Created(Job::new(
-                    JobId::new(work.to_i64()),
+                    JobId::new(work.id_i64()),
                     work,
                     source,
                     now,
                 )))
             });
 
-        let ingestor = Ingestor::new(Arc::new(mail), Arc::new(jobs), clock(), config());
+        let ingestor = Ingestor::new(
+            Arc::new(mail),
+            Arc::new(jobs),
+            no_series(),
+            clock(),
+            config(),
+        );
         let report = ingestor.run_once().await.unwrap();
         // First message: 5 links, cap 2 -> 3 dropped. Second: exactly at the cap -> none.
         assert_eq!((report.enqueued, report.truncated_links), (4, 3));
@@ -343,14 +396,20 @@ mod tests {
             .times(2)
             .returning(|work, source, now| {
                 Ok(EnqueueOutcome::Created(Job::new(
-                    JobId::new(work.to_i64()),
+                    JobId::new(work.id_i64()),
                     work,
                     source,
                     now,
                 )))
             });
 
-        let ingestor = Ingestor::new(Arc::new(mail), Arc::new(jobs), clock(), config());
+        let ingestor = Ingestor::new(
+            Arc::new(mail),
+            Arc::new(jobs),
+            no_series(),
+            clock(),
+            config(),
+        );
         let report = ingestor.run_once().await.unwrap();
         assert_eq!(
             report,
@@ -361,6 +420,7 @@ mod tests {
                 enqueued: 2,
                 already_active: 0,
                 truncated_links: 1,
+                series_followed: 0,
             }
         );
     }

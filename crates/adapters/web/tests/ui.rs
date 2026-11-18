@@ -74,6 +74,7 @@ fn rig_with_page_size(page_size: u32) -> Rig {
     let deps = Arc::new(WebDeps {
         jobs: jobs.clone(),
         catalog: jobs.clone(),
+        metadata: jobs.clone(),
         admin: Arc::new(JobAdmin::new(jobs.clone(), clock.clone())),
         session: Arc::new(SessionAdmin::new(
             session_store.clone(),
@@ -169,7 +170,7 @@ impl Rig {
         match self
             .jobs
             .enqueue(
-                WorkId::new(work).unwrap(),
+                WorkId::new(work).unwrap().into(),
                 JobSource::Mail,
                 self.clock.now(),
             )
@@ -733,7 +734,10 @@ async fn adding_a_link_queues_it_and_redirects_back() {
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
     assert_eq!(reply.location(), "/?added=1");
     assert_eq!(rig.jobs.all_jobs().len(), 1);
-    assert_eq!(rig.jobs.all_jobs()[0].work, WorkId::new(123).unwrap());
+    assert_eq!(
+        rig.jobs.all_jobs()[0].target,
+        WorkId::new(123).unwrap().into()
+    );
 
     let again = post(
         &rig.ui,
@@ -1742,5 +1746,62 @@ async fn the_session_fragment_is_just_the_live_region() {
     assert!(
         !fragment.body.contains("<form"),
         "forms stay outside the live region"
+    );
+}
+
+#[tokio::test]
+async fn a_series_link_queues_a_series_job_shown_by_its_name() {
+    use fanfold_app::ports::MetadataStore as _;
+    use fanfold_domain::{
+        job::Target,
+        metadata::{SeriesFacts, SeriesMetadata},
+        work::SeriesId,
+    };
+    let rig = rig();
+    let link = ["https://archiveofourown.org", "/series/2000001"].concat();
+    let reply = post(&rig.ui, "/jobs", &form(&[("url", &link)])).await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let series = SeriesId::new(2_000_001).unwrap();
+    let job = rig.jobs.all_jobs()[0].clone();
+    assert_eq!(job.target, Target::Series(series));
+
+    // Before the listing, the job is named by its number; after it, by the series' name.
+    let unnamed = get(&rig.ui, &format!("/jobs/{}", job.id)).await.body;
+    assert!(unnamed.contains("Series #2000001"), "{unnamed}");
+    rig.jobs
+        .record_series(
+            &SeriesMetadata {
+                series,
+                facts: SeriesFacts {
+                    name: "The Harbor Saga".into(),
+                    summary_html: String::new(),
+                    complete: Some(false),
+                    works: vec![WorkId::new(1).unwrap()],
+                },
+                raw: serde_json::Value::Null,
+            },
+            rig.clock.now(),
+            None,
+        )
+        .await
+        .unwrap();
+    let page = get(&rig.ui, &format!("/jobs/{}", job.id)).await.body;
+    assert!(page.contains("The Harbor Saga"));
+    assert!(page.contains("series #2000001"));
+    assert!(page.contains(r#"href="https://archiveofourown.org/series/2000001""#));
+    let dashboard = get(&rig.ui, "/").await.body;
+    assert!(dashboard.contains("The Harbor Saga") && dashboard.contains(">Series<"));
+    assert!(dashboard.contains("Add a work or a series"));
+    rig.jobs.claim_next(rig.clock.now()).await.unwrap();
+    let mut done = JobRepository::get(rig.jobs.as_ref(), job.id)
+        .await
+        .unwrap()
+        .unwrap();
+    done.succeed(rig.clock.now()).unwrap();
+    rig.jobs.save(&done).await.unwrap();
+    let finished = get(&rig.ui, &format!("/jobs/{}", job.id)).await.body;
+    assert!(
+        finished.contains("List the series again")
+            && !finished.contains("Re-download from scratch")
     );
 }

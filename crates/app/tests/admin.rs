@@ -16,7 +16,7 @@ use fanfold_app::{
 };
 use fanfold_domain::{
     failure::FailureKind,
-    job::{JobId, JobState},
+    job::{JobId, JobState, Target},
     retry::RetryPolicy,
     work::{UrlError, WorkId},
 };
@@ -88,8 +88,8 @@ async fn adding_a_link_queues_it_once() {
         panic!("must create")
     };
     assert_eq!(
-        (job.work, job.state),
-        (WorkId::new(77).unwrap(), JobState::Queued)
+        (job.target, job.state),
+        (Target::Work(WorkId::new(77).unwrap()), JobState::Queued)
     );
     assert_eq!(job.source, fanfold_domain::job::JobSource::Manual);
 
@@ -102,11 +102,39 @@ async fn adding_a_link_queues_it_once() {
 }
 
 #[tokio::test]
+async fn a_series_link_queues_one_series_job_once() {
+    let rig = rig();
+    let link = "https://archiveofourown.org/series/2000001?page=2";
+    let EnqueueOutcome::Created(job) = rig.admin.add_url(link).await.unwrap() else {
+        panic!("must create")
+    };
+    assert_eq!(
+        job.target,
+        Target::Series(fanfold_domain::work::SeriesId::new(2_000_001).unwrap())
+    );
+    assert_eq!(
+        rig.admin.add_url(link).await.unwrap(),
+        EnqueueOutcome::AlreadyActive(job.id)
+    );
+    // A work with the same number is a different thing.
+    assert!(matches!(
+        rig.admin
+            .add_url("https://archiveofourown.org/works/2000001")
+            .await
+            .unwrap(),
+        EnqueueOutcome::Created(_)
+    ));
+}
+
+#[tokio::test]
 async fn bad_links_are_rejected_with_the_reason() {
     let rig = rig();
     for (input, reason) in [
         ("https://example.com/works/1", UrlError::Host),
-        ("https://archiveofourown.org/series/1", UrlError::NotAWork),
+        (
+            "https://archiveofourown.org/users/someone",
+            UrlError::NotAWork,
+        ),
         ("not a link", UrlError::Malformed),
         ("", UrlError::Malformed),
     ] {
@@ -206,7 +234,7 @@ async fn a_finished_job_can_be_forced_to_download_again() {
 
     assert_eq!(
         rig.admin.force_retry(old).await.unwrap_err(),
-        AdminError::AlreadyActive(WorkId::new(3).unwrap())
+        AdminError::AlreadyActive(Target::Work(WorkId::new(3).unwrap()))
     );
     assert_eq!(
         rig.admin.force_retry(JobId::new(404)).await.unwrap_err(),
@@ -238,7 +266,7 @@ async fn retrying_when_the_work_is_already_queued_again_is_a_conflict() {
 
     assert_eq!(
         rig.admin.retry(old).await.unwrap_err(),
-        AdminError::AlreadyActive(WorkId::new(1).unwrap())
+        AdminError::AlreadyActive(Target::Work(WorkId::new(1).unwrap()))
     );
     assert_eq!(
         rig.jobs.get(old).await.unwrap().unwrap().state,

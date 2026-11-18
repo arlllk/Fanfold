@@ -61,12 +61,12 @@ pub fn render(event: &NotifyEvent) -> Value {
             )
         }
         NotifyEvent::GaveUp {
-            work,
+            target,
             kind,
             message,
         } => format!(
             "❌ Gave up on <{}> ({kind}): {}",
-            work.canonical_url(),
+            target.canonical_url(),
             sanitize(message, MAX_FIELD_CHARS)
         ),
         NotifyEvent::SiteDegraded { kind } => {
@@ -160,7 +160,7 @@ mod tests {
         };
         assert!(content(&updated).starts_with("🔄 Updated"));
         let gave_up = NotifyEvent::GaveUp {
-            work: work(),
+            target: work().into(),
             kind: FailureKind::NotFound,
             message: "deleted".into(),
         };
@@ -168,6 +168,12 @@ mod tests {
             content(&gave_up),
             "❌ Gave up on <https://archiveofourown.org/works/42> (not_found): deleted"
         );
+        let series = NotifyEvent::GaveUp {
+            target: fanfold_domain::work::SeriesId::new(7).unwrap().into(),
+            kind: FailureKind::SiteUnavailable,
+            message: "HTTP 525".into(),
+        };
+        assert!(content(&series).contains("<https://archiveofourown.org/series/7>"));
         assert!(
             content(&NotifyEvent::SiteDegraded {
                 kind: FailureKind::Blocked
@@ -200,7 +206,7 @@ mod tests {
     #[test]
     fn long_content_is_capped() {
         let event = NotifyEvent::GaveUp {
-            work: work(),
+            target: fanfold_domain::work::SeriesId::new(7).unwrap().into(),
             kind: FailureKind::Transient,
             message: "x".repeat(10_000),
         };

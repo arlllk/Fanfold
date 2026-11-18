@@ -28,15 +28,15 @@ use axum::{
 use fanfold_app::{
     admin::{AdminError, JobAdmin},
     ports::{
-        BookCatalog, Clock, Event, EventSource, JobFilter, JobRepository, Readiness,
+        BookCatalog, Clock, Event, EventSource, JobFilter, JobRepository, MetadataStore, Readiness,
         SiteStatusSource,
     },
     session::{SessionAdmin, SessionError},
     stats::{MailStats, WorkerStats},
 };
 use fanfold_domain::{
-    job::{Job, JobId},
-    work::WorkId,
+    job::{Job, JobId, Target},
+    work::{SeriesId, WorkId},
 };
 use maud::Markup;
 use tokio_stream::{
@@ -64,6 +64,8 @@ const ACTIVE_LEN: u32 = 50;
 pub struct WebDeps {
     pub jobs: Arc<dyn JobRepository>,
     pub catalog: Arc<dyn BookCatalog>,
+    /// Series names, for series jobs.
+    pub metadata: Arc<dyn MetadataStore>,
     pub admin: Arc<JobAdmin>,
     pub session: Arc<SessionAdmin>,
     pub events: Arc<dyn EventSource>,
@@ -160,16 +162,31 @@ fn internal(error: &impl std::fmt::Display) -> ProblemDetails {
 // -------------------------------------------------------------------- data
 
 async fn rows(deps: &WebDeps, jobs: Vec<Job>) -> Result<Vec<JobRow>, ProblemDetails> {
-    let works: Vec<WorkId> = jobs.iter().map(|j| j.work).collect();
+    let mut works: Vec<WorkId> = Vec::new();
+    let mut series: Vec<SeriesId> = Vec::new();
+    for job in &jobs {
+        match job.target {
+            Target::Work(w) => works.push(w),
+            Target::Series(s) => series.push(s),
+        }
+    }
     let titles: HashMap<WorkId, String> = deps
         .catalog
         .titles(&works)
         .await
         .map_err(|e| internal(&e))?;
+    let names: HashMap<SeriesId, String> = deps
+        .metadata
+        .series_names(&series)
+        .await
+        .map_err(|e| internal(&e))?;
     Ok(jobs
         .into_iter()
         .map(|job| JobRow {
-            title: titles.get(&job.work).cloned(),
+            title: match job.target {
+                Target::Work(w) => titles.get(&w).cloned(),
+                Target::Series(s) => names.get(&s).cloned(),
+            },
             job,
         })
         .collect())
@@ -317,15 +334,24 @@ async fn job_inner(
         .await
         .map_err(|e| internal(&e))?
         .ok_or_else(|| ProblemDetails::from(&AdminError::NotFound(id)))?;
-    let book = deps.catalog.get(job.work).await.map_err(|e| internal(&e))?;
+    let book = match job.target {
+        Target::Work(work) => deps.catalog.get(work).await.map_err(|e| internal(&e))?,
+        Target::Series(_) => None,
+    };
     let logs = deps.jobs.logs(id).await.map_err(|e| internal(&e))?;
+    let title = match job.target {
+        Target::Work(_) => book.as_ref().map(|b| b.title.clone()),
+        Target::Series(series) => deps
+            .metadata
+            .series_names(&[series])
+            .await
+            .map_err(|e| internal(&e))?
+            .remove(&series),
+    };
     let model = JobModel {
         now: deps.clock.now(),
         site: deps.site.site_status(),
-        row: JobRow {
-            title: book.as_ref().map(|b| b.title.clone()),
-            job,
-        },
+        row: JobRow { job, title },
         book,
         logs,
         max_attempts: deps.max_attempts,

@@ -9,6 +9,7 @@
 use std::{collections::HashMap, time::Duration};
 
 pub mod events;
+mod metadata;
 
 use async_trait::async_trait;
 use fanfold_app::{
@@ -20,7 +21,7 @@ use fanfold_app::{
 };
 use fanfold_domain::{
     Timestamp,
-    job::{Job, JobId, JobSource, JobState},
+    job::{Job, JobId, JobSource, JobState, Target, TargetKind},
     session::BrowserSession,
     timestamp::{from_millis, to_millis},
     work::WorkId,
@@ -64,7 +65,7 @@ fn backend(e: &sqlx::Error) -> RepoError {
 
 macro_rules! job_columns {
     () => {
-        "id, work_id, source, state, attempt, next_attempt_at_ms, created_at_ms, updated_at_ms, last_error, force"
+        "id, target_kind, target_id, source, state, attempt, next_attempt_at_ms, created_at_ms, updated_at_ms, last_error, force"
     };
 }
 
@@ -77,10 +78,14 @@ fn job_from_row(row: &PgRow) -> Result<Job, RepoError> {
     let source: String = row.try_get("source").map_err(|e| backend(&e))?;
     let state: String = row.try_get("state").map_err(|e| backend(&e))?;
     let attempt: i32 = row.try_get("attempt").map_err(|e| backend(&e))?;
+    let kind: String = row.try_get("target_kind").map_err(|e| backend(&e))?;
+    let kind = kind
+        .parse::<TargetKind>()
+        .map_err(|_| corrupt("target_kind"))?;
     Ok(Job {
         id: JobId::new(row.try_get("id").map_err(|e| backend(&e))?),
-        work: WorkId::from_i64(row.try_get("work_id").map_err(|e| backend(&e))?)
-            .ok_or_else(|| corrupt("work_id"))?,
+        target: Target::from_parts(kind, row.try_get("target_id").map_err(|e| backend(&e))?)
+            .ok_or_else(|| corrupt("target_id"))?,
         source: source.parse::<JobSource>().map_err(|_| corrupt("source"))?,
         state: state.parse::<JobState>().map_err(|_| corrupt("state"))?,
         attempt: u32::try_from(attempt).map_err(|_| corrupt("attempt"))?,
@@ -145,7 +150,7 @@ impl PgStore {
 impl JobRepository for PgStore {
     async fn enqueue(
         &self,
-        work: WorkId,
+        target: Target,
         source: JobSource,
         now: Timestamp,
     ) -> Result<EnqueueOutcome, RepoError> {
@@ -153,11 +158,12 @@ impl JobRepository for PgStore {
         // Two statements can race with a job finishing in between; a few retries
         // make that window irrelevant.
         for _ in 0..3 {
-            let inserted = sqlx::query(concat!("INSERT INTO jobs (work_id, source, state, attempt, next_attempt_at_ms, created_at_ms, updated_at_ms)
-                 VALUES ($1, $2, 'queued', 0, $3, $3, $3)
+            let inserted = sqlx::query(concat!("INSERT INTO jobs (target_kind, target_id, source, state, attempt, next_attempt_at_ms, created_at_ms, updated_at_ms)
+                 VALUES ($1, $2, $3, 'queued', 0, $4, $4, $4)
                  ON CONFLICT DO NOTHING
                  RETURNING ", job_columns!(), ""))
-            .bind(work.to_i64())
+            .bind(target.kind().as_str())
+            .bind(target.id_i64())
             .bind(source.as_str())
             .bind(now_ms)
             .fetch_optional(&self.pool)
@@ -167,9 +173,11 @@ impl JobRepository for PgStore {
                 return Ok(EnqueueOutcome::Created(job_from_row(&row)?));
             }
             let active: Option<i64> = sqlx::query_scalar(
-                "SELECT id FROM jobs WHERE work_id = $1 AND state IN ('queued', 'running')",
+                "SELECT id FROM jobs
+                 WHERE target_kind = $1 AND target_id = $2 AND state IN ('queued', 'running')",
             )
-            .bind(work.to_i64())
+            .bind(target.kind().as_str())
+            .bind(target.id_i64())
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| backend(&e))?;
