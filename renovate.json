@@ -11,8 +11,10 @@
     "github-actions",
     "custom.regex"
   ],
+  "automergeStrategy": "merge-commit",
   "lockFileMaintenance": {
     "enabled": true,
+    "automerge": true,
     "schedule": [
       "before 6am on monday"
     ]
@@ -83,6 +85,23 @@
         "github-runners"
       ],
       "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Automerge patch updates of stable (>= 1.0) dependencies once the required `ci-ok` check passes (GitHub auto-merge, enforced by the main ruleset). Minor and major updates, and patches of anything still on 0.x (where a patch may break), run CI and wait for a human. Digest and pin updates: next rule. Last on purpose, so no rule above overrides it. Lock file maintenance automerges too (top-level lockFileMaintenance). Each merge is a patch release (release.yml).",
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "matchCurrentVersion": "!/^v?0\\./",
+      "automerge": true
+    },
+    {
+      "description": "Digest and pin updates automerge too, at any version: the tag or version stays the same, only the digest it is pinned to changes (a rebuilt base image, a GitHub Action pinned to the commit of its tag).",
+      "matchUpdateTypes": [
+        "digest",
+        "pin",
+        "pinDigest"
+      ],
+      "automerge": true
     }
   ]
 }
