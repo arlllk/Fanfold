@@ -1479,6 +1479,15 @@ mod tests {
     async fn fake_flaresolverr_serving(
         page: &'static str,
     ) -> (u16, Arc<Mutex<Vec<serde_json::Value>>>) {
+        fake_flaresolverr_routing(&[], page).await
+    }
+
+    /// [`fake_flaresolverr_serving`], answering a URL containing a route's needle with that
+    /// route's page, and any other URL with `default`.
+    async fn fake_flaresolverr_routing(
+        routes: &'static [(&'static str, &'static str)],
+        default: &'static str,
+    ) -> (u16, Arc<Mutex<Vec<serde_json::Value>>>) {
         use tokio::{
             io::{AsyncReadExt as _, AsyncWriteExt as _},
             net::TcpListener,
@@ -1518,6 +1527,11 @@ mod tests {
                     };
                     let request: serde_json::Value =
                         serde_json::from_str(&body).unwrap_or_default();
+                    let url = request["url"].as_str().unwrap_or_default();
+                    let page = routes
+                        .iter()
+                        .find(|(needle, _)| url.contains(needle))
+                        .map_or(default, |(_, page)| *page);
                     let reply = serde_json::json!({
                         "status": "ok", "message": "", "session": "fake",
                         "solution": {
@@ -1976,6 +1990,65 @@ mod tests {
         if let Some(dir) = book.path.parent() {
             let _ = tokio::fs::remove_dir_all(dir).await;
         }
+    }
+
+    /// An AO3 work that only logged-in users may read.
+    const AO3_LOGIN_REQUIRED: &str = "<html><body><div id=\"main\">\
+        <p class=\"notice\">This work is only available to registered users of the Archive.</p>\
+        </div></body></html>";
+
+    /// Regression (work 32088421 in production): the login token request hit AO3's 525 through
+    /// FlareSolverr; FanFicFare reports that as "Failed getting login token", which was taken
+    /// for a transient error. The site was down: it is an outage, retried at no cost.
+    #[tokio::test]
+    #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
+    async fn a_login_token_lost_to_an_outage_is_an_outage() {
+        static ROUTES: [(&str, &str); 1] = [("token_dispenser", CLOUDFLARE_525)];
+        let scratch = tempfile::tempdir().unwrap();
+        let (port, _seen) = fake_flaresolverr_routing(&ROUTES, AO3_LOGIN_REQUIRED).await;
+        let ini = flaresolverr_ini(scratch.path(), port);
+        let err = real_downloader(
+            scratch.path(),
+            &ini,
+            "https://archiveofourown.org/works/{id}",
+        )
+        .download(&request(None))
+        .await
+        .expect_err("no work behind a 525");
+        assert_eq!(
+            err.kind,
+            FailureKind::SiteUnavailable,
+            "{}\n{}",
+            err.message,
+            err.log
+        );
+    }
+
+    /// When the site does answer but the login cannot be done this way, it is a login problem:
+    /// the login fallback (plain HTTP after a FlareSolverr clearance) must get its turn.
+    #[tokio::test]
+    #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
+    async fn a_login_token_that_cannot_be_read_asks_for_the_login_fallback() {
+        static ROUTES: [(&str, &str); 1] =
+            [("token_dispenser", "<html><body>not the token</body></html>")];
+        let scratch = tempfile::tempdir().unwrap();
+        let (port, _seen) = fake_flaresolverr_routing(&ROUTES, AO3_LOGIN_REQUIRED).await;
+        let ini = flaresolverr_ini(scratch.path(), port);
+        let err = real_downloader(
+            scratch.path(),
+            &ini,
+            "https://archiveofourown.org/works/{id}",
+        )
+        .download(&request(None))
+        .await
+        .expect_err("no login, no work");
+        assert_eq!(
+            err.kind,
+            FailureKind::AuthFailed,
+            "{}\n{}",
+            err.message,
+            err.log
+        );
     }
 
     /// Opt-in: drives the *real* worker against FanFicFare's offline `test1.com` site.
