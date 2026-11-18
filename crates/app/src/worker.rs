@@ -18,9 +18,9 @@ use fanfold_domain::{
 use crate::{
     error::AppError,
     ports::{
-        BookCatalog, BookRecord, Clock, DownloadError, DownloadRequest, DownloadedBook, Downloader,
-        EnqueueOutcome, Jitter, JobRepository, LibraryStore, LogEntry, LogLevel, MetadataStore,
-        Notifier, NotifyEvent, SiteStatus, SiteStatusSource,
+        BookCatalog, BookRecord, Clock, DownloadDetails, DownloadError, DownloadRequest,
+        DownloadedBook, Downloader, EnqueueOutcome, Jitter, JobRepository, LibraryStore, LogEntry,
+        LogLevel, MetadataStore, Notifier, NotifyEvent, SiteStatus, SiteStatusSource,
     },
     stats::WorkerStats,
 };
@@ -74,6 +74,8 @@ pub struct Worker {
     retry: RetryPolicy,
     breaker: Mutex<CircuitBreaker>,
     stats: Arc<WorkerStats>,
+    /// When the current site trouble began (the breaker tripped), for the recovery notice.
+    down_since: Mutex<Option<fanfold_domain::Timestamp>>,
 }
 
 impl fmt::Debug for Worker {
@@ -92,6 +94,7 @@ struct Published {
     /// Whether the library changed at all.
     changed: bool,
     log: String,
+    details: Option<Box<DownloadDetails>>,
 }
 
 /// A series that was listed, and what that queued.
@@ -115,6 +118,17 @@ pub const METADATA_CHANGED_NOTE: &str = "the work's details changed: recorded a 
 
 const MAX_LOG_CHARS: usize = 20_000;
 
+/// One chapter seen twice: AO3's chapter id when both have one, else number and title.
+fn same_chapter(
+    a: &fanfold_domain::metadata::Chapter,
+    b: &fanfold_domain::metadata::Chapter,
+) -> bool {
+    match (a.ao3_id, b.ao3_id) {
+        (Some(x), Some(y)) => x == y,
+        _ => a.number == b.number && a.title == b.title,
+    }
+}
+
 /// A failure of our own storage, not of the site: retried like a transient error.
 const fn internal(message: String) -> DownloadError {
     DownloadError {
@@ -132,6 +146,7 @@ impl Worker {
             retry: config.retry,
             breaker: Mutex::new(CircuitBreaker::new(config.breaker)),
             stats: Arc::new(WorkerStats::new()),
+            down_since: Mutex::new(None),
         }
     }
 
@@ -241,6 +256,8 @@ impl Worker {
             .download(&DownloadRequest { work, existing })
             .await?;
 
+        // The chapters recorded before this download tell what an update added.
+        let previous = self.ports.metadata.work_state(work).await.ok().flatten();
         // What the site said is recorded first, even when the book itself did not change.
         if let Err(err) = self.record_metadata(job, &book).await {
             self.ports.downloader.release(&book).await;
@@ -256,6 +273,7 @@ impl Worker {
                 updated: false,
                 changed: false,
                 log: book.log,
+                details: None,
             });
         }
 
@@ -280,17 +298,35 @@ impl Worker {
             .catalog
             .upsert(&BookRecord {
                 work,
-                file_name,
+                file_name: file_name.clone(),
                 title: book.title.clone(),
                 updated_at: self.ports.clock.now(),
             })
             .await
             .map_err(|e| internal(e.to_string()))?;
+        let details = book.metadata.map(|metadata| {
+            let new_chapters = match (&previous, updated) {
+                (Some(before), true) => metadata
+                    .chapters
+                    .iter()
+                    .filter(|c| !before.chapters.iter().any(|old| same_chapter(old, c)))
+                    .cloned()
+                    .collect(),
+                _ => Vec::new(),
+            };
+            Box::new(DownloadDetails {
+                metadata,
+                previous,
+                new_chapters,
+                path: file_name,
+            })
+        });
         Ok(Published {
             title: book.title,
             updated,
             changed: true,
             log: book.log,
+            details,
         })
     }
 
@@ -410,8 +446,18 @@ impl Worker {
             listed.name, listed.works, listed.queued, listed.already_active
         );
         self.log(job, LogLevel::Info, line).await;
+        if let Target::Series(series) = job.target {
+            self.announce(&NotifyEvent::SeriesListed {
+                job: job.id,
+                series,
+                name: listed.name,
+                works: listed.works,
+                queued: listed.queued,
+            })
+            .await;
+        }
         if event == BreakerEvent::Recovered {
-            self.announce(&NotifyEvent::SiteRecovered).await;
+            self.announce_recovery().await;
         }
         Ok(Outcome::Succeeded)
     }
@@ -438,9 +484,11 @@ impl Worker {
             self.log(job, LogLevel::Info, format!("{verb} \"{}\"", done.title))
                 .await;
             self.announce(&NotifyEvent::Downloaded {
+                job: job.id,
                 work,
                 title: done.title,
                 updated: done.updated,
+                details: done.details,
             })
             .await;
         } else {
@@ -448,7 +496,7 @@ impl Worker {
             self.log(job, LogLevel::Info, line).await;
         }
         if event == BreakerEvent::Recovered {
-            self.announce(&NotifyEvent::SiteRecovered).await;
+            self.announce_recovery().await;
         }
         Ok(Outcome::Succeeded)
     }
@@ -486,19 +534,23 @@ impl Worker {
         self.log(job, LogLevel::Error, line).await;
         if event == BreakerEvent::Tripped {
             self.stats.record_breaker_trip();
-            self.announce(&NotifyEvent::SiteDegraded { kind: err.kind })
-                .await;
+            self.announce_degraded(err.kind, &err.message, now).await;
         }
         if resolution == Resolution::GaveUp {
+            let title = self.target_name(job.target).await;
             self.announce(&NotifyEvent::GaveUp {
+                job: job.id,
                 target: job.target,
+                title,
                 kind: err.kind,
                 message: err.message,
+                attempts: job.attempt,
+                max_attempts: self.retry.max_attempts,
             })
             .await;
         }
         if event == BreakerEvent::Recovered {
-            self.announce(&NotifyEvent::SiteRecovered).await;
+            self.announce_recovery().await;
         }
         Ok(Outcome::Failed(resolution))
     }
@@ -523,6 +575,72 @@ impl Worker {
         }
         let clipped: String = output.chars().take(MAX_LOG_CHARS).collect();
         self.log(job, level, clipped).await;
+    }
+
+    async fn announce_degraded(
+        &self,
+        kind: FailureKind,
+        message: &str,
+        now: fanfold_domain::Timestamp,
+    ) {
+        use fanfold_domain::breaker::BreakerState;
+        self.down_since
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(now);
+        let state = self.breaker().state();
+        let retry_at = match state {
+            BreakerState::Open { until, .. } => until,
+            _ => now,
+        };
+        let waiting = self
+            .ports
+            .jobs
+            .counts()
+            .await
+            .ok()
+            .map(|c| c.queued + c.retrying);
+        self.announce(&NotifyEvent::SiteDegraded {
+            kind,
+            message: message.to_owned(),
+            retry_at,
+            waiting,
+        })
+        .await;
+    }
+
+    async fn announce_recovery(&self) {
+        let down_since = self
+            .down_since
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        self.announce(&NotifyEvent::SiteRecovered {
+            down_since,
+            at: self.ports.clock.now(),
+        })
+        .await;
+    }
+
+    /// A work's book title, or a series' name, when known. Best effort.
+    async fn target_name(&self, target: Target) -> Option<String> {
+        match target {
+            Target::Work(work) => self
+                .ports
+                .catalog
+                .get(work)
+                .await
+                .ok()
+                .flatten()
+                .map(|b| b.title),
+            Target::Series(series) => self
+                .ports
+                .metadata
+                .series_names(&[series])
+                .await
+                .ok()
+                .and_then(|mut names| names.remove(&series)),
+        }
     }
 
     /// Notifications are best-effort: a Discord outage must not affect downloads.

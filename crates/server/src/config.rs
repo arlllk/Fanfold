@@ -283,7 +283,17 @@ const fn default_true() -> bool {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiscordConfig {
-    pub webhook: SecretRef,
+    /// Downloads and series. Optional: leave it out to post failures only.
+    #[serde(default)]
+    pub webhook: Option<SecretRef>,
+    /// Gave up, AO3 unhealthy, AO3 back: another channel, perhaps muted. Without it, failures
+    /// are not posted.
+    #[serde(default)]
+    pub failures_webhook: Option<SecretRef>,
+    /// The web interface's address as you open it (e.g. `https://fanfold.example.org`):
+    /// notifications then link to their job.
+    #[serde(default)]
+    pub ui_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -347,6 +357,7 @@ pub struct Secrets {
     /// `None` when downloads go through `FlareSolverr`, which cannot log in.
     pub ao3: Option<Ao3Credentials>,
     pub discord_webhook: Option<SecretString>,
+    pub discord_failures_webhook: Option<SecretString>,
     pub mail_password: Option<SecretString>,
 }
 
@@ -457,6 +468,19 @@ impl Config {
             self.retry.cap.0 >= self.retry.base.0,
             "retry.cap must be at least retry.base",
         );
+        if let Some(discord) = &self.discord {
+            require(
+                discord.webhook.is_some() || discord.failures_webhook.is_some(),
+                "discord needs webhook, failures_webhook, or both",
+            );
+            require(
+                discord.ui_url.as_deref().is_none_or(|u| {
+                    url::Url::parse(u)
+                        .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.has_host())
+                }),
+                "discord.ui_url must be an http(s) URL with a host",
+            );
+        }
         require(
             self.breaker.failure_threshold >= 1,
             "breaker.failure_threshold must be at least 1",
@@ -560,7 +584,13 @@ impl Config {
         let discord_webhook = self
             .discord
             .as_ref()
-            .map(|d| get("discord.webhook", &d.webhook));
+            .and_then(|d| d.webhook.as_ref())
+            .map(|w| get("discord.webhook", w));
+        let discord_failures_webhook = self
+            .discord
+            .as_ref()
+            .and_then(|d| d.failures_webhook.as_ref())
+            .map(|w| get("discord.failures_webhook", w));
         let mail_password = self
             .mail
             .as_ref()
@@ -571,6 +601,7 @@ impl Config {
                     database_password,
                     ao3,
                     discord_webhook: webhook.flatten(),
+                    discord_failures_webhook: discord_failures_webhook.flatten(),
                     mail_password: mail.flatten(),
                 })
             }
@@ -628,6 +659,7 @@ password = { env = "AO3_PASSWORD" }
             "AO3_USERNAME",
             "AO3_PASSWORD",
             "DISCORD_WEBHOOK_URL",
+            "DISCORD_FAILURES_WEBHOOK_URL",
             "MAIL_PASSWORD",
         ] {
             fake.env.insert(name.into(), "value".into());
@@ -998,6 +1030,7 @@ password = { env = "MAIL_PASSWORD" }
             "alice"
         );
         assert!(secrets.discord_webhook.is_none());
+        assert!(secrets.discord_failures_webhook.is_none());
         assert!(!format!("{secrets:?}").contains("dbpw"));
     }
 
@@ -1036,5 +1069,38 @@ password = { env = "MAIL_PASSWORD" }
         fn duration_parsing_never_panics(s in "\\PC*") {
             let _ = parse_duration(&s);
         }
+    }
+
+    #[test]
+    fn failures_can_have_their_own_discord_channel_or_be_the_only_one() {
+        let both = format!(
+            "{MINIMAL}\n[discord]\nwebhook = {{ env = \"MAIN\" }}\n\
+             failures_webhook = {{ env = \"MUTED\" }}\nui_url = \"https://fanfold.example.org\"\n"
+        );
+        let config = parse(&both).unwrap();
+        assert_eq!(
+            config.discord.as_ref().unwrap().ui_url.as_deref(),
+            Some("https://fanfold.example.org")
+        );
+        let only_failures =
+            format!("{MINIMAL}\n[discord]\nfailures_webhook = {{ env = \"MUTED\" }}\n");
+        assert!(
+            parse(&only_failures)
+                .unwrap()
+                .discord
+                .unwrap()
+                .webhook
+                .is_none()
+        );
+        assert!(matches!(
+            parse(&format!("{MINIMAL}\n[discord]\n")),
+            Err(ConfigError::Invalid(p)) if p.iter().any(|m| m.contains("failures_webhook"))
+        ));
+        assert!(matches!(
+            parse(&format!(
+                "{MINIMAL}\n[discord]\nwebhook = {{ env = \"MAIN\" }}\nui_url = \"ftp://x\"\n"
+            )),
+            Err(ConfigError::Invalid(p)) if p.iter().any(|m| m.contains("ui_url"))
+        ));
     }
 }

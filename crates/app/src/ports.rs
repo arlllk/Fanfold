@@ -14,7 +14,7 @@ use fanfold_domain::{
     Timestamp,
     failure::FailureKind,
     job::{Job, JobId, JobSource, Target},
-    metadata::{FollowSource, SeriesMetadata, WorkMetadata, WorkState},
+    metadata::{Chapter, FollowSource, SeriesMetadata, WorkMetadata, WorkState},
     session::BrowserSession,
     work::{SeriesId, WorkId},
 };
@@ -433,23 +433,63 @@ pub trait SiteStatusSource: Send + Sync {
 
 // -------------------------------------------------------------------- notifier
 
+/// What a finished download brought, for notifications.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadDetails {
+    pub metadata: WorkMetadata,
+    /// What was recorded about the work before this download (`None` on a first download, or
+    /// after the history was started afresh): what an update changed is the difference.
+    pub previous: Option<WorkState>,
+    /// The chapters this update added, in order. Empty on a first download.
+    pub new_chapters: Vec<Chapter>,
+    /// Where the book is in the library.
+    pub path: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotifyEvent {
     Downloaded {
+        job: JobId,
         work: WorkId,
         title: String,
         updated: bool,
+        /// Present when the site told us about the work during the download.
+        details: Option<Box<DownloadDetails>>,
+    },
+    /// A series was listed and its works queued.
+    SeriesListed {
+        job: JobId,
+        series: SeriesId,
+        name: String,
+        works: usize,
+        queued: usize,
     },
     GaveUp {
+        job: JobId,
         target: Target,
+        /// The work's or series' name, when known.
+        title: Option<String>,
         kind: FailureKind,
         message: String,
+        /// Failures that counted against the job, and how many it was allowed.
+        attempts: u32,
+        max_attempts: u32,
     },
     /// The circuit breaker opened: the site is having trouble.
     SiteDegraded {
         kind: FailureKind,
+        /// The failure that tipped it over.
+        message: String,
+        /// When the next probe download may run.
+        retry_at: Timestamp,
+        /// Jobs waiting meanwhile, when known.
+        waiting: Option<u64>,
     },
-    SiteRecovered,
+    SiteRecovered {
+        /// When the trouble began, when known.
+        down_since: Option<Timestamp>,
+        at: Timestamp,
+    },
 }
 
 #[cfg_attr(any(test, feature = "mocks"), mockall::automock)]
