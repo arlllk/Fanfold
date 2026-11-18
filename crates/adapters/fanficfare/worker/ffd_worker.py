@@ -34,6 +34,7 @@ import logging
 import os
 import re
 import sys
+import time
 import traceback
 import zipfile
 import xml.etree.ElementTree as ET
@@ -95,12 +96,22 @@ def status_for_cloudflare(code):
     return 429 if code == 1015 else 403  # 1015 is Cloudflare's rate limit, other 1xxx are blocks
 
 
+# Cloudflare could not get an answer from the origin (AO3): 520-527. These are retried at
+# once, a few times: during AO3's partial 525 outages roughly half of all fresh connections
+# fail and a retry is a fresh coin toss, while the request never reached AO3, so retrying is
+# safe even for a login form. Blocks and rate limits (1xxx) are never retried.
+CLOUDFLARE_ORIGIN_ERRORS = range(520, 528)
+CLOUDFLARE_RETRIES = 3
+CLOUDFLARE_RETRY_DELAY_S = 1.0
+
+
 def install_cloudflare_guard():
-    """Make FanFicFare's FlareSolverr fetcher fail on a Cloudflare error page.
+    """Make FanFicFare's FlareSolverr fetcher retry, then fail, on a Cloudflare error page.
 
     Without this, an AO3 page that came back as Cloudflare's "525: SSL handshake failed"
     is taken for a real page: a chapter list with no chapters gives a book with only a
-    title page, and FanFicFare reports success.
+    title page, and FanFicFare reports success. FanFicFare's own plain-HTTP fetcher already
+    retries 525s (retry_http_525_failures); this gives the FlareSolverr path the same.
     """
     from fanficfare import exceptions
     from fanficfare.fetchers import fetcher_flaresolverr_proxy as module
@@ -111,16 +122,22 @@ def install_cloudflare_guard():
     original = fetcher.request
 
     def request(self, method, url, headers=None, parameters=None):
-        response = original(self, method, url, headers=headers, parameters=parameters)
-        code = cloudflare_error(getattr(response, "content", None))
-        if code is not None:
-            raise exceptions.HTTPErrorFFF(
-                url,
-                status_for_cloudflare(code),
-                "Cloudflare error code: %d (through FlareSolverr)" % code,
-                None,
-            )
-        return response
+        for attempt in range(CLOUDFLARE_RETRIES + 1):
+            response = original(self, method, url, headers=headers, parameters=parameters)
+            code = cloudflare_error(getattr(response, "content", None))
+            if code is None:
+                return response
+            if code not in CLOUDFLARE_ORIGIN_ERRORS or attempt == CLOUDFLARE_RETRIES:
+                raise exceptions.HTTPErrorFFF(
+                    url,
+                    status_for_cloudflare(code),
+                    "Cloudflare error code: %d (through FlareSolverr)" % code,
+                    None,
+                )
+            delay = CLOUDFLARE_RETRY_DELAY_S * (attempt + 1)
+            print("Cloudflare error %d for %s; retrying in %.0f s (%d of %d)"
+                  % (code, url, delay, attempt + 1, CLOUDFLARE_RETRIES))
+            time.sleep(delay)
 
     request._cloudflare_guard = True
     fetcher.request = request
