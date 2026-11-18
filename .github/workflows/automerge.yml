@@ -1,0 +1,69 @@
+# Merges the owner's pull requests once CI has passed on their latest commit, then starts the
+# release (release.yml) for the merge.
+#
+# Merged automatically: PRs from a branch of this repository (never a fork) that the owner
+# opened, or that pr.yml opened for the owner's push (assigned to them), are not drafts, and
+# do not carry the `no-automerge` label. Everything else (Renovate, contributors) waits for a
+# human. The ruleset on main still applies: `ci-ok` must be green or the merge is refused.
+#
+# GitHub's own auto-merge is not used: a merge it performs for the Actions token does not
+# trigger the push to main that release.yml listens for, so the release would never run.
+# This runs on workflow_run, from main's copy of this file, and never checks out PR code.
+name: automerge
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: automerge-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      contains(fromJSON('["pull_request", "workflow_dispatch"]'), github.event.workflow_run.event) &&
+      github.event.workflow_run.head_branch != 'main'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write # start release.yml
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      OWNER: ${{ github.repository_owner }}
+      BRANCH: ${{ github.event.workflow_run.head_branch }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Merge if eligible
+        run: |
+          set -euo pipefail
+          pr=$(gh pr list --head "$BRANCH" --base main --state open \
+                 --json number,headRefOid,isDraft,author,assignees,labels,isCrossRepository \
+                 --jq '.[0] // empty')
+          if [ -z "$pr" ]; then echo "No open PR into main for $BRANCH."; exit 0; fi
+          n=$(jq -r .number <<<"$pr")
+
+          why=$(jq -r --arg sha "$SHA" --arg owner "$OWNER" '
+            if .isCrossRepository then "it comes from a fork"
+            elif .headRefOid != $sha then "CI ran on \($sha), but the PR is now at \(.headRefOid)"
+            elif .isDraft then "it is a draft"
+            elif any(.labels[]; .name == "no-automerge") then "it is labelled no-automerge"
+            elif (.author.login == $owner) or any(.assignees[]; .login == $owner) then ""
+            else "it is not the owner'"'"'s (author \(.author.login))"
+            end' <<<"$pr")
+          if [ -n "$why" ]; then echo "Not merging #$n: $why."; exit 0; fi
+
+          # --match-head-commit: refuse if anything was pushed after the CI run we checked.
+          # (The branch is deleted by the repository's "delete head branches" setting.)
+          gh pr merge "$n" --merge --match-head-commit "$SHA"
+          merged=$(gh pr view "$n" --json mergeCommit --jq .mergeCommit.oid)
+          echo "Merged #$n as $merged; releasing it."
+          gh workflow run release.yml --ref main -f sha="$merged"

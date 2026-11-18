@@ -1,0 +1,118 @@
+# Every merge into main is a release: a new `vX.Y.Z` tag on the merge commit, a GitHub release
+# with generated notes, and the container image published as X.Y.Z, X.Y, X (from 1.0) and
+# latest (image.yml, linux/amd64).
+#
+# The bump comes from the merged PR's label: `release:major`, `release:minor`, or
+# `release:patch`; no label means patch, and with several the biggest wins. It is applied to
+# the highest existing vX.Y.Z tag (the first release is Cargo.toml's version).
+#
+# Versions live only in tags: nothing is committed back to main, so a release never puts open
+# PRs behind or in conflict. The image is built with the version passed in (FANFOLD_VERSION).
+#
+# Runs on a push to main (a merge by a person) and on workflow_dispatch from automerge.yml (a
+# merge by the Actions token, which does not trigger `push`). Re-running for an already
+# tagged commit does nothing.
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Merge commit on main to release (default the branch head).
+        type: string
+        default: ""
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  tag:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: write # create the tag and the release
+      pull-requests: read
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SHA: ${{ inputs.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - id: tag
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$SHA" origin/main \
+            || { echo "::error::$SHA is not on main"; exit 1; }
+
+          semver='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          if existing=$(git tag --points-at "$SHA" | grep -E "$semver" | head -n1) && [ -n "$existing" ]; then
+            echo "$SHA is already released as $existing."
+            exit 0
+          fi
+
+          labels=$(gh api "repos/$GH_REPO/commits/$SHA/pulls" \
+                     --jq '[.[] | select(.merged_at != null) | .labels[].name] | unique | join(" ")')
+          case " $labels " in
+            *" release:major "*) bump="major" ;;
+            *" release:minor "*) bump="minor" ;;
+            *) bump="patch" ;;
+          esac
+          echo "PR labels: ${labels:-none} -> $bump"
+
+          # Retried in case another release took the version first.
+          for attempt in 1 2 3 4 5; do
+            git fetch --quiet --force --tags origin
+            latest=$(git tag -l 'v*' | grep -E "$semver" | sort -V | tail -n1 || true)
+            if [ -z "$latest" ]; then
+              next="v$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+            else
+              IFS=. read -r major minor patch <<<"${latest#v}"
+              case $bump in
+                major) next="v$((major + 1)).0.0" ;;
+                minor) next="v$major.$((minor + 1)).0" ;;
+                patch) next="v$major.$minor.$((patch + 1))" ;;
+              esac
+            fi
+            [[ "$next" =~ $semver ]] || { echo "::error::bad version '$next'"; exit 1; }
+            if gh api "repos/$GH_REPO/git/refs" -f ref="refs/tags/$next" -f sha="$SHA" >/dev/null; then
+              echo "Tagged $SHA as $next (after ${latest:-no release})."
+              echo "version=${next#v}" >> "$GITHUB_OUTPUT"
+              gh release create "$next" --verify-tag --generate-notes --title "$next"
+              exit 0
+            fi
+            echo "Could not create $next (taken?); retrying."
+            sleep $((attempt * 3))
+          done
+          exit 1
+
+  image:
+    needs: tag
+    if: needs.tag.outputs.version != ''
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/image.yml
+    with:
+      version: ${{ needs.tag.outputs.version }}
+
+  # CI on main itself, beside the release (it does not gate it: the PR already passed). This is
+  # what fills the Rust cache the PRs read; the image cache is filled by the publish above.
+  warm-cache:
+    permissions:
+      contents: read
+      packages: write # required by the called workflows, unused here
+    uses: ./.github/workflows/ci.yml
+    with:
+      image: false

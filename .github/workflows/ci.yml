@@ -1,0 +1,139 @@
+# The checks every pull request has to pass. `ci-ok` is the one required status check (see the
+# ruleset on main); it sums up the jobs above it, so a skipped job (docs-only change) is fine
+# and a failed or cancelled one is not.
+#
+# Triggers:
+#  * pull_request: every PR, including Renovate's and forks' (forks get a read-only token and
+#    no secrets);
+#  * workflow_dispatch: pr.yml starts this for the PRs it opens itself, because a PR opened
+#    with the Actions token does not trigger `pull_request`;
+#  * workflow_call: release.yml re-runs it on main, which is also what fills the caches PRs
+#    read (GitHub only shares caches from the default branch).
+name: ci
+
+on:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      image:
+        description: Also build and smoke-test the container image.
+        type: boolean
+        default: true
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # Docs-only changes skip the expensive jobs (their checks report "skipped", which ci-ok
+  # accepts). On main everything always runs.
+  changes:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" = refs/heads/main ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$EVENT" = pull_request ]; then
+            base=HEAD^1   # the checkout is the PR merged into its base
+          else
+            base=$(git merge-base origin/main HEAD)
+          fi
+          changed=$(git diff --name-only "$base" HEAD)
+          printf 'changed:\n%s\n' "$changed"
+          if grep -qvE '^docs/|\.md$' <<<"$changed"; then code=true; else code=false; fi
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+
+  rust:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rustup installs the toolchain rust-toolchain.toml names.
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Only main writes the cache; PRs read it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      # `just integration`, spelled out: a throwaway PostgreSQL (the runner ships one, not
+      # started) and the pinned FanFicFare against its offline test site. No network needed.
+      - name: Integration setup
+        run: |
+          set -euo pipefail
+          pg_bin=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -n1)
+          echo "$pg_bin" >> "$GITHUB_PATH"
+          fanficfare=$(grep -oP "fanficfare==\K[0-9][^'\s]*" justfile)
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet --disable-pip-version-check "fanficfare==$fanficfare"
+          echo "FFD_PYTHON=$PWD/.venv/bin/python" >> "$GITHUB_ENV"
+
+      - name: Integration, PostgreSQL contracts
+        run: scripts/with-postgres.sh cargo test --locked -p fanfold-adapter-postgres -- --ignored
+
+      - name: Integration, Python worker
+        run: cargo test --locked -p fanfold-adapter-fanficfare -- --ignored
+
+      - name: Integration, end to end
+        run: scripts/with-postgres.sh cargo test --locked -p fanfold-server --test e2e -- --ignored
+
+  image:
+    needs: changes
+    # As a string: outside workflow_call the input is null, and null == false in expressions.
+    if: needs.changes.outputs.code == 'true' && format('{0}', inputs.image) != 'false'
+    permissions:
+      contents: read
+      packages: write # not used without a version; required by the called workflow
+    uses: ./.github/workflows/image.yml
+
+  ci-ok:
+    if: always()
+    needs: [changes, rust, image]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - env:
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "results: $RESULTS"
+          [ "$FAILED" = false ]
