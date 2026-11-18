@@ -41,6 +41,9 @@ pub struct FlareSolverr<'a> {
     pub timeout: std::time::Duration,
 }
 
+/// How much longer FanFicFare waits for `FlareSolverr` than `FlareSolverr` waits for a page.
+const FLARESOLVERR_MARGIN_S: u64 = 30;
+
 /// FanFicFare's `[defaults]` for fetching through `FlareSolverr`. It builds
 /// `protocol://address:port/v1` itself, so only the origin's parts are given.
 fn flaresolverr_section(fs: &FlareSolverr<'_>) -> Result<String, IniError> {
@@ -54,11 +57,16 @@ fn flaresolverr_section(fs: &FlareSolverr<'_>) -> Result<String, IniError> {
         .port_or_known_default()
         .ok_or(IniError::Empty("FlareSolverr port"))?;
     let millis = fs.timeout.as_millis();
+    // FanFicFare waits this long for any answer, FlareSolverr's included. It must outlast
+    // FlareSolverr's own limit, or a slow page ends as "connection to flaresolverr failed"
+    // instead of FlareSolverr's real answer (FanFicFare's docs say the same).
+    let wait = fs.timeout.as_secs() + FLARESOLVERR_MARGIN_S;
     // A session keeps one browser (and its cookies) across the requests of a download.
     Ok(format!(
         "[defaults]\nuse_flaresolverr_proxy:true\nuse_flaresolverr_session:true\n\
          flaresolverr_proxy_protocol:{}\nflaresolverr_proxy_address:{host}\n\
-         flaresolverr_proxy_port:{port}\nflaresolverr_proxy_timeout:{millis}\n\n",
+         flaresolverr_proxy_port:{port}\nflaresolverr_proxy_timeout:{millis}\n\
+         connect_timeout:{wait}\n\n",
         fs.url.scheme()
     ))
 }
@@ -233,10 +241,28 @@ mod tests {
             ini,
             "[defaults]\nuse_flaresolverr_proxy:true\nuse_flaresolverr_session:true\n\
              flaresolverr_proxy_protocol:http\nflaresolverr_proxy_address:flaresolverr\n\
-             flaresolverr_proxy_port:8191\nflaresolverr_proxy_timeout:60000\n\n\
+             flaresolverr_proxy_port:8191\nflaresolverr_proxy_timeout:60000\n\
+             connect_timeout:90\n\n\
              [archiveofourown.org]\nis_adult:true\nmax_request_retries:6\n"
         );
         assert!(!ini.contains("always_login") && !ini.contains("username"));
+    }
+
+    /// Regression: both were 60 s, so `FanFicFare` gave up on `FlareSolverr` just before it
+    /// answered, and every slow AO3 page became "connection to flaresolverr failed".
+    #[test]
+    fn fanficfare_outlasts_flaresolverr() {
+        for secs in [1, 60, 180] {
+            let ini = with_flaresolverr("http://flaresolverr:8191", secs);
+            let value = |key: &str| -> u64 {
+                ini.lines()
+                    .find_map(|l| l.strip_prefix(key))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap()
+            };
+            let flaresolverr_s = value("flaresolverr_proxy_timeout:") / 1000;
+            assert!(value("connect_timeout:") > flaresolverr_s, "{ini}");
+        }
     }
 
     #[test]
