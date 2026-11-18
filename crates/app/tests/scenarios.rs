@@ -830,10 +830,9 @@ async fn adding_a_series_lists_it_follows_it_and_files_every_work_under_it() {
     );
 
     // The works it queued are downloaded in series order, each into the series folder.
-    h.downloader
-        .push_ok_with("The Lighthouse Keeper", |m| {
-            m.series = vec![part(2_000_001, "The Harbor Saga", 1)];
-        });
+    h.downloader.push_ok_with("The Lighthouse Keeper", |m| {
+        m.series = vec![part(2_000_001, "The Harbor Saga", 1)];
+    });
     h.downloader
         .push_ok_with("The Keeper and the Logbook", |m| {
             // Renamed since the listing: the folder chosen first stays.

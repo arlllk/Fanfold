@@ -278,9 +278,12 @@ mod tests {
         assert_eq!(e["title"], "The Keeper and the Logbook");
         assert_eq!(e["url"], "https://archiveofourown.org/works/42");
         let description = e["description"].as_str().unwrap();
-        assert!(description.contains(
-            "by [quillandink](https://archiveofourown.org/users/quillandink/pseuds/quillandink)"
-        ), "{description}");
+        assert!(
+            description.contains(
+                "by [quillandink](https://archiveofourown.org/users/quillandink/pseuds/quillandink)"
+            ),
+            "{description}"
+        );
         assert!(description.contains(
             "Part **2** of [The Harbor Saga](https://archiveofourown.org/series/2000001)"
         ));
