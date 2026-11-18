@@ -66,13 +66,22 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # Registry names must be lowercase, and the repository is `arlllk/Fanfold`.
-      - name: Image name
-        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      # Reproducible builds: every timestamp in the image is the commit's (buildx passes
+      # SOURCE_DATE_EPOCH to the build, and `rewrite-timestamp=true` below clamps file times).
+      - name: Image name, build time
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
 
+      # `context: git`: labels describe the checked-out commit (the tag), not the event's, and
+      # `created` is the commit time, so rebuilding a commit gives the same labels.
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
+          context: git
           images: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.created={{commit_date 'YYYY-MM-DDTHH:mm:ss[Z]'}}
           # Semver only; `value` makes the tags independent of the event and ref.
           flavor: latest=false
           tags: |
@@ -87,7 +96,10 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
-          load: true
+          # Into the local image store (what `load: true` does), with reproducible timestamps.
+          outputs: type=docker,rewrite-timestamp=true
+          provenance: false
+          sbom: false
           tags: fanfold:ci
           labels: ${{ steps.meta.outputs.labels }}
           build-args: FANFOLD_VERSION=${{ steps.version.outputs.version }}
@@ -167,7 +179,13 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
-          push: true
+          # Pushed with the same reproducible timestamps. No provenance/SBOM attestation
+          # manifests: they record the build's own time and runner, so they would give every
+          # rebuild a new digest; the published digest is the image itself, and rebuilding
+          # the tag reproduces it.
+          outputs: type=image,push=true,rewrite-timestamp=true
+          provenance: false
+          sbom: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: FANFOLD_VERSION=${{ steps.version.outputs.version }}

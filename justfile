@@ -20,10 +20,10 @@ test:
 
 # --- tests that need real services (throwaway local PostgreSQL, real Python) ------
 
-# One-time: a venv with the pinned FanFicFare, for the integration tests.
+# A venv with exactly the FanFicFare the image ships (python/uv.lock), for the integration
+# tests. Needs uv. Re-run after the lock changes.
 venv:
-    python3 -m venv .venv
-    .venv/bin/pip install --quiet 'fanficfare==4.63.0'
+    UV_PROJECT_ENVIRONMENT={{justfile_directory()}}/.venv uv sync --project python --locked --no-build
 
 # The shared port contracts, run against a real PostgreSQL.
 test-postgres:
@@ -74,7 +74,7 @@ fmt-check:
     cargo fmt --all -- --check
 
 # The licence notices the container image ships (needs: cargo install cargo-about --features cli).
-# The Python list is for the local .venv, which also contains pip; the image's venv has no pip.
+# The Python list is for the local .venv, built from the same lock as the image's venv.
 licenses:
     mkdir -p target/licenses
     cargo about generate --locked --manifest-path crates/server/Cargo.toml --config licenses/about.toml licenses/about.hbs --output-file target/licenses/THIRD-PARTY-LICENSES-RUST.txt
