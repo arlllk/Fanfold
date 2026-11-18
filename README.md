@@ -117,7 +117,7 @@ password = { file = "/run/secrets/x" } # a file (a trailing newline is ignored)
 | `[worker]` | `poll_interval` (`5s`), `concurrency` (1) | Keep concurrency at 1: AO3 rate-limits. |
 | `[web]` | `listen` (`0.0.0.0:8080`), `ops_listen` (`0.0.0.0:9090`), `page_size` (20) | The interface, and the health and metrics port. |
 | `[mail]` | see [Adding works](#adding-works) | Optional. Queue works from AO3 emails. |
-| `[discord]` | `webhook` | Optional. Post downloads and failures to a Discord channel. |
+| `[discord]` | `webhook`, `failures_webhook`, `ui_url` | Optional. Rich messages for new books, new chapters and followed series go to `webhook`; failures (gave up, AO3 unhealthy, AO3 back) only to `failures_webhook`, if set (a muted channel works well). `ui_url` links each message to its job. |
 
 Logs go to standard output. `RUST_LOG=debug` raises the detail and `FANFOLD_LOG_FORMAT=json`
 switches to JSON lines.

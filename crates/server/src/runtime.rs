@@ -96,6 +96,26 @@ pub fn build_worker(
     build_worker_with(config, secrets, store, runner, AO3_URL_TEMPLATE)
 }
 
+/// Discord when a webhook is configured (downloads and failures may go to different ones),
+/// otherwise the log.
+fn build_notifier(config: &Config, secrets: &Secrets) -> Result<Arc<dyn Notifier>, StartupError> {
+    if secrets.discord_webhook.is_none() && secrets.discord_failures_webhook.is_none() {
+        return Ok(Arc::new(LogOnlyNotifier));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| StartupError::Io(format!("cannot build HTTP client: {e}")))?;
+    Ok(Arc::new(
+        DiscordNotifier::routed(
+            client,
+            secrets.discord_webhook.as_ref().map(copy_secret),
+            secrets.discord_failures_webhook.as_ref().map(copy_secret),
+        )
+        .with_ui(config.discord.as_ref().and_then(|d| d.ui_url.clone())),
+    ))
+}
+
 /// As [`build_worker`], with the story URL template (`{id}` is the work id)
 /// injectable so end-to-end tests can point at FanFicFare's offline test site.
 pub fn build_worker_with(
@@ -153,7 +173,10 @@ pub fn build_worker_with(
     if let Some(ao3) = &secrets.ao3 {
         redactions.push(copy_secret(&ao3.password));
     }
-    if let Some(webhook) = &secrets.discord_webhook {
+    for webhook in [&secrets.discord_webhook, &secrets.discord_failures_webhook]
+        .into_iter()
+        .flatten()
+    {
         redactions.push(copy_secret(webhook));
     }
     let downloader = FanFicFareDownloader::new(
@@ -171,16 +194,7 @@ pub fn build_worker_with(
     // The browser session (cookies + User-Agent) is imported from the web UI.
     .with_session(Arc::<PgStore>::clone(store), Arc::new(SystemClock));
 
-    let notifier: Arc<dyn Notifier> = match &secrets.discord_webhook {
-        Some(webhook) => {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .map_err(|e| StartupError::Io(format!("cannot build HTTP client: {e}")))?;
-            Arc::new(DiscordNotifier::new(client, copy_secret(webhook)))
-        }
-        None => Arc::new(LogOnlyNotifier),
-    };
+    let notifier = build_notifier(config, secrets)?;
 
     Ok(Worker::new(
         Ports {
@@ -739,9 +753,13 @@ mod tests {
             3,
             "the breaker stopped further requests"
         );
-        assert!(rig.notifier.events().contains(&NotifyEvent::SiteDegraded {
-            kind: FailureKind::SiteUnavailable
-        }));
+        assert!(rig.notifier.events().iter().any(|e| matches!(
+            e,
+            NotifyEvent::SiteDegraded {
+                kind: FailureKind::SiteUnavailable,
+                ..
+            }
+        )));
         tx.send(true).unwrap();
         task.await.unwrap();
     }
