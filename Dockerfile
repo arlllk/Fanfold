@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 #
 # fanfold: the service, plus the pinned FanFicFare it runs as a subprocess.
 #
@@ -33,10 +33,10 @@
 # ------------------------------------------------------------------------ python base
 # One definition of the Python base, shared by the venv and the runtime stage: the venv's
 # interpreter is a link into this image, so the two must be the very same image.
-FROM python:3.13-slim-trixie@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS python-base
+FROM python:3.15-slim-trixie@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928 AS python-base
 
 # ----------------------------------------------------------------------------- chef
-FROM rust:1.100.0-trixie@sha256:e19840879045c951c905d0eaa9887f3439c62000e429963371b376bac8d38c31 AS chef
+FROM rust:1.100.0-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS chef
 # renovate: datasource=crate depName=cargo-chef
 ARG CARGO_CHEF_VERSION=0.1.78
 RUN cargo install cargo-chef --version "${CARGO_CHEF_VERSION}" --locked
