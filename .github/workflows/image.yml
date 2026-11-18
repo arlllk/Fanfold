@@ -27,8 +27,6 @@ on:
       - licenses/**
       - LICENSE-*
       - .github/workflows/image.yml
-  pull_request:
-    paths: *paths
   workflow_dispatch:
 
 concurrency:
