@@ -1139,3 +1139,154 @@ async fn listing_a_series_is_announced() {
         }]
     );
 }
+
+// -------------------------------------------------------------------- deleting
+
+fn library_admin(h: &Harness) -> fanfold_app::library::LibraryAdmin {
+    fanfold_app::library::LibraryAdmin::new(
+        h.jobs.clone(),
+        h.jobs.clone(),
+        h.library.clone(),
+        h.jobs.clone(),
+        h.clock.clone(),
+    )
+}
+
+#[tokio::test]
+async fn deleting_a_book_removes_its_file_and_record_and_says_so() {
+    let h = Harness::new();
+    let job = h.enqueue(5).await;
+    h.downloader.push_ok("Story");
+    h.worker.run_once().await.unwrap();
+    let work = WorkId::new(5).unwrap();
+
+    let deleted = library_admin(&h)
+        .delete_book(work, Some(job))
+        .await
+        .unwrap();
+    assert_eq!(deleted.file.as_deref(), Some("single/Author/Story 5.epub"));
+    assert_eq!(h.library.files(), Vec::<String>::new());
+    assert_eq!(
+        fanfold_app::ports::BookCatalog::get(h.jobs.as_ref(), work)
+            .await
+            .unwrap(),
+        None
+    );
+    let logs = h.jobs.logs(job).await.unwrap();
+    assert_eq!(
+        logs.last().unwrap().message,
+        "deleted the book: single/Author/Story 5.epub"
+    );
+    assert_eq!(
+        h.jobs.work_history(work).versions.len(),
+        1,
+        "the history is kept"
+    );
+    let again = library_admin(&h).delete_book(work, None).await.unwrap();
+    assert_eq!(again.file, None, "nothing left to delete");
+}
+
+#[tokio::test]
+async fn deleting_a_book_cancels_its_queued_download_but_waits_for_a_running_one() {
+    let h = Harness::new();
+    let queued = h.enqueue(5).await;
+    let work = WorkId::new(5).unwrap();
+    let deleted = library_admin(&h).delete_book(work, None).await.unwrap();
+    assert_eq!(deleted.cancelled, 1);
+    assert_eq!(h.job(queued).await.state, JobState::Cancelled);
+
+    h.enqueue(6).await;
+    h.jobs.claim_next(h.clock_now()).await.unwrap().unwrap(); // now running
+    assert_eq!(
+        library_admin(&h)
+            .delete_book(WorkId::new(6).unwrap(), None)
+            .await
+            .unwrap_err(),
+        fanfold_app::library::DeleteError::Busy(Target::Work(WorkId::new(6).unwrap()))
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_series_keeps_the_books_another_followed_series_shares() {
+    let h = Harness::new();
+    let saga = SeriesId::new(77).unwrap();
+    let other = SeriesId::new(88).unwrap();
+    h.jobs
+        .follow_series(other, FollowSource::Manual, h.clock_now())
+        .await
+        .unwrap();
+    let series_job = queue_series(&h, 77).await;
+    h.downloader.push_listing("The Saga", &[1, 2, 3]);
+    h.worker.run_once().await.unwrap();
+    // Work 1 is only in the saga; work 2 also in the other followed series; work 3 is
+    // still queued when the series is deleted.
+    h.downloader
+        .push_ok_with("One", |m| m.series = vec![part(77, "The Saga", 1)]);
+    h.downloader.push_ok_with("Two", |m| {
+        m.series = vec![part(77, "The Saga", 2), part(88, "Other", 5)];
+    });
+    h.worker.run_once().await.unwrap();
+    h.worker.run_once().await.unwrap();
+    let three = h
+        .jobs
+        .all_jobs()
+        .into_iter()
+        .find(|j| j.target == Target::Work(WorkId::new(3).unwrap()))
+        .unwrap();
+
+    let result = library_admin(&h)
+        .delete_series(saga, Some(series_job))
+        .await
+        .unwrap();
+    assert!(result.was_followed);
+    assert_eq!(result.kept, [(WorkId::new(2).unwrap(), other)]);
+    let files: Vec<Option<String>> = result.deleted.iter().map(|d| d.file.clone()).collect();
+    assert_eq!(
+        files,
+        [Some("series/The Saga 77/01 One 1.epub".to_owned()), None],
+        "work 1's book is deleted; work 3 had none"
+    );
+    assert_eq!(h.job(three.id).await.state, JobState::Cancelled);
+    assert_eq!(
+        h.library.files(),
+        ["series/The Saga 77/02 Two 2.epub"],
+        "the shared book stays where it is"
+    );
+    assert!(h.jobs.series_history(saga).followed.is_none());
+    let logs = h.jobs.logs(series_job).await.unwrap();
+    assert!(
+        logs.last()
+            .unwrap()
+            .message
+            .contains("1 books deleted, 1 kept for another series"),
+        "{logs:?}"
+    );
+}
+
+#[tokio::test]
+async fn nothing_is_deleted_while_one_of_the_series_works_is_downloading() {
+    let h = Harness::new();
+    queue_series(&h, 77).await;
+    h.downloader.push_listing("The Saga", &[1, 2]);
+    h.worker.run_once().await.unwrap();
+    h.downloader
+        .push_ok_with("One", |m| m.series = vec![part(77, "The Saga", 1)]);
+    h.worker.run_once().await.unwrap();
+    h.jobs.claim_next(h.clock_now()).await.unwrap().unwrap(); // work 2 is running
+
+    let err = library_admin(&h)
+        .delete_series(SeriesId::new(77).unwrap(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        fanfold_app::library::DeleteError::Busy(Target::Work(WorkId::new(2).unwrap()))
+    );
+    assert_eq!(h.library.files().len(), 1, "nothing was deleted");
+    assert!(
+        h.jobs
+            .series_history(SeriesId::new(77).unwrap())
+            .followed
+            .is_some()
+    );
+}

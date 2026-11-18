@@ -401,6 +401,15 @@ impl BookCatalog for PgStore {
             .collect()
     }
 
+    async fn remove(&self, work: WorkId) -> Result<bool, RepoError> {
+        sqlx::query("DELETE FROM books WHERE work_id = $1")
+            .bind(work.to_i64())
+            .execute(&self.pool)
+            .await
+            .map(|r| r.rows_affected() > 0)
+            .map_err(|e| backend(&e))
+    }
+
     /// `file_name` is deliberately absent from the `DO UPDATE` list: once a book
     /// has a path it keeps it.
     async fn upsert(&self, record: &BookRecord) -> Result<(), RepoError> {

@@ -58,6 +58,7 @@ struct Rig {
     /// Dropping the sender would end every event stream, so the rig owns it.
     stop: tokio::sync::watch::Sender<bool>,
     jobs: Arc<InMemoryJobs>,
+    library: Arc<fanfold_testkit::memory::InMemoryLibrary>,
     session_store: Arc<InMemorySession>,
     clock: Arc<FakeClock>,
     site: Arc<FixedSite>,
@@ -70,12 +71,20 @@ fn rig_with_page_size(page_size: u32) -> Rig {
     let clock = Arc::new(FakeClock::at_secs(NOW));
     let site = Arc::new(FixedSite(Mutex::new(SiteStatus::Healthy)));
     let session_store = Arc::new(InMemorySession::new());
+    let library = Arc::new(fanfold_testkit::memory::InMemoryLibrary::new());
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let deps = Arc::new(WebDeps {
         jobs: jobs.clone(),
         catalog: jobs.clone(),
         metadata: jobs.clone(),
         admin: Arc::new(JobAdmin::new(jobs.clone(), clock.clone())),
+        library: Arc::new(fanfold_app::library::LibraryAdmin::new(
+            jobs.clone(),
+            jobs.clone(),
+            library.clone(),
+            jobs.clone(),
+            clock.clone(),
+        )),
         session: Arc::new(SessionAdmin::new(
             session_store.clone(),
             clock.clone(),
@@ -97,6 +106,7 @@ fn rig_with_page_size(page_size: u32) -> Rig {
         stop,
         session_store,
         jobs,
+        library,
         clock,
         site,
         ui: ui_router(deps.clone()),
@@ -1803,5 +1813,116 @@ async fn a_series_link_queues_a_series_job_shown_by_its_name() {
     assert!(
         finished.contains("List the series again")
             && !finished.contains("Re-download from scratch")
+    );
+}
+
+#[tokio::test]
+async fn a_book_can_be_deleted_from_its_job_page() {
+    let rig = rig();
+    let job = rig.queue(5).await;
+    rig.succeed(job.id).await;
+    let page = get(&rig.ui, &format!("/jobs/{}", job.id)).await.body;
+    assert!(
+        !page.contains("Delete the book"),
+        "no book, nothing to delete"
+    );
+
+    rig.titled(5, "Story").await;
+    rig.library.seed("Story [5].epub");
+    let page = get(&rig.ui, &format!("/jobs/{}", job.id)).await.body;
+    assert!(page.contains(r#"action="/works/5/delete""#) && page.contains("Delete the book"));
+    assert!(
+        page.contains("<details class=\"danger\">"),
+        "folded away behind a summary"
+    );
+
+    let reply = post(
+        &rig.ui,
+        "/works/5/delete",
+        &form(&[("job", &job.id.to_string())]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        reply.location(),
+        format!("/jobs/{}?deleted_book=1", job.id).as_str()
+    );
+    assert_eq!(rig.library.files(), Vec::<String>::new());
+    let after = get(&rig.ui, reply.location()).await.body;
+    assert!(after.contains("The book was deleted from the library"));
+    assert!(!after.contains("Delete the book"), "nothing left to delete");
+    assert!(
+        after.contains("deleted the book: Story [5].epub"),
+        "the log says so"
+    );
+
+    assert_eq!(
+        post(&rig.ui, "/works/abc/delete", "").await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn a_running_download_blocks_the_delete_with_a_clear_conflict() {
+    let rig = rig();
+    let job = rig.queue(5).await;
+    rig.titled(5, "Story").await;
+    rig.claim(job.id).await;
+    let reply = post(
+        &rig.ui,
+        "/works/5/delete",
+        &form(&[("job", &job.id.to_string())]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    assert!(
+        reply.body.contains("downloading right now"),
+        "{}",
+        reply.body
+    );
+}
+
+#[tokio::test]
+async fn a_series_can_be_deleted_from_its_job_page() {
+    use fanfold_domain::{job::Target, work::SeriesId};
+    let rig = rig();
+    let series = SeriesId::new(77).unwrap();
+    let EnqueueOutcome::Created(job) = rig
+        .jobs
+        .enqueue(Target::Series(series), JobSource::Manual, rig.clock.now())
+        .await
+        .unwrap()
+    else {
+        panic!("must create")
+    };
+    let page = get(&rig.ui, &format!("/jobs/{}", job.id)).await.body;
+    assert!(page.contains(r#"action="/series/77/delete""#));
+    assert!(page.contains("Delete the series and its books"));
+    assert!(page.contains("except those that also belong to another series you follow"));
+
+    let reply = post(
+        &rig.ui,
+        "/series/77/delete",
+        &form(&[("job", &job.id.to_string())]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        reply.location(),
+        format!("/jobs/{}?deleted_series=0&kept=0", job.id).as_str()
+    );
+    let after = get(&rig.ui, reply.location()).await.body;
+    assert!(
+        after.contains("The series is no longer followed. Deleted 0 books."),
+        "{after}"
+    );
+    assert_eq!(
+        JobRepository::get(rig.jobs.as_ref(), job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        fanfold_domain::job::JobState::Cancelled,
+        "its queued listing is cancelled"
     );
 }

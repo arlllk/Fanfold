@@ -239,6 +239,20 @@ impl From<&AdminError> for ProblemDetails {
     }
 }
 
+impl From<&fanfold_app::library::DeleteError> for ProblemDetails {
+    fn from(err: &fanfold_app::library::DeleteError) -> Self {
+        use fanfold_app::library::DeleteError;
+        match err {
+            DeleteError::Busy(_) => {
+                Self::about_blank(StatusCode::CONFLICT).with_detail(err.to_string())
+            }
+            DeleteError::Repo(e) => Self::from(&AppError::Repo(e.clone())),
+            DeleteError::Store(_) => Self::about_blank(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_detail("The file could not be deleted; the server log has the details."),
+        }
+    }
+}
+
 impl From<&fanfold_app::session::SessionError> for ProblemDetails {
     fn from(err: &fanfold_app::session::SessionError) -> Self {
         use fanfold_app::session::SessionError;

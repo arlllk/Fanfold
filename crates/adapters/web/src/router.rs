@@ -67,6 +67,8 @@ pub struct WebDeps {
     /// Series names, for series jobs.
     pub metadata: Arc<dyn MetadataStore>,
     pub admin: Arc<JobAdmin>,
+    /// The delete buttons.
+    pub library: Arc<fanfold_app::library::LibraryAdmin>,
     pub session: Arc<SessionAdmin>,
     pub events: Arc<dyn EventSource>,
     pub site: Arc<dyn SiteStatusSource>,
@@ -387,6 +389,67 @@ async fn add_job(State(deps): State<Deps>, headers: HeaderMap, body: Bytes) -> R
     }
 }
 
+/// A positive AO3 id from the path.
+fn parse_ao3_id(raw: &str) -> Option<u64> {
+    raw.parse::<u64>().ok().filter(|id| *id > 0)
+}
+
+fn invalid_id(what: &str) -> ProblemDetails {
+    ProblemDetails::about_blank(StatusCode::NOT_FOUND)
+        .with_detail(format!("That is not a valid {what} id."))
+}
+
+/// Where to go back to after a delete: the job page it was pressed on, else the dashboard.
+fn back_to(pairs: &[(String, String)], query: &str) -> (Option<JobId>, String) {
+    let job = forms::job_ids(pairs, "job").first().copied();
+    let to = job.map_or_else(
+        || format!("/?{query}"),
+        |job| format!("/jobs/{job}?{query}"),
+    );
+    (job, to)
+}
+
+async fn delete_work(
+    State(deps): State<Deps>,
+    headers: HeaderMap,
+    Path(raw): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Some(work) = parse_ao3_id(&raw).and_then(WorkId::new) else {
+        return problem_response(&headers, invalid_id("work"));
+    };
+    let pairs = forms::pairs(&body);
+    let (job, _) = back_to(&pairs, "");
+    match deps.library.delete_book(work, job).await {
+        Ok(deleted) => {
+            let query = format!("deleted_book={}", u8::from(deleted.file.is_some()));
+            Redirect::to(&back_to(&pairs, &query).1).into_response()
+        }
+        Err(e) => problem_response(&headers, ProblemDetails::from(&e)),
+    }
+}
+
+async fn delete_series(
+    State(deps): State<Deps>,
+    headers: HeaderMap,
+    Path(raw): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Some(series) = parse_ao3_id(&raw).and_then(SeriesId::new) else {
+        return problem_response(&headers, invalid_id("series"));
+    };
+    let pairs = forms::pairs(&body);
+    let (job, _) = back_to(&pairs, "");
+    match deps.library.delete_series(series, job).await {
+        Ok(done) => {
+            let deleted = done.deleted.iter().filter(|d| d.file.is_some()).count();
+            let query = format!("deleted_series={deleted}&kept={}", done.kept.len());
+            Redirect::to(&back_to(&pairs, &query).1).into_response()
+        }
+        Err(e) => problem_response(&headers, ProblemDetails::from(&e)),
+    }
+}
+
 async fn retry_job(
     State(deps): State<Deps>,
     headers: HeaderMap,
@@ -623,6 +686,8 @@ pub fn ui_router(deps: Deps) -> Router {
         .route("/jobs/{id}/retry", post(retry_job))
         .route("/jobs/{id}/force-retry", post(force_retry_job))
         .route("/jobs/{id}/cancel", post(cancel_job))
+        .route("/works/{id}/delete", post(delete_work))
+        .route("/series/{id}/delete", post(delete_series))
         .route(
             "/session",
             get(session_page)
