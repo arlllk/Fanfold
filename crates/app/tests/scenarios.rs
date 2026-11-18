@@ -211,6 +211,47 @@ async fn a_book_deleted_from_the_library_is_downloaded_afresh_under_its_recorded
     ));
 }
 
+/// A book that was downloaded wrong (e.g. with no chapters) cannot be fixed by an update, which
+/// only adds to it: a forced retry downloads from scratch and replaces it under the same name.
+#[tokio::test]
+async fn a_forced_retry_replaces_the_stored_book_instead_of_updating_it() {
+    let h = Harness::new();
+    let admin = fanfold_app::admin::JobAdmin::new(h.jobs.clone(), h.clock.clone());
+    let id = h.enqueue(5).await;
+    h.downloader.push_ok("My Story");
+    h.worker.run_once().await.unwrap();
+
+    h.clock.advance(Duration::from_secs(60));
+    admin.force_retry(id).await.unwrap();
+    // The first forced run fails: the next one must still be forced.
+    h.downloader
+        .push_err(FailureKind::SiteUnavailable, "HTTP 525");
+    h.worker.run_once().await.unwrap();
+    assert!(h.job(id).await.force);
+    h.clock.advance(Duration::from_secs(3600));
+    h.downloader.push_ok("My Story");
+    h.worker.run_once().await.unwrap();
+
+    for request in &h.downloader.requests()[1..] {
+        assert_eq!(request.existing, None, "the stored book is not updated");
+    }
+    assert_eq!(h.library.published()[1].0, "My Story [5].epub");
+    let job = h.job(id).await;
+    assert_eq!((job.state, job.force), (JobState::Succeeded, false));
+    let logs = h.jobs.logs(id).await.unwrap();
+    assert!(
+        logs.iter()
+            .filter(|l| l.message == fanfold_app::worker::FORCED_NOTE)
+            .count()
+            == 2,
+        "each forced run says so"
+    );
+    assert!(matches!(
+        h.notifier.events().last(),
+        Some(NotifyEvent::Downloaded { updated: true, .. })
+    ));
+}
+
 #[tokio::test]
 async fn an_update_with_nothing_new_touches_nothing_and_stays_quiet() {
     let h = Harness::new();

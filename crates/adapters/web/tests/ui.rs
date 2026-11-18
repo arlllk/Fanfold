@@ -606,6 +606,13 @@ async fn a_job_page_shows_its_story_and_the_log_by_run() {
         "live updates are scoped to this job"
     );
     assert!(body.contains("rel=\"noopener noreferrer\""));
+    let at = |text: &str| body.find(text).unwrap();
+    assert!(at("Run 2") < at("Run 1"), "the latest run comes first");
+    assert!(
+        at("slow response") < at("failed (site_unavailable)") && at("Run 2") < at("slow response"),
+        "each run keeps its own lines in order, under its heading"
+    );
+    assert!(body.contains("newest first"));
 }
 
 #[tokio::test]
@@ -631,6 +638,46 @@ async fn the_actions_offered_match_the_job_state() {
     );
     let d = page(done.id).await;
     assert!(!d.contains("/retry\"") && !d.contains("/cancel\""));
+    let force = |id: JobId| format!(r#"action="/jobs/{id}/force-retry""#);
+    assert!(
+        d.contains(&force(done.id)),
+        "a finished book can be re-downloaded"
+    );
+    assert!(f.contains(&force(failed.id)));
+    assert!(!q.contains("force-retry"), "not while it is queued");
+}
+
+#[tokio::test]
+async fn a_finished_job_can_be_downloaded_again_from_scratch() {
+    let rig = rig();
+    let done = rig.queue(1).await;
+    rig.succeed(done.id).await;
+    let reply = post(&rig.ui, &format!("/jobs/{}/force-retry", done.id), "").await;
+    assert_eq!(
+        (reply.status, reply.location()),
+        (
+            StatusCode::SEE_OTHER,
+            format!("/jobs/{0}?forced={0}", done.id).as_str()
+        )
+    );
+    let stored = JobRepository::get(rig.jobs.as_ref(), done.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (stored.state, stored.force),
+        (fanfold_domain::job::JobState::Queued, true)
+    );
+    let page = get(&rig.ui, reply.location()).await.body;
+    assert!(page.contains("Queued to download again from scratch."));
+    assert!(page.contains("from scratch"));
+
+    let again = post(&rig.ui, &format!("/jobs/{}/force-retry", done.id), "").await;
+    assert_eq!(again.status, StatusCode::CONFLICT, "already queued");
+    assert_eq!(
+        post(&rig.ui, "/jobs/999/force-retry", "").await.status,
+        StatusCode::NOT_FOUND
+    );
 }
 
 #[tokio::test]
