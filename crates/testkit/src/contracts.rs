@@ -651,6 +651,24 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = Arc<dyn BookCatalog>>,
 {
+    let removable = make().await;
+    assert!(
+        !removable.remove(work(3)).await.unwrap(),
+        "nothing to remove"
+    );
+    removable
+        .upsert(&BookRecord {
+            work: work(3),
+            file_name: "single/A/T 3.epub".into(),
+            title: "T".into(),
+            updated_at: t(1),
+        })
+        .await
+        .unwrap();
+    assert!(removable.remove(work(3)).await.unwrap());
+    assert_eq!(removable.get(work(3)).await.unwrap(), None);
+    assert!(removable.titles(&[work(3)]).await.unwrap().is_empty());
+
     let catalog = make().await;
     assert_eq!(catalog.get(work(1)).await.unwrap(), None);
     let record = BookRecord {
@@ -911,6 +929,7 @@ where
     versions_are_written_only_for_changes(&*make().await).await;
     spans_follow_what_the_site_shows(&*make().await).await;
     series_are_followed_once_and_named(&*make().await).await;
+    a_series_can_be_unfollowed_and_knows_its_members(&*make().await).await;
     a_series_folder_is_chosen_once(&*make().await).await;
 }
 
@@ -1082,6 +1101,70 @@ async fn series_are_followed_once_and_named(store: &dyn MetadataStore) {
         Some("The Harbor Saga")
     );
     assert_eq!(names.get(&c), None);
+}
+
+async fn a_series_can_be_unfollowed_and_knows_its_members(store: &dyn MetadataStore) {
+    let saga = series_id(2_000_001);
+    assert!(
+        !store.unfollow_series(saga).await.unwrap(),
+        "never followed"
+    );
+    store
+        .follow_series(saga, FollowSource::Manual, t(1))
+        .await
+        .unwrap();
+    // Work 5 names the series on its page (observed_work); 7 and 5 are in its listing.
+    store
+        .record_work(&observed_work(5), t(2), None)
+        .await
+        .unwrap();
+    store
+        .record_series(
+            &SeriesMetadata {
+                series: saga,
+                facts: SeriesFacts {
+                    name: "The Harbor Saga".into(),
+                    summary_html: String::new(),
+                    complete: None,
+                    works: vec![work(7), work(5)],
+                },
+                raw: serde_json::Value::Null,
+            },
+            t(3),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut members = store.series_members(saga).await.unwrap();
+    members.sort();
+    assert_eq!(
+        members,
+        [work(5), work(7)],
+        "page and listing, no duplicates"
+    );
+    assert_eq!(
+        store.series_members(series_id(1)).await.unwrap(),
+        Vec::<WorkId>::new()
+    );
+
+    assert!(store.unfollow_series(saga).await.unwrap());
+    assert_eq!(
+        store.followed(&[saga]).await.unwrap(),
+        Vec::<SeriesId>::new()
+    );
+    assert!(
+        !store.unfollow_series(saga).await.unwrap(),
+        "already unfollowed"
+    );
+    store
+        .follow_series(saga, FollowSource::Mail, t(9))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.followed(&[saga]).await.unwrap(),
+        [saga],
+        "it can be followed again"
+    );
 }
 
 async fn a_series_folder_is_chosen_once(store: &dyn MetadataStore) {

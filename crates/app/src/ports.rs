@@ -232,6 +232,8 @@ pub trait BookCatalog: Send + Sync {
     async fn upsert(&self, record: &BookRecord) -> Result<(), RepoError>;
     /// Known titles for these works; works without a book are simply absent.
     async fn titles(&self, works: &[WorkId]) -> Result<HashMap<WorkId, String>, RepoError>;
+    /// Forget a work's book. Returns whether there was one.
+    async fn remove(&self, work: WorkId) -> Result<bool, RepoError>;
 }
 
 /// The folder the e-reader syncs from.
@@ -245,6 +247,9 @@ pub trait LibraryStore: Send + Sync {
     /// Atomically place `source` at `file_name`, replacing any previous file, so a
     /// syncing reader never observes a partial book. Consumes `source`.
     async fn publish(&self, source: &Path, file_name: &str) -> Result<(), StoreError>;
+
+    /// Delete a book, and the folders it leaves empty. Returns whether the file existed.
+    async fn remove(&self, file_name: &str) -> Result<bool, StoreError>;
 }
 
 // -------------------------------------------------------------------- metadata
@@ -288,6 +293,13 @@ pub trait MetadataStore: Send + Sync {
         by: FollowSource,
         at: Timestamp,
     ) -> Result<(), RepoError>;
+
+    /// Stop following a series. Returns whether it was followed.
+    async fn unfollow_series(&self, series: SeriesId) -> Result<bool, RepoError>;
+
+    /// The works a series contains, as far as is known: those whose page currently names
+    /// it, and those its latest listing showed.
+    async fn series_members(&self, series: SeriesId) -> Result<Vec<WorkId>, RepoError>;
 
     /// The followed series among `candidates`, in the order given.
     async fn followed(&self, candidates: &[SeriesId]) -> Result<Vec<SeriesId>, RepoError>;

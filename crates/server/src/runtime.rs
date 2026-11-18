@@ -441,6 +441,13 @@ pub async fn start_web(
             Arc::<PgStore>::clone(store),
             Arc::clone(&clock),
         )),
+        library: Arc::new(fanfold_app::library::LibraryAdmin::new(
+            Arc::<PgStore>::clone(store),
+            Arc::<PgStore>::clone(store),
+            Arc::new(FsLibrary::new(config.library.path.clone())),
+            Arc::<PgStore>::clone(store),
+            Arc::clone(&clock),
+        )),
         session: Arc::new(SessionAdmin::new(
             Arc::<PgStore>::clone(store),
             Arc::clone(&clock),

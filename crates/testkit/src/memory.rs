@@ -435,6 +435,10 @@ impl BookCatalog for InMemoryJobs {
             .filter_map(|w| state.books.get(w).map(|b| (*w, b.title.clone())))
             .collect())
     }
+
+    async fn remove(&self, work: WorkId) -> Result<bool, RepoError> {
+        Ok(self.state()?.books.remove(&work).is_some())
+    }
 }
 
 #[async_trait]
@@ -510,6 +514,35 @@ impl MetadataStore for InMemoryJobs {
             .followed
             .get_or_insert((by, at));
         Ok(())
+    }
+
+    async fn unfollow_series(&self, series: SeriesId) -> Result<bool, RepoError> {
+        let mut state = self.metadata_state()?;
+        Ok(state
+            .series
+            .get_mut(&series)
+            .and_then(|s| s.followed.take())
+            .is_some())
+    }
+
+    async fn series_members(&self, series: SeriesId) -> Result<Vec<WorkId>, RepoError> {
+        let state = self.metadata_state()?;
+        let mut members: Vec<WorkId> = state
+            .works
+            .iter()
+            .filter(|(_, w)| {
+                w.series
+                    .iter()
+                    .any(|s| s.removed_in.is_none() && s.item.id == series)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        if let Some((_, listing)) = state.series.get(&series).and_then(|s| s.versions.last()) {
+            members.extend(listing.works.iter().copied());
+        }
+        members.sort();
+        members.dedup();
+        Ok(members)
     }
 
     async fn followed(&self, candidates: &[SeriesId]) -> Result<Vec<SeriesId>, RepoError> {
@@ -701,6 +734,7 @@ impl SessionStore for InMemorySession {
 #[derive(Debug, Default)]
 struct LibraryState {
     files: HashMap<String, PathBuf>,
+    removed: Vec<String>,
     publish_log: Vec<(String, PathBuf)>,
     fail_publish: bool,
 }
@@ -733,6 +767,20 @@ impl InMemoryLibrary {
         lock(&self.state).fail_publish = fail;
     }
 
+    /// Every file `remove` was asked for, in order.
+    #[must_use]
+    pub fn removed(&self) -> Vec<String> {
+        lock(&self.state).removed.clone()
+    }
+
+    /// The files in the library now.
+    #[must_use]
+    pub fn files(&self) -> Vec<String> {
+        let mut files: Vec<String> = lock(&self.state).files.keys().cloned().collect();
+        files.sort();
+        files
+    }
+
     /// Every `(file_name, source)` ever published, in order.
     #[must_use]
     pub fn published(&self) -> Vec<(String, PathBuf)> {
@@ -762,6 +810,12 @@ impl LibraryStore for InMemoryLibrary {
             .publish_log
             .push((file_name.to_owned(), source.to_path_buf()));
         Ok(())
+    }
+
+    async fn remove(&self, file_name: &str) -> Result<bool, StoreError> {
+        let mut state = lock(&self.state);
+        state.removed.push(file_name.to_owned());
+        Ok(state.files.remove(file_name).is_some())
     }
 }
 

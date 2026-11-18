@@ -495,6 +495,34 @@ impl MetadataStore for PgStore {
         .map_err(|e| backend(&e))
     }
 
+    async fn unfollow_series(&self, series: SeriesId) -> Result<bool, RepoError> {
+        sqlx::query(
+            "UPDATE series SET followed_at_ms = NULL, followed_by = NULL
+             WHERE series_id = $1 AND followed_at_ms IS NOT NULL",
+        )
+        .bind(series.to_i64())
+        .execute(&self.pool)
+        .await
+        .map(|r| r.rows_affected() > 0)
+        .map_err(|e| backend(&e))
+    }
+
+    async fn series_members(&self, series: SeriesId) -> Result<Vec<WorkId>, RepoError> {
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT work_id FROM work_series WHERE series_id = $1 AND removed_in IS NULL
+             UNION
+             SELECT unnest(works) FROM (
+                 SELECT works FROM series_versions WHERE series_id = $1 ORDER BY id DESC LIMIT 1
+             ) latest
+             ORDER BY 1",
+        )
+        .bind(series.to_i64())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| backend(&e))?;
+        Ok(ids.into_iter().filter_map(WorkId::from_i64).collect())
+    }
+
     async fn followed(&self, candidates: &[SeriesId]) -> Result<Vec<SeriesId>, RepoError> {
         if candidates.is_empty() {
             return Ok(Vec::new());

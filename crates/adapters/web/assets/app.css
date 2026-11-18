@@ -317,3 +317,9 @@ footer { padding-bottom: 24px; color: var(--muted); font-size: .82rem; }
   .wrap { max-width: 1240px; }
   :root { --cols: 8rem minmax(0, 1.8fr) 6rem 5.5rem 9rem minmax(0, 2.2fr); }
 }
+
+/* Delete controls: folded away under the facts. */
+details.danger { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+details.danger summary { cursor: pointer; color: var(--muted); font-weight: 600; font-size: .92rem; }
+details.danger[open] summary { color: inherit; }
+details.danger p { margin: 8px 0 10px; color: var(--muted); font-size: .92rem; }
