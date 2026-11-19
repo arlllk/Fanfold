@@ -1,5 +1,7 @@
 # Builds the container image, smoke-tests it hardened (read-only root, no capabilities, a
-# non-default uid), and, for a release, publishes it to ghcr.io/<owner>/<repo>.
+# non-default uid, no shell), scans it for vulnerabilities, and, for a release, publishes it to
+# ghcr.io/<owner>/<repo>. (The release's SBOM and attestations are made by release.yml, from
+# the digest this outputs.)
 #
 # Called by ci.yml (build + smoke test, nothing published) and by release.yml (publish
 # version X.Y.Z). A `vX.Y.Z` tag pushed by hand publishes too. Images are only ever tagged
@@ -22,6 +24,10 @@ on:
         description: "Release version without the leading v (e.g. 1.4.2). Empty: build and test only."
         type: string
         default: ""
+    outputs:
+      digest:
+        description: The published image's digest (empty when nothing was published).
+        value: ${{ jobs.image.outputs.digest }}
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
   workflow_dispatch:
@@ -40,6 +46,8 @@ jobs:
     permissions:
       contents: read
       packages: write # releases only; read-only for forks automatically
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
     steps:
       # The version to publish: the caller's input, or the tag a hand-pushed tag run is for.
       - name: Version
@@ -63,7 +71,13 @@ jobs:
           ref: ${{ steps.version.outputs.version != '' && format('refs/tags/v{0}', steps.version.outputs.version) || '' }}
           persist-credentials: false
 
+      # BuildKit pinned by digest: the files in the image are the same with any version, but the
+      # layer compression is BuildKit's, so a pinned BuildKit is what makes the published
+      # digest reproducible (verified: a local build with this BuildKit gave the same layers as
+      # CI). Renovate updates it (custom manager in renovate.json).
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
 
       # Registry names must be lowercase, and the repository is `arlllk/Fanfold`.
       # Reproducible builds: every timestamp in the image is the commit's (buildx passes
@@ -147,22 +161,44 @@ jobs:
             -I -c "import fanficfare; print('FanFicFare', fanficfare.__file__)"
           echo "::endgroup::"
 
-          echo "::group::the root filesystem really is read-only, and the mounts really are writable"
-          docker run --rm "${hardened[@]}" --entrypoint sh fanfold:ci -c '
-            for p in /etc /usr /opt/venv /home; do
-              if touch "$p/probe" 2>/dev/null; then echo "FAIL: $p is writable"; exit 1; fi
-            done
-            for p in /tmp/fanfold /run/fanfold /library; do
-              touch "$p/probe" || { echo "FAIL: $p is not writable"; exit 1; }
-            done
-            test "$(id -u)" != 0 || { echo "FAIL: running as root"; exit 1; }
-            echo ok'
+          # The image is distroless (no shell), so the probe is the image's own Python.
+          echo "::group::read-only root, writable mounts, not root, and no shell anywhere"
+          docker run --rm "${hardened[@]}" --entrypoint /opt/venv/bin/python fanfold:ci -I -c '
+          import os
+          for p in ("/etc", "/usr", "/opt/venv", "/home"):
+              try:
+                  open(p + "/probe", "w").close()
+              except OSError:
+                  continue
+              raise SystemExit(f"FAIL: {p} is writable")
+          for p in ("/tmp/fanfold", "/run/fanfold", "/library"):
+              open(p + "/probe", "w").close()
+          if os.getuid() == 0:
+              raise SystemExit("FAIL: running as root")
+          for sh in ("/bin/sh", "/bin/bash", "/usr/bin/sh", "/bin/busybox"):
+              if os.path.exists(sh):
+                  raise SystemExit(f"FAIL: {sh} exists")
+          print("ok")'
           echo "::endgroup::"
 
           echo "::group::and as the image default user, with nothing mounted at all"
           docker run --rm -e DB_PASSWORD=ci -v "$RUNNER_TEMP/config.toml:/etc/fanfold/config.toml:ro" \
             --read-only --cap-drop ALL fanfold:ci check-config
           echo "::endgroup::"
+
+      # Vulnerabilities in everything the image contains: Debian packages (distroless records
+      # them), the Python venv, and the Rust crates (embedded by cargo-auditable). Fails only on
+      # a critical one that already has a fix, i.e. one that a dependency update would remove;
+      # the full list is in the log. (Releases also get a full scan in the Security tab, see
+      # release.yml and scan.yml.)
+      - name: Vulnerability scan
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: fanfold:ci
+          fail-build: true
+          severity-cutoff: critical
+          only-fixed: true
+          output-format: table
 
       - name: Log in to GHCR
         if: steps.version.outputs.publish == 'true'
@@ -174,6 +210,7 @@ jobs:
 
       # Same inputs as the build above, so every layer is a cache hit: this only pushes.
       - name: Publish
+        id: publish
         if: steps.version.outputs.publish == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:

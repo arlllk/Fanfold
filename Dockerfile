@@ -29,7 +29,10 @@
 # and Python package in it, in /usr/share/doc/fanfold. The build fails if a dependency has a
 # licence that is not on the allowlists in licenses/ (copyleft needs to be allowed by name).
 #
-# HARDENING. The image runs as a non-root user, needs no capabilities, and works with a
+# HARDENING. The runtime is distroless: the binary, Python and the venv, the libraries they link,
+# CA certificates and tzdata. No shell, no package manager, no coreutils, so there is nothing to
+# `exec` into and much less to patch (use an ephemeral debug container to look inside). The image
+# runs as a non-root user, needs no capabilities, and works with a
 # read-only root filesystem: the only places the service writes are /library, /tmp/fanfold and
 # /run/fanfold, and each can be a volume or an empty tmpfs. It also runs under rootless
 # Docker/Podman and with an arbitrary --user (see APP_UID/APP_GID, and the README).
@@ -40,9 +43,12 @@
 #     -v library:/library -v ./config.toml:/etc/fanfold/config.toml:ro fanfold
 
 # ------------------------------------------------------------------------ python base
-# One definition of the Python base, shared by the venv and the runtime stage: the venv's
-# interpreter is a link into this image, so the two must be the very same image.
-FROM python:3.15-slim-trixie@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928 AS python-base
+# Distroless: Debian's Python 3.13 and the shared libraries it needs, and nothing else (no shell,
+# no package manager, no coreutils). Every Debian package in it is recorded in
+# /var/lib/dpkg/status.d, so vulnerability scanners see all of it. One definition, shared by the
+# venv and the runtime stage: the venv's interpreter is a link into this image, so the two must be
+# the very same image. (It also has what the fanfold binary links: libc, libm, libgcc_s.)
+FROM gcr.io/distroless/python3-debian13:latest@sha256:60faad2efce94a847f32e2adbcaefeb2e4fd3e3a78075a3abb600904a5e010e9 AS python-base
 
 # ----------------------------------------------------------------------------- chef
 FROM rust:1.100.0-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS chef
@@ -62,6 +68,16 @@ ARG CARGO_ABOUT_VERSION=0.9.3
 # yet exits 0. The version check makes a missing binary fail the build.
 RUN cargo install cargo-about --version "${CARGO_ABOUT_VERSION}" --locked --features cli \
  && cargo about --version
+
+# --------------------------------------------------------------------- cargo-auditable
+# Builds the binary with its dependency list embedded (a small compressed JSON section), so
+# vulnerability scanners (Trivy, Grype, Syft) find every crate inside the image, not only the
+# Debian and Python packages. Its own stage, cached like cargo-about.
+FROM chef AS auditable-tool
+# renovate: datasource=crate depName=cargo-auditable
+ARG CARGO_AUDITABLE_VERSION=0.7.7
+RUN cargo install cargo-auditable --version "${CARGO_AUDITABLE_VERSION}" --locked \
+ && cargo auditable --version
 
 # --------------------------------------------------------------------------- planner
 # The dependency graph, as one small file. Everything that is not a manifest is dropped, so
@@ -90,8 +106,9 @@ COPY fuzz ./fuzz
 # The release version (the git tag without its `v`), shown by the service. Declared after the
 # dependency layer so a new version recompiles only our crates. Empty: Cargo.toml's version.
 ARG FANFOLD_VERSION=
+COPY --from=auditable-tool /usr/local/cargo/bin/cargo-auditable /usr/local/cargo/bin/cargo-auditable
 RUN if [ -z "${FANFOLD_VERSION}" ]; then unset FANFOLD_VERSION; else export FANFOLD_VERSION; fi \
- && cargo build --release --locked --package fanfold-server \
+ && cargo auditable build --release --locked --package fanfold-server \
  && install -D target/release/fanfold /out/fanfold
 
 # ------------------------------------------------------------------------ rust licences
@@ -108,6 +125,8 @@ RUN mkdir /out && cargo about generate --locked --manifest-path crates/server/Ca
 # Built apart from the runtime so no pip cache or build leftovers ship.
 FROM ghcr.io/astral-sh/uv:0.13.9@sha256:d3b601f0c7b118bc1753febf7c41cc80981df678445e0254284eecf84db79a7d AS uv
 
+# The base image has no shell, so every RUN below is in exec form (a JSON list), and the
+# little filesystem work there is is done by its Python.
 FROM python-base AS venv
 # Reproducible bytecode: with SOURCE_DATE_EPOCH set, Python writes hash-checked .pyc files
 # instead of ones stamped with the source file's mtime.
@@ -118,14 +137,19 @@ ARG SOURCE_DATE_EPOCH
 # and the venv has no pip (nothing installs at run time).
 COPY --from=uv /uv /usr/local/bin/uv
 COPY python/pyproject.toml python/uv.lock /deps/
-RUN UV_PROJECT_ENVIRONMENT=/opt/venv UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy \
-    UV_COMPILE_BYTECODE=1 UV_NO_CACHE=1 \
-    uv sync --project /deps --locked --no-build --no-dev --python /usr/local/bin/python \
- && /opt/venv/bin/python -I -c "import fanficfare"
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    UV_NO_CACHE=1
+RUN ["/usr/local/bin/uv", "sync", "--project", "/deps", "--locked", "--no-build", "--no-dev", \
+     "--python", "/usr/bin/python3"]
+RUN ["/opt/venv/bin/python", "-I", "-c", "import fanficfare"]
 # The licence notice for everything in the venv. The script exits non-zero on a licence that
 # is not allowed, which fails the build (see licenses/python_licenses.py).
 COPY licenses/python_licenses.py /licenses/python_licenses.py
-RUN mkdir /out && /opt/venv/bin/python -I /licenses/python_licenses.py > /out/THIRD-PARTY-LICENSES-PYTHON.txt
+RUN ["/opt/venv/bin/python", "-I", "-B", "/licenses/python_licenses.py", \
+     "--output", "/out/THIRD-PARTY-LICENSES-PYTHON.txt"]
 
 # --------------------------------------------------------------------------- runtime
 FROM python-base AS runtime
@@ -133,26 +157,22 @@ FROM python-base AS runtime
 # Who the service runs as. Any other uid works too, with `--user UID:GID` (or runAsUser):
 # the writable directories below are group-writable for exactly that reason, so pass the
 # group this image is built with (APP_GID) and everything keeps working. Under rootless
-# Docker/Podman the uid is a range inside your user namespace, so the default is fine.
+# Docker/Podman the uid is a range inside your user namespace, so the default is fine. (No
+# passwd entry is needed: nothing looks the user up, and HOME is set below.)
 ARG APP_UID=10001
 ARG APP_GID=10001
-# useradd stamps /etc/shadow with "last password change" = today; with this set it uses the
-# commit's date instead.
-ARG SOURCE_DATE_EPOCH
 
-# No apt: the base image already ships ca-certificates, and an apt install would pull whatever
-# Debian has that day (and leave logs behind), which no two builds would agree on.
-RUN groupadd --system --gid "${APP_GID}" fanfold \
- && useradd --system --uid "${APP_UID}" --gid "${APP_GID}" --no-create-home \
-        --home-dir /tmp/fanfold --shell /usr/sbin/nologin fanfold \
- # The only writable places. Mount a volume at /library (the books) and an empty tmpfs or
- # emptyDir at /tmp/fanfold (per-download scratch) and /run/fanfold (the rendered personal.ini,
- # best on a memory-backed mount so credentials never touch disk). They exist here so a
- # container started without mounts still works, and are 0770 so a different uid in the
- # same group can use them.
- && install -d -o "${APP_UID}" -g "${APP_GID}" -m 0770 /library /tmp/fanfold /run/fanfold \
- # Where the config file is mounted (root-owned, read-only).
- && install -d -m 0755 /etc/fanfold
+# The only writable places. Mount a volume at /library (the books) and an empty tmpfs or
+# emptyDir at /tmp/fanfold (per-download scratch) and /run/fanfold (the rendered personal.ini,
+# best on a memory-backed mount so credentials never touch disk). They exist here so a
+# container started without mounts still works, and are 0770 so a different uid in the same
+# group can use them. /etc/fanfold is where the config is mounted (root-owned, read-only).
+# (ARGs are plain environment variables to an exec-form RUN.)
+RUN ["/usr/bin/python3", "-I", "-B", "-c", "\
+import os; u, g = int(os.environ['APP_UID']), int(os.environ['APP_GID'])\n\
+for p in ('/library', '/tmp/fanfold', '/run/fanfold'):\n\
+    os.makedirs(p); os.chown(p, u, g); os.chmod(p, 0o770)\n\
+os.makedirs('/etc/fanfold'); os.chmod('/etc/fanfold', 0o755)\n"]
 
 COPY --from=venv /opt/venv /opt/venv
 COPY --from=build /out/fanfold /usr/local/bin/fanfold
