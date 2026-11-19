@@ -10,7 +10,8 @@ use fanfold_app::{
     error::RepoError,
     ports::{
         BookCatalog, BookRecord, CursorStore, EnqueueOutcome, Event, EventSource, JobCounts,
-        JobFilter, JobRepository, LogEntry, LogLevel, MetadataStore, SessionStore,
+        JobFilter, JobRepository, LibraryCatalog, LibraryPage, LibraryQuery, LibrarySort,
+        LibraryStatus, LibraryTotals, LogEntry, LogLevel, MetadataStore, SessionStore,
     },
 };
 use fanfold_domain::{
@@ -645,6 +646,264 @@ fn unwrap_created(outcome: EnqueueOutcome) -> fanfold_domain::job::Job {
     }
 }
 
+/// What the library listing reads from: the books, and the recorded metadata.
+pub trait LibraryFixture: BookCatalog + MetadataStore + LibraryCatalog {}
+impl<T: BookCatalog + MetadataStore + LibraryCatalog> LibraryFixture for T {}
+
+/// Run every [`LibraryCatalog`] contract against fresh instances from `make`.
+pub async fn library_catalog<F, Fut>(make: F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<dyn LibraryFixture>>,
+{
+    the_library_lists_books_with_their_latest_metadata(&*make().await).await;
+    the_library_is_searched_filtered_sorted_and_paged(&*make().await).await;
+    equal_update_dates_put_the_newest_book_first(&*make().await).await;
+}
+
+fn book(n: u64, title: &str, at: i64) -> BookRecord {
+    BookRecord {
+        work: work(n),
+        file_name: format!("single/somebody/{title} {n}.epub"),
+        title: title.into(),
+        updated_at: t(at),
+    }
+}
+
+/// Three books and one observed work without a book:
+/// 1 "Alpha Light" by zed: complete (3/3), 1,000 words, updated 2026-10-01, in a series,
+///   with a freeform tag (searchable, but not listed);
+/// 2 "beta tide" by Amy: in progress (2/?), 5,000 words, updated 2026-10-20;
+/// 3 "Gamma (saved)": a book whose work was never observed;
+/// 4: observed, but never downloaded.
+async fn small_library(store: &dyn LibraryFixture) {
+    let mut alpha = observed_work(1);
+    alpha.facts.title = "Alpha Light".into();
+    alpha.facts.byline = "zed".into();
+    alpha.facts.chapters_posted = 3;
+    alpha.facts.chapters_total = Some(3);
+    alpha.facts.words = 1_000;
+    alpha.facts.updated_on = Some(jiff_date(2026, 10, 1));
+    alpha.tags.push(Tag {
+        kind: TagKind::Freeform,
+        name: "Slow Burn".into(),
+    });
+    alpha.series = vec![SeriesPart {
+        id: series_id(77),
+        name: "A Test Saga".into(),
+        part: Some(1),
+    }];
+    alpha.stats.kudos = Some(5);
+    store.record_work(&alpha, t(100), None).await.unwrap();
+    // A later visit: only the counters moved.
+    alpha.stats.kudos = Some(9);
+    store.record_work(&alpha, t(200), None).await.unwrap();
+
+    let mut beta = observed_work(2);
+    beta.facts.title = "beta tide".into();
+    beta.facts.byline = "Amy".into();
+    beta.facts.chapters_posted = 2;
+    beta.facts.chapters_total = None;
+    beta.facts.words = 5_000;
+    beta.facts.updated_on = Some(jiff_date(2026, 10, 20));
+    beta.series = vec![];
+    store.record_work(&beta, t(150), None).await.unwrap();
+
+    store
+        .record_work(&observed_work(4), t(160), None)
+        .await
+        .unwrap();
+
+    for b in [
+        book(1, "Alpha Light", 210),
+        book(2, "beta tide", 160),
+        book(3, "Gamma (saved)", 170),
+    ] {
+        store.upsert(&b).await.unwrap();
+    }
+}
+
+fn query(search: Option<&str>, status: LibraryStatus, sort: LibrarySort) -> LibraryQuery {
+    LibraryQuery {
+        search: search.map(Into::into),
+        status,
+        sort,
+        limit: 50,
+        offset: 0,
+    }
+}
+
+async fn listed(store: &dyn LibraryFixture, q: &LibraryQuery) -> Vec<u64> {
+    store
+        .library(q)
+        .await
+        .unwrap()
+        .entries
+        .iter()
+        .map(|e| e.book.work.get())
+        .collect()
+}
+
+async fn the_library_lists_books_with_their_latest_metadata(store: &dyn LibraryFixture) {
+    let empty = store
+        .library(&query(None, LibraryStatus::All, LibrarySort::Updated))
+        .await
+        .unwrap();
+    assert_eq!(empty, LibraryPage::default(), "an empty library");
+
+    small_library(store).await;
+    let page = store
+        .library(&query(None, LibraryStatus::All, LibrarySort::Updated))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.totals,
+        LibraryTotals {
+            books: 3,
+            words: 6_000,
+            complete: 1
+        }
+    );
+    assert_eq!(page.matching, 3);
+
+    let alpha = store.entry(work(1)).await.unwrap().expect("listed");
+    assert_eq!(alpha, page.entries[1], "entry() is the listed entry");
+    assert_eq!(alpha.book, book(1, "Alpha Light", 210));
+    assert_eq!(alpha.title(), "Alpha Light");
+    assert_eq!(alpha.complete(), Some(true));
+    assert_eq!(
+        alpha.tags,
+        vec![
+            Tag {
+                kind: TagKind::Fandom,
+                name: "Original Work".into()
+            },
+            Tag {
+                kind: TagKind::Relationship,
+                name: "Ada Marsh/Ben Ward".into()
+            },
+        ],
+        "fandoms, relationships and warnings only, in AO3's order"
+    );
+    assert_eq!(alpha.series[0].name, "A Test Saga");
+    assert_eq!(alpha.stats.kudos, Some(9), "the latest counters");
+    assert_eq!(alpha.last_checked, Some(t(200)));
+
+    let gamma = store.entry(work(3)).await.unwrap().expect("listed");
+    assert_eq!(gamma.facts, None, "never observed");
+    assert_eq!(
+        gamma.title(),
+        "Gamma (saved)",
+        "falls back to the book's title"
+    );
+    assert_eq!(gamma.complete(), None);
+    assert_eq!(gamma.stats, WorkStats::default());
+    assert_eq!(gamma.last_checked, None);
+
+    assert_eq!(
+        store.entry(work(4)).await.unwrap(),
+        None,
+        "no book, not listed"
+    );
+}
+
+async fn the_library_is_searched_filtered_sorted_and_paged(store: &dyn LibraryFixture) {
+    use LibrarySort as S;
+    use LibraryStatus as St;
+    small_library(store).await;
+
+    // Sorting.
+    assert_eq!(
+        listed(store, &query(None, St::All, S::Updated)).await,
+        [2, 1, 3]
+    );
+    assert_eq!(
+        listed(store, &query(None, St::All, S::Title)).await,
+        [1, 2, 3],
+        "case-insensitive: alpha, beta, Gamma"
+    );
+    assert_eq!(
+        listed(store, &query(None, St::All, S::Author)).await,
+        [2, 1, 3],
+        "Amy, zed, then no byline"
+    );
+    assert_eq!(
+        listed(store, &query(None, St::All, S::Words)).await,
+        [2, 1, 3]
+    );
+
+    // Filtering by completion.
+    assert_eq!(
+        listed(store, &query(None, St::Complete, S::Updated)).await,
+        [1]
+    );
+    assert_eq!(
+        listed(store, &query(None, St::InProgress, S::Updated)).await,
+        [2],
+        "a total of \"?\" is in progress; an unobserved work is neither"
+    );
+
+    // Searching: title, byline, any current tag, series names; case-insensitive.
+    for (needle, expect) in [
+        ("TIDE", vec![2]),
+        ("amy", vec![2]),
+        ("slow burn", vec![1]),
+        ("test saga", vec![1]),
+        ("gamma", vec![3]),
+        ("original work", vec![2, 1]),
+        ("zzz", vec![]),
+        ("%", vec![]),
+        ("_", vec![]),
+        ("   ", vec![2, 1, 3]),
+    ] {
+        assert_eq!(
+            listed(store, &query(Some(needle), St::All, S::Updated)).await,
+            expect,
+            "search {needle:?}"
+        );
+    }
+    let page = store
+        .library(&query(Some("tide"), St::All, S::Updated))
+        .await
+        .unwrap();
+    assert_eq!(page.matching, 1);
+    assert_eq!(page.totals.books, 3, "totals ignore the query");
+    assert_eq!(
+        listed(store, &query(Some("original"), St::Complete, S::Updated)).await,
+        [1],
+        "search and filter combine"
+    );
+
+    // Paging.
+    let mut q = query(None, St::All, S::Title);
+    q.limit = 2;
+    let first = store.library(&q).await.unwrap();
+    assert_eq!(first.entries.len(), 2);
+    assert_eq!(first.matching, 3);
+    q.offset = 2;
+    assert_eq!(listed(store, &q).await, [3]);
+}
+
+async fn equal_update_dates_put_the_newest_book_first(store: &dyn LibraryFixture) {
+    for (n, saved) in [(1, 300), (2, 400), (3, 100)] {
+        let mut w = observed_work(n);
+        w.facts.title = format!("Work {n}");
+        store.record_work(&w, t(50), None).await.unwrap();
+        store
+            .upsert(&book(n, &format!("Work {n}"), saved))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        listed(
+            store,
+            &query(None, LibraryStatus::All, LibrarySort::Updated)
+        )
+        .await,
+        [2, 1, 3]
+    );
+}
+
 /// Run every [`BookCatalog`] contract against fresh instances from `make`.
 pub async fn book_catalog<F, Fut>(make: F)
 where
@@ -1230,5 +1489,11 @@ mod tests {
     #[tokio::test]
     async fn in_memory_metadata_store_honours_the_contract() {
         metadata_store(|| async { Arc::new(InMemoryJobs::new()) as Arc<dyn MetadataStore> }).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_library_honours_the_contract() {
+        library_catalog(|| async { Arc::new(InMemoryJobs::new()) as Arc<dyn LibraryFixture> })
+            .await;
     }
 }

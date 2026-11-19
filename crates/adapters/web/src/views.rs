@@ -21,6 +21,8 @@ use crate::{
     problem::ProblemDetails,
 };
 
+pub mod library;
+
 // ----------------------------------------------------------------------- models
 
 #[derive(Debug, Clone)]
@@ -160,6 +162,7 @@ impl Notice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Nav {
     Dashboard,
+    Library,
     History,
     Session,
     None,
@@ -266,6 +269,7 @@ pub fn page(frame: Frame<'_>, above: &Markup, content: &Markup) -> Markup {
                         a class="brand" href="/" { "Fanfold" }
                         nav class="nav" aria-label="Main" {
                             (nav_link("Dashboard", "/", nav == Nav::Dashboard))
+                            (nav_link("Library", "/library", nav == Nav::Library))
                             (nav_link("History", "/jobs", nav == Nav::History))
                             (nav_link("Session", "/session", nav == Nav::Session))
                         }

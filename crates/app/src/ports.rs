@@ -14,7 +14,10 @@ use fanfold_domain::{
     Timestamp,
     failure::FailureKind,
     job::{Job, JobId, JobSource, Target},
-    metadata::{Chapter, FollowSource, SeriesMetadata, WorkMetadata, WorkState},
+    metadata::{
+        Chapter, FollowSource, SeriesMetadata, SeriesPart, Tag, WorkFacts, WorkMetadata, WorkState,
+        WorkStats,
+    },
     session::BrowserSession,
     work::{SeriesId, WorkId},
 };
@@ -234,6 +237,137 @@ pub trait BookCatalog: Send + Sync {
     async fn titles(&self, works: &[WorkId]) -> Result<HashMap<WorkId, String>, RepoError>;
     /// Forget a work's book. Returns whether there was one.
     async fn remove(&self, work: WorkId) -> Result<bool, RepoError>;
+}
+
+// --------------------------------------------------------------------- library
+
+/// Which books a library listing shows, by completion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum LibraryStatus {
+    #[default]
+    All,
+    /// Every chapter the author planned is posted.
+    Complete,
+    /// Known, and not complete (including works whose total AO3 shows as "?").
+    InProgress,
+}
+
+impl LibraryStatus {
+    pub const ALL: [Self; 3] = [Self::All, Self::Complete, Self::InProgress];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Complete => "complete",
+            Self::InProgress => "in_progress",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.as_str() == raw)
+    }
+}
+
+/// The order of a library listing. Every order ends with the work id, so it is total.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum LibrarySort {
+    /// AO3's "updated" date, newest first (works without one last), then the newest book.
+    #[default]
+    Updated,
+    /// By title, A to Z (lower-cased, by code point).
+    Title,
+    /// By byline, A to Z (lower-cased, by code point), then title.
+    Author,
+    /// Longest first.
+    Words,
+}
+
+impl LibrarySort {
+    pub const ALL: [Self; 4] = [Self::Updated, Self::Title, Self::Author, Self::Words];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Updated => "updated",
+            Self::Title => "title",
+            Self::Author => "author",
+            Self::Words => "words",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.as_str() == raw)
+    }
+}
+
+/// One page of the library to list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LibraryQuery {
+    /// Case-insensitive substring of the title, the byline, any current tag, or a series
+    /// name. Blank means everything.
+    pub search: Option<String>,
+    pub status: LibraryStatus,
+    pub sort: LibrarySort,
+    pub limit: u32,
+    pub offset: u32,
+}
+
+/// One book in the library, with what AO3 last said about its work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryEntry {
+    pub book: BookRecord,
+    /// The latest recorded facts; `None` for a book whose work was never observed.
+    pub facts: Option<WorkFacts>,
+    /// The work's current fandom, relationship and warning tags, in AO3's order.
+    pub tags: Vec<Tag>,
+    pub series: Vec<SeriesPart>,
+    /// The latest counters.
+    pub stats: WorkStats,
+    pub last_checked: Option<Timestamp>,
+}
+
+impl LibraryEntry {
+    /// The title to show: AO3's latest, else the one the book was saved with.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        self.facts.as_ref().map_or(&self.book.title, |f| &f.title)
+    }
+
+    /// Whether every planned chapter is posted (`None`: never observed).
+    #[must_use]
+    pub fn complete(&self) -> Option<bool> {
+        self.facts
+            .as_ref()
+            .map(|f| f.chapters_total == Some(f.chapters_posted))
+    }
+}
+
+/// Totals over the whole library, whatever the query.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LibraryTotals {
+    pub books: u64,
+    pub words: u64,
+    pub complete: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LibraryPage {
+    pub entries: Vec<LibraryEntry>,
+    /// How many books match the query (all pages).
+    pub matching: u64,
+    pub totals: LibraryTotals,
+}
+
+/// The library as a list: every book, with its work's latest metadata.
+#[cfg_attr(any(test, feature = "mocks"), mockall::automock)]
+#[async_trait]
+pub trait LibraryCatalog: Send + Sync {
+    async fn library(&self, query: &LibraryQuery) -> Result<LibraryPage, RepoError>;
+    /// One book, as listed (`None` when the work has no book).
+    async fn entry(&self, work: WorkId) -> Result<Option<LibraryEntry>, RepoError>;
 }
 
 /// The folder the e-reader syncs from.

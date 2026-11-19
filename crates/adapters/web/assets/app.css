@@ -323,3 +323,144 @@ details.danger { margin-top: 12px; border-top: 1px solid var(--line); padding-to
 details.danger summary { cursor: pointer; color: var(--muted); font-weight: 600; font-size: .92rem; }
 details.danger[open] summary { color: inherit; }
 details.danger p { margin: 8px 0 10px; color: var(--muted); font-size: .92rem; }
+
+/* ---- library -------------------------------------------------------------- */
+/* Twelve cover colours; a work takes one from its first fandom (format::hue). */
+.hue-0 { --h: 4; } .hue-1 { --h: 28; } .hue-2 { --h: 46; } .hue-3 { --h: 88; }
+.hue-4 { --h: 142; } .hue-5 { --h: 172; } .hue-6 { --h: 196; } .hue-7 { --h: 214; }
+.hue-8 { --h: 238; } .hue-9 { --h: 266; } .hue-10 { --h: 296; } .hue-11 { --h: 330; }
+
+/* A book cover drawn in CSS: a darker spine with a highlight, a sheen, a two-tone cloth. */
+.cover {
+  --light: 40%;
+  position: relative; flex: none; display: flex; flex-direction: column; justify-content: space-between;
+  width: 64px; aspect-ratio: 2 / 3; padding: 7px 6px 6px 10px; overflow: hidden;
+  border-radius: 3px 7px 7px 3px; color: #fff;
+  background:
+    linear-gradient(90deg, rgb(0 0 0 / .3) 0 4px, rgb(255 255 255 / .22) 4px 5px, transparent 5px),
+    radial-gradient(120% 70% at 100% 0%, rgb(255 255 255 / .25), transparent 60%),
+    linear-gradient(160deg, hsl(var(--h) 52% calc(var(--light) + 10%)), hsl(calc(var(--h) + 32) 60% calc(var(--light) - 12%)));
+  box-shadow: 0 1px 2px rgb(0 0 0 / .18), 0 6px 12px -6px rgb(0 0 0 / .45);
+}
+.cover::after { /* the paper label, as on the dashboard's spines */
+  content: ""; position: absolute; left: 10px; right: 6px; bottom: 22%; height: 2px;
+  background: rgb(255 255 255 / .55); border-radius: 1px;
+}
+.cover-title {
+  font: 600 .6rem/1.15 var(--serif); overflow-wrap: break-word; hyphens: auto; text-shadow: 0 1px 1px rgb(0 0 0 / .3);
+  display: -webkit-box; -webkit-line-clamp: 5; -webkit-box-orient: vertical; overflow: hidden;
+}
+.cover-by { font-size: .48rem; opacity: .9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cover.big { width: 128px; padding: 14px 12px 12px 18px; border-radius: 4px 12px 12px 4px; }
+.cover.big::after { left: 18px; right: 12px; height: 3px; }
+.cover.big .cover-title { font-size: 1rem; -webkit-line-clamp: 7; }
+.cover.big .cover-by { font-size: .75rem; }
+@media (prefers-color-scheme: dark) { .cover { --light: 34%; } }
+
+.lib-title { margin-bottom: 12px; }
+.lib-tools { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+.lib-tools input[type="search"], .lib-tools select {
+  min-height: 48px; padding: 0 14px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--surface); color: var(--ink); font: inherit; min-width: 0;
+}
+.lib-tools input[type="search"] { grid-column: 1 / -1; }
+@media (min-width: 560px) {
+  .lib-tools { grid-template-columns: 1fr auto auto; }
+  .lib-tools input[type="search"] { grid-column: auto; }
+}
+.lib-stats { display: flex; flex-wrap: wrap; gap: 2px 16px; margin: 16px 0 0; color: var(--muted); font-size: .92rem; }
+.lib-stats strong { color: var(--ink); font-variant-numeric: tabular-nums; }
+
+.seg {
+  display: flex; gap: 4px; padding: 4px; margin: 12px 0 14px;
+  background: color-mix(in srgb, var(--ink) 7%, transparent); border-radius: 12px;
+}
+.seg a {
+  flex: 1; display: flex; align-items: center; justify-content: center; min-height: 40px; padding: 0 8px;
+  border-radius: 9px; color: var(--muted); font-weight: 600; font-size: .92rem; text-decoration: none; text-align: center;
+}
+.seg a[aria-current="page"] { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgb(0 0 0 / .14); }
+@media (prefers-color-scheme: dark) {
+  .seg a[aria-current="page"] { background: color-mix(in srgb, var(--ink) 18%, var(--surface)); }
+}
+.lib-count { margin: 0 0 10px; color: var(--muted); font-size: .9rem; }
+
+.books { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+@media (min-width: 680px) { .books { grid-template-columns: 1fr 1fr; } }
+.book {
+  display: flex; gap: 14px; height: 100%; padding: 12px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+  color: inherit; text-decoration: none;
+}
+.book:hover { border-color: color-mix(in srgb, var(--ink) 30%, var(--line)); }
+@media (prefers-reduced-motion: no-preference) {
+  .book .cover { transition: transform .2s ease; }
+  .book:hover .cover, .book:focus-visible .cover { transform: rotate(-3deg) translateY(-2px); }
+}
+.book .info { display: flex; flex-direction: column; min-width: 0; }
+.book .t {
+  font: 600 1.05rem/1.3 var(--serif); overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.book .by { font-size: .9rem; overflow-wrap: anywhere; }
+.fandom { font-size: .82rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.book .meta { margin-top: 6px; }
+.soft { color: var(--muted); }
+.meta.soft { margin-top: 3px; font-size: .8rem; }
+.wip { --c: var(--running); }
+.rating {
+  display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px;
+  border-radius: 6px; background: var(--r); color: #fff; font: 800 .74rem var(--sans);
+}
+.r-g { --r: #3d8a4c; } .r-t { --r: #b98a12; } .r-m { --r: #cc6119; } .r-e { --r: #b3372b; } .r-nr { --r: #6f7b88; }
+.kudos { color: #c2466b; font-weight: 600; }
+@media (prefers-color-scheme: dark) { .kudos { color: #f08aa8; } }
+.series { font-style: italic; }
+.lock { font-weight: 600; color: var(--retrying); }
+
+/* One book. */
+.work-head { display: flex; gap: 18px; align-items: flex-start; margin-top: 4px; }
+.work-id { flex: 1; min-width: 0; }
+.work-id h1 { font-size: 1.5rem; }
+.work-id .by { margin: 4px 0 0; }
+.work-id .fandom { white-space: normal; margin: 2px 0 0; }
+.work-id .meta { margin: 10px 0 0; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.actions form { display: contents; }
+@media (max-width: 520px) {
+  .work-head { flex-direction: column; align-items: center; text-align: center; }
+  .work-id .meta, .actions { justify-content: center; }
+  .actions .btn { flex: 1 1 100%; }
+}
+.summary {
+  margin-top: 22px; padding: 16px 18px; background: var(--surface); border: 1px solid var(--line);
+  border-left: 4px solid var(--accent); border-radius: var(--radius); font: 1.02rem/1.6 var(--serif);
+}
+.summary p { margin: 0; }
+.summary p + p { margin-top: .7em; }
+/* Each cell draws its own right and bottom rule (clipped at the edges), so a short last row
+   leaves plain surface, not a grey gap. */
+.stats {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); margin: 22px 0 0;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden;
+}
+.stats div { padding: 10px 12px; min-width: 0; box-shadow: 1px 0 0 var(--line), 0 1px 0 var(--line); }
+.stats:empty { display: none; }
+.work > .empty { margin-top: 16px; }
+.stats dt { font-size: .7rem; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
+.stats dd { margin: 2px 0 0; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.tags ul { display: flex; flex-wrap: wrap; gap: 6px; list-style: none; margin: 0; padding: 0; }
+.tags li {
+  padding: 3px 11px; border-radius: 999px; font-size: .86rem;
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--line));
+}
+.work-series ul { margin: 0; padding-left: 1.1em; }
+.chapters { margin-top: 28px; padding: 0 14px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+.chapters summary { display: flex; align-items: center; min-height: 48px; font-weight: 600; cursor: pointer; }
+.chapters ol { margin: 0 0 12px; padding-left: 1.6em; }
+.chapters li { padding: 5px 0; border-top: 1px solid var(--line); }
+.chapters li .soft { float: right; margin-left: 12px; font-size: .85rem; }
+.file p { margin: 0; }
+.file .soft { margin-top: 4px; font-size: .85rem; }
+.work details.danger { margin-top: 28px; }

@@ -125,6 +125,255 @@ pub fn site_summary(status: SiteStatus, now: Timestamp) -> (&'static str, String
     }
 }
 
+// ----------------------------------------------------------------------- library
+
+/// `84,213`.
+#[must_use]
+pub fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `950`, `8.4k`, `84k`, `1.2M`: one decimal below ten of a unit, none above.
+#[must_use]
+pub fn short(n: u64) -> String {
+    // In u128: `value * 10` must not overflow for any u64.
+    let unit = |value: u64, size: u128, suffix: &str| {
+        let value = u128::from(value);
+        let tenths = (value * 10 + size / 2) / size;
+        match tenths {
+            0..100 if !tenths.is_multiple_of(10) => {
+                format!("{}.{}{suffix}", tenths / 10, tenths % 10)
+            }
+            0..100 => format!("{}{suffix}", tenths / 10),
+            _ => format!("{}{suffix}", (value + size / 2) / size),
+        }
+    };
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..999_500 => unit(n, 1_000, "k"),
+        _ => unit(n, 1_000_000, "M"),
+    }
+}
+
+/// AO3's rating as a one-letter badge: (CSS class, letter, the full name for people).
+#[must_use]
+pub fn rating_badge(rating: &str) -> (&'static str, &'static str) {
+    match rating {
+        "General Audiences" => ("g", "G"),
+        "Teen And Up Audiences" => ("t", "T"),
+        "Mature" => ("m", "M"),
+        "Explicit" => ("e", "E"),
+        _ => ("nr", "?"),
+    }
+}
+
+/// Number of cover colours in the stylesheet (`.hue-0` … `.hue-11`).
+pub const HUES: u32 = 12;
+
+/// A stable colour for a name (its fandom, usually): FNV-1a, so it never changes between
+/// releases or machines.
+#[must_use]
+pub fn hue(seed: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in seed.bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h % HUES
+}
+
+/// `20 Oct 2026`.
+#[must_use]
+pub fn day(date: fanfold_domain::metadata::Date) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month =
+        usize::try_from(date.month() - 1).map_or("?", |m| MONTHS.get(m).copied().unwrap_or("?"));
+    format!("{} {month} {}", date.day(), date.year())
+}
+
+/// AO3 summary HTML as plain paragraphs, safe to print escaped.
+///
+/// Tags are dropped (block ends and `<br>` break paragraphs), the common entities are
+/// decoded, whitespace is collapsed. Nothing of the markup survives, so a summary can never
+/// inject anything into the page.
+#[must_use]
+pub fn summary_paragraphs(html: &str) -> Vec<String> {
+    let mut paragraphs = Vec::new();
+    let mut current = String::new();
+    let mut rest = html;
+    let flush = |current: &mut String, paragraphs: &mut Vec<String>| {
+        let text = decode_entities(current)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !text.is_empty() {
+            paragraphs.push(text);
+        }
+        current.clear();
+    };
+    while let Some(open) = rest.find('<') {
+        current.push_str(&rest[..open]);
+        let Some(close) = rest[open..].find('>') else {
+            // An unclosed `<`: the rest is text.
+            current.push_str(&rest[open..]);
+            rest = "";
+            break;
+        };
+        let tag = rest[open + 1..open + close]
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace() || c == '/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(
+            tag.as_str(),
+            "p" | "br"
+                | "div"
+                | "blockquote"
+                | "li"
+                | "ul"
+                | "ol"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "hr"
+        ) {
+            flush(&mut current, &mut paragraphs);
+        } else {
+            current.push(' ');
+        }
+        rest = &rest[open + close + 1..];
+    }
+    current.push_str(rest);
+    flush(&mut current, &mut paragraphs);
+    paragraphs
+}
+
+fn decode_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        let decoded = after.find(';').filter(|&end| end <= 10).and_then(|end| {
+            let name = &after[..end];
+            let c = match name {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "nbsp" => Some(' '),
+                _ => name
+                    .strip_prefix("#x")
+                    .or_else(|| name.strip_prefix("#X"))
+                    .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                    .or_else(|| name.strip_prefix('#').and_then(|d| d.parse().ok()))
+                    .and_then(char::from_u32),
+            }?;
+            Some((c, end))
+        });
+        if let Some((c, end)) = decoded {
+            out.push(c);
+            rest = &after[end + 1..];
+        } else {
+            out.push('&');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod library_tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    #[test]
+    fn numbers_read_naturally() {
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(999), "999");
+        assert_eq!(grouped(1_000), "1,000");
+        assert_eq!(grouped(84_213), "84,213");
+        assert_eq!(grouped(1_234_567), "1,234,567");
+        assert_eq!(short(950), "950");
+        assert_eq!(short(1_000), "1k");
+        assert_eq!(short(8_449), "8.4k");
+        assert_eq!(short(84_213), "84k");
+        assert_eq!(short(999_499), "999k");
+        assert_eq!(short(999_500), "1M");
+        assert_eq!(short(1_250_000), "1.3M");
+        assert_eq!(short(12_000_000), "12M");
+    }
+
+    #[test]
+    fn ratings_become_badges() {
+        assert_eq!(rating_badge("Teen And Up Audiences"), ("t", "T"));
+        assert_eq!(rating_badge("Explicit"), ("e", "E"));
+        assert_eq!(rating_badge("Not Rated"), ("nr", "?"));
+    }
+
+    #[test]
+    fn hues_are_stable_and_in_range() {
+        assert_eq!(hue("Original Work"), hue("Original Work"));
+        assert!((0..HUES).contains(&hue("")));
+    }
+
+    #[test]
+    fn days_are_short() {
+        let d = fanfold_domain::metadata::Date::new(2026, 10, 20).unwrap();
+        assert_eq!(day(d), "20 Oct 2026");
+    }
+
+    #[test]
+    fn summaries_lose_all_markup() {
+        assert_eq!(
+            summary_paragraphs("<p>It&#39;s now <b>Ben</b>&#x27;s year.</p><p>Two &amp; three</p>"),
+            ["It's now Ben 's year.", "Two & three"]
+        );
+        assert_eq!(
+            summary_paragraphs("line one<br/>line two<br>\n  "),
+            ["line one", "line two"]
+        );
+        assert_eq!(
+            summary_paragraphs(r#"<script>alert(1)</script><img src=x onerror="y">hi"#),
+            ["alert(1) hi"],
+            "tags vanish, their text is just text (and is escaped on output)"
+        );
+        assert_eq!(summary_paragraphs("a < b & c"), ["a < b & c"]);
+        assert_eq!(summary_paragraphs("&bogus; &#xZZ; &"), ["&bogus; &#xZZ; &"]);
+        assert_eq!(summary_paragraphs("  <p> </p> "), Vec::<String>::new());
+    }
+
+    proptest! {
+        #[test]
+        fn summaries_never_panic_or_keep_a_tag(s in ".{0,300}") {
+            for p in summary_paragraphs(&s) {
+                prop_assert!(!p.contains('\n'));
+                prop_assert_eq!(p.trim(), p.as_str());
+            }
+        }
+
+        #[test]
+        fn short_never_panics(n in any::<u64>()) {
+            let _ = short(n);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use fanfold_domain::{

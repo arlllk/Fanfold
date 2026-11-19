@@ -437,6 +437,7 @@ pub async fn start_web(
         jobs: Arc::<PgStore>::clone(store),
         catalog: Arc::<PgStore>::clone(store),
         metadata: Arc::<PgStore>::clone(store),
+        listing: Arc::<PgStore>::clone(store),
         admin: Arc::new(JobAdmin::new(
             Arc::<PgStore>::clone(store),
             Arc::clone(&clock),
