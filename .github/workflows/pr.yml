@@ -5,8 +5,9 @@
 # bump, see release.yml) and is assigned to whoever pushed. Open it as, or convert it to, a
 # draft to keep it from being merged automatically (automerge.yml).
 #
-# A PR opened with the Actions token does not trigger `pull_request` workflows, so this starts
-# CI for the first push itself; later pushes trigger it the normal way.
+# It is opened by the repository's GitHub App (secrets RELEASE_APP_ID, RELEASE_APP_PRIVATE_KEY),
+# not the Actions token: a PR the Actions bot opens triggers no workflows and, in a public repo,
+# would wait for a maintainer to approve its CI. The app's PR triggers CI like anyone's.
 name: pr
 
 on:
@@ -23,12 +24,8 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
-      contents: read
-      pull-requests: write
-      issues: write # labels
-      actions: write # start ci.yml
+      contents: read # checkout only; the PR is opened with the app's token
     env:
-      GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       BRANCH: ${{ github.ref_name }}
       PUSHER: ${{ github.actor }}
@@ -38,7 +35,20 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # A token for this repository only, with only what opening a PR needs; it expires in an
+      # hour and is revoked when the job ends.
+      - id: app
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+          permission-pull-requests: write
+
       - name: Open the pull request
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           set -euo pipefail
           if [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
@@ -53,9 +63,8 @@ jobs:
           if ! gh pr create --base main --head "$BRANCH" --fill-first \
               --label release:patch --assignee "$PUSHER"; then
             if [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
-              echo "Opened concurrently; leaving it to the pull_request trigger."
+              echo "Opened concurrently."
               exit 0
             fi
             exit 1
           fi
-          gh workflow run ci.yml --ref "$BRANCH"

@@ -1,5 +1,14 @@
 # Fanfold
 
+[![Release](https://github.com/arlllk/Fanfold/actions/workflows/release.yml/badge.svg)](https://github.com/arlllk/Fanfold/actions/workflows/release.yml)
+[![CodeQL](https://github.com/arlllk/Fanfold/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/arlllk/Fanfold/security/code-scanning)
+[![Image scan](https://github.com/arlllk/Fanfold/actions/workflows/scan.yml/badge.svg)](https://github.com/arlllk/Fanfold/actions/workflows/scan.yml)
+[![Latest release](https://img.shields.io/github/v/release/arlllk/Fanfold?sort=semver)](https://github.com/arlllk/Fanfold/releases/latest)
+[![Container image](https://img.shields.io/badge/ghcr.io-arlllk%2Ffanfold-blue?logo=docker&logoColor=white)](https://github.com/arlllk/Fanfold/pkgs/container/fanfold)
+[![Rust 1.99+](https://img.shields.io/badge/rust-1.99%2B-orange?logo=rust)](Cargo.toml)
+[![License](https://img.shields.io/badge/license-0BSD%20%7C%20MIT%20%7C%20Apache--2.0-blue)](#license)
+[![Renovate](https://img.shields.io/badge/renovate-enabled-brightgreen?logo=renovatebot)](https://github.com/arlllk/Fanfold/issues?q=is%3Aissue+Dependency+Dashboard)
+
 Fanfold keeps an e-reader library of [AO3](https://archiveofourown.org) works up to date.
 It downloads works as EPUB files into a folder you sync to your reader (with Syncthing, for
 example), and downloads them again when new chapters appear. You queue works or whole series
