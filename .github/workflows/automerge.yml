@@ -1,14 +1,15 @@
-# Merges the owner's pull requests once CI has passed on their latest commit, then starts the
-# release (release.yml) for the merge.
+# Merges the owner's pull requests once CI has passed on their latest commit. The merge is a
+# push to main, which starts the release (release.yml).
 #
 # Merged automatically: PRs from a branch of this repository (never a fork) that the owner
 # opened, or that pr.yml opened for the owner's push (assigned to them), are not drafts, and
 # do not carry the `no-automerge` label. Everything else (Renovate, contributors) waits for a
 # human. The ruleset on main still applies: `ci-ok` must be green or the merge is refused.
 #
-# GitHub's own auto-merge is not used: a merge it performs for the Actions token does not
-# trigger the push to main that release.yml listens for, so the release would never run.
-# This runs on workflow_run, from main's copy of this file, and never checks out PR code.
+# The merge is made with the repository's GitHub App (secrets RELEASE_APP_ID,
+# RELEASE_APP_PRIVATE_KEY): a merge by the Actions token would not trigger the push to main
+# that release.yml listens for. This runs on workflow_run, from main's copy of this file, and
+# never checks out PR code.
 name: automerge
 
 on:
@@ -31,18 +32,28 @@ jobs:
       github.event.workflow_run.head_branch != 'main'
     runs-on: ubuntu-26.04
     timeout-minutes: 5
-    permissions:
-      contents: write
-      pull-requests: write
-      actions: write # start release.yml
+    permissions: {} # everything is done with the app's token
     env:
-      GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       OWNER: ${{ github.repository_owner }}
       BRANCH: ${{ github.event.workflow_run.head_branch }}
       SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
+      # This repository only, only what merging needs (`workflows`: a PR may change files in
+      # .github/workflows); expires in an hour, revoked when the job ends.
+      - id: app
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
       - name: Merge if eligible
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           set -euo pipefail
           pr=$(gh pr list --head "$BRANCH" --base main --state open \
@@ -64,6 +75,4 @@ jobs:
           # --match-head-commit: refuse if anything was pushed after the CI run we checked.
           # (The branch is deleted by the repository's "delete head branches" setting.)
           gh pr merge "$n" --merge --match-head-commit "$SHA"
-          merged=$(gh pr view "$n" --json mergeCommit --jq .mergeCommit.oid)
-          echo "Merged #$n as $merged; releasing it."
-          gh workflow run release.yml --ref main -f sha="$merged"
+          echo "Merged #$n; the push to main starts the release."

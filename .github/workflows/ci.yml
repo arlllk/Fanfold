@@ -5,8 +5,7 @@
 # Triggers:
 #  * pull_request: every PR, including Renovate's and forks' (forks get a read-only token and
 #    no secrets);
-#  * workflow_dispatch: pr.yml starts this for the PRs it opens itself, because a PR opened
-#    with the Actions token does not trigger `pull_request`;
+#  * workflow_dispatch: by hand, to re-run CI on a branch;
 #  * workflow_call: release.yml re-runs it on main, which is also what fills the caches PRs
 #    read (GitHub only shares caches from the default branch).
 name: ci

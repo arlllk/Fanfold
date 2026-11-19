@@ -10,6 +10,10 @@ be green before anything merges.
 Push a branch and a pull request into `main` is opened for it (`pr.yml`), titled after the
 branch's first commit. You can also open one yourself; nothing is duplicated.
 
+Those PRs are opened, and merged, by the repository's GitHub App (secrets `RELEASE_APP_ID` and
+`RELEASE_APP_PRIVATE_KEY`), so CI and the release start by themselves. A PR or merge by the
+built-in Actions token would trigger nothing.
+
 The maintainer's pull requests merge themselves once CI passes (`automerge.yml`). To stop that,
 make the PR a draft or add the `no-automerge` label. Pull requests from forks are merged by
 hand. Renovate merges its own lock file maintenance, digest and pin updates, and patch updates

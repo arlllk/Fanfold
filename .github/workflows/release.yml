@@ -14,9 +14,10 @@
 # Versions live only in tags: nothing is committed back to main, so a release never puts open
 # PRs behind or in conflict. The image is built with the version passed in (FANFOLD_VERSION).
 #
-# Runs on a push to main (a merge by a person) and on workflow_dispatch from automerge.yml (a
-# merge by the Actions token, which does not trigger `push`). Re-running for an already
-# tagged commit does nothing.
+# Runs on every push to main (a merge by a person, by Renovate, or by automerge.yml's GitHub
+# App), and by hand (workflow_dispatch, e.g. with `force`). Re-running for an already tagged
+# commit does nothing. The tag and release are made with the Actions token on purpose: they
+# then trigger nothing, so image.yml's own tag trigger does not build the image a second time.
 name: release
 
 on:
