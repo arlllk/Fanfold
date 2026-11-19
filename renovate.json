@@ -30,6 +30,17 @@
       "matchStrings": [
         "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+)(?:\\s+versioning=(?<versioning>\\S+))?\\s*\\n\\s*ARG\\s+\\w+=(?<currentValue>\\S+)"
       ]
+    },
+    {
+      "customType": "regex",
+      "description": "The BuildKit image CI builds with (image.yml, setup-buildx driver-opts), pinned by digest because its layer compression is part of the reproducible image digest.",
+      "managerFilePatterns": [
+        "/(^|/)\\.github/workflows/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "image=(?<depName>moby/buildkit):(?<currentValue>v[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
     }
   ],
   "packageRules": [
@@ -48,21 +59,7 @@
       "groupName": "GitHub Actions"
     },
     {
-      "description": "A new Python minor/major under FanFicFare, and a new runner OS, can break the build in ways CI only half covers: propose them on the dependency dashboard and wait for approval. Patch and digest updates stay automatic.",
-      "matchDatasources": [
-        "docker"
-      ],
-      "matchPackageNames": [
-        "python"
-      ],
-      "matchUpdateTypes": [
-        "major",
-        "minor"
-      ],
-      "dependencyDashboardApproval": true
-    },
-    {
-      "description": "Runner images: approval first (see above).",
+      "description": "A new runner OS can break the build in ways CI only half covers: propose it on the dependency dashboard and wait for approval. (The runtime base, distroless python3-debian13, only ever gets digest updates, which automerge; its next Debian release is a new image name, changed by hand.)",
       "matchDatasources": [
         "github-runners"
       ],

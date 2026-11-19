@@ -1,0 +1,57 @@
+# Daily vulnerability scan of the latest release, for CVEs published after it was released.
+#
+# Scans the release's SPDX SBOM (attached by release.yml: Debian packages, the Python venv, and
+# the Rust crates), so it needs neither the image nor registry access, and uploads the result
+# to the Security tab (code scanning, category `container-image`, the same as release.yml's,
+# so the newest result replaces the last and fixed findings close by themselves).
+#
+# A finding with a fix is usually one Renovate update away (a base image digest, a crate, a
+# Python package); merging it makes a new release, whose scan closes the alert.
+name: scan
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  latest-release:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # download the release asset
+      security-events: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Latest release's SBOM
+        id: sbom
+        run: |
+          set -euo pipefail
+          tag=$(gh release view --json tagName --jq .tagName)
+          if ! gh release download "$tag" --pattern '*.spdx.json' --output sbom.spdx.json; then
+            echo "::notice::$tag has no SBOM (released before SBOMs existed); nothing to scan."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Scanning $tag."
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      - name: Vulnerability scan
+        id: scan
+        if: steps.sbom.outputs.found == 'true'
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          sbom: sbom.spdx.json
+          fail-build: false
+          output-format: sarif
+
+      - name: Upload to the Security tab
+        if: steps.sbom.outputs.found == 'true'
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: ${{ steps.scan.outputs.sarif }}
+          category: container-image

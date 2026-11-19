@@ -140,6 +140,92 @@ jobs:
     with:
       version: ${{ needs.tag.outputs.version }}
 
+  # The release's software bill of materials, and signed statements about the image. All of it
+  # lives NEXT to the image (release assets, and attestations stored in the registry as
+  # referrers of the digest), never inside it, so the image digest stays reproducible.
+  #  * SBOMs (Syft), SPDX and CycloneDX: Debian packages, the Python venv, and the Rust crates
+  #    (cargo-auditable embeds them in the binary). Attached to the GitHub release.
+  #  * Attestations, signed with GitHub's Sigstore identity for this workflow: build provenance
+  #    (which commit and workflow made this digest) and the SPDX SBOM. Check them with
+  #      gh attestation verify oci://ghcr.io/arlllk/fanfold:X.Y.Z -R arlllk/Fanfold
+  #  * A vulnerability scan of the SBOM, uploaded to the repository's Security tab (code
+  #    scanning). scan.yml re-scans the latest release daily, for CVEs published later.
+  sbom:
+    needs: [tag, image]
+    if: needs.image.outputs.digest != ''
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # release assets
+      packages: write # attestations are pushed to the registry
+      id-token: write # Sigstore signing
+      attestations: write
+      security-events: write # code scanning upload
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.tag.outputs.version }}
+      DIGEST: ${{ needs.image.outputs.digest }}
+    steps:
+      - name: Image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: SBOM, SPDX
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.IMAGE }}@${{ env.DIGEST }}
+          format: spdx-json
+          output-file: fanfold-${{ env.VERSION }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: SBOM, CycloneDX
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.IMAGE }}@${{ env.DIGEST }}
+          format: cyclonedx-json
+          output-file: fanfold-${{ env.VERSION }}.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Attach the SBOMs to the release
+        run: gh release upload "v$VERSION" "fanfold-$VERSION.spdx.json" "fanfold-$VERSION.cdx.json" --clobber
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ env.DIGEST }}
+          push-to-registry: true
+
+      - name: Attest the SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ env.DIGEST }}
+          sbom-path: fanfold-${{ env.VERSION }}.spdx.json
+          push-to-registry: true
+
+      - name: Vulnerability scan
+        id: scan
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          sbom: fanfold-${{ env.VERSION }}.spdx.json
+          fail-build: false
+          output-format: sarif
+
+      - name: Upload to the Security tab
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: ${{ steps.scan.outputs.sarif }}
+          category: container-image
+
   # CI on main itself, beside the release (it does not gate it: the PR already passed). This is
   # what fills the Rust cache the PRs read; the image cache is filled by the publish above.
   warm-cache:

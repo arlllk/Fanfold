@@ -101,13 +101,14 @@ jobs:
           enable-cache: false
 
       # The FanFicFare the image ships: the same python/uv.lock (and --locked fails if
-      # pyproject.toml and the lock disagree).
+      # pyproject.toml and the lock disagree), on the image's Python minor version (Debian's,
+      # in the distroless base; keep in step with the Dockerfile).
       - name: Integration setup
         run: |
           set -euo pipefail
           pg_bin=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -n1)
           echo "$pg_bin" >> "$GITHUB_PATH"
-          UV_PROJECT_ENVIRONMENT="$PWD/.venv" uv sync --project python --locked --no-build
+          UV_PROJECT_ENVIRONMENT="$PWD/.venv" uv sync --project python --locked --no-build --python 3.13
           echo "FFD_PYTHON=$PWD/.venv/bin/python" >> "$GITHUB_ENV"
 
       - name: Integration, PostgreSQL contracts

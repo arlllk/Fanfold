@@ -10,6 +10,7 @@ that is not allowed. Copyleft is allowed only for the packages named in COPYLEFT
 GPL or LGPL dependency fails the build until someone has read it and decided.
 """
 
+import os
 import re
 import sys
 from importlib import metadata
@@ -153,8 +154,8 @@ def main():
     out.append("Fanfold runs FanFicFare, a Python program, as a separate process. FanFicFare and")
     out.append("the packages it depends on are installed in /opt/venv, each under its own licence,")
     out.append("listed below with the licence texts they ship. The Python interpreter and the")
-    out.append("Debian packages in the image keep their own notices (/usr/local/lib/python3*/")
-    out.append("LICENSE.txt and /usr/share/doc/*/copyright).")
+    out.append("other Debian packages in the image keep their own notices")
+    out.append("(/usr/share/doc/*/copyright).")
     out.append("")
     out.append("Summary")
     out.append("-------")
@@ -190,7 +191,16 @@ def main():
         for name, text in texts:
             out += [f"--- {name} ---", text, ""]
         out.append("")
-    sys.stdout.write("\n".join(out).rstrip("\n") + "\n")
+    notice = "\n".join(out).rstrip("\n") + "\n"
+    # `--output FILE` writes the notice there (the distroless image build has no shell to
+    # redirect stdout); otherwise it goes to stdout.
+    if len(sys.argv) == 3 and sys.argv[1] == "--output":
+        target = PurePosixPath(sys.argv[2])
+        os.makedirs(str(target.parent), exist_ok=True)
+        with open(str(target), "w", encoding="utf-8") as f:
+            f.write(notice)
+    else:
+        sys.stdout.write(notice)
 
     if problems:
         sys.stderr.write("\nlicence check FAILED:\n")

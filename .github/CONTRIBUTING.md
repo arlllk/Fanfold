@@ -45,17 +45,23 @@ first release.
 
 ## Reproducible images
 
-The same commit always builds the same image, with the same digest. To check a release, build
-its tag:
+The same commit always builds the same image, on any machine. This was verified for v0.1.2: a
+local rebuild gave exactly the layers CI published. To check a release, build its tag with the
+BuildKit CI uses (pinned in `image.yml`; the files are identical with any BuildKit, but the
+layer compression is BuildKit's own):
 
 ```sh
 git checkout v1.4.2
-SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) docker buildx build --build-arg FANFOLD_VERSION=1.4.2 \
-  --output type=oci,dest=fanfold.tar,rewrite-timestamp=true .
+docker buildx create --name repro --driver docker-container \
+  --driver-opt image=moby/buildkit:v0.34.2   # the version pinned in image.yml
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) docker buildx build --builder repro \
+  --build-arg FANFOLD_VERSION=1.4.2 --output type=oci,dest=fanfold.tar,rewrite-timestamp=true .
+docker buildx rm repro
 ```
 
-The image's labels (added by CI) are left out of this build, so compare the image's layers with
-the published ones (for example `docker buildx imagetools inspect --raw`), not its digest.
+Then compare the layer digests in `fanfold.tar` with the published image's
+(`docker buildx imagetools inspect --raw ghcr.io/arlllk/fanfold:1.4.2`). The image digest
+itself also covers the labels CI adds, so compare the layers.
 
 What makes it work: base images pinned by digest, crates by `Cargo.lock`, and Python packages by
 hash in `python/uv.lock` (wheels only, nothing compiled). Nothing comes from apt, and every
@@ -67,3 +73,28 @@ breaks it.
 FanFicFare, the only Python dependency, is declared in `python/pyproject.toml` and locked in
 `python/uv.lock`. The image, CI and `just venv` all install exactly that lock with
 `uv sync --locked`. After changing `pyproject.toml`, run `uv lock --project python`.
+
+The image runs Debian's Python (3.13, from the distroless base), and CI's integration tests use
+the same minor version.
+
+## Security: SBOMs, attestations, vulnerability scans
+
+The image is distroless: no shell, no package manager. Everything in it is visible to
+scanners: the Debian packages, the Python venv, and the Rust crates (built with
+`cargo auditable`, which embeds the dependency list in the binary).
+
+- **Every build** (PRs included) is scanned with Grype. CI fails on a critical vulnerability that
+  already has a fix; everything else is listed in the log.
+- **Every release** has SBOMs, SPDX and CycloneDX, attached to its GitHub release, for your own
+  tools (Grype, Trivy, Dependency-Track and so on).
+- **Signed attestations** for the image digest, made with GitHub's signing identity for this
+  workflow: build provenance (which commit and workflow built it) and the SPDX SBOM. They
+  are stored in the registry next to the image, not inside it, so the digest stays
+  reproducible. Check them with:
+
+  ```sh
+  gh attestation verify oci://ghcr.io/arlllk/fanfold:1.4.2 -R arlllk/Fanfold
+  ```
+
+- **Findings** go to the repository's Security tab (code scanning). `scan.yml` re-scans the
+  latest release's SBOM daily, so CVEs published after a release show up too.
