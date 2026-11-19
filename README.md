@@ -276,6 +276,8 @@ below); the page warns before it lapses.
 | Page | What it is for |
 |---|---|
 | **Dashboard** | Site health, an add-a-link form, a strip of recent results (one colour per job, oldest to newest), what needs attention, what is running, and the latest results. |
+| **Library** | Every book you have, as a shelf of covers: title, author, fandom, rating, chapters, length, series and kudos. Search by title, author, tag or series; show only complete or in-progress works; order by update, title, author or length. |
+| **Book** | One work in full: its summary, every tag, statistics, chapters and series, where the file is, and buttons to open it on AO3, check it for updates or delete it. |
 | **History** | Every job, filtered by state, with paging. Tick failed jobs and use **Retry selected**, or **Retry all failed**. |
 | **Job** | The title, state, failure reason and a log split by attempt, with **Retry** or **Cancel**. |
 | **Session** | The imported browser cookies, their expiry, and an import form. |
@@ -286,11 +288,14 @@ setting, and never relies on colour alone.
 
 <p>
 <img src="docs/screenshots/desktop-dashboard.png" width="440" alt="Dashboard on a desktop">
+<img src="docs/screenshots/desktop-library.png" width="440" alt="The library on a desktop">
 <img src="docs/screenshots/desktop-history.png" width="440" alt="History as a table">
 <img src="docs/screenshots/desktop-job.png" width="440" alt="A job with its log">
 </p>
 <p>
 <img src="docs/screenshots/mobile-dashboard.png" width="190" alt="Dashboard on a phone">
+<img src="docs/screenshots/mobile-library.png" width="190" alt="The library on a phone">
+<img src="docs/screenshots/mobile-book.png" width="190" alt="One book on a phone">
 <img src="docs/screenshots/mobile-history.png" width="190" alt="History on a phone">
 <img src="docs/screenshots/mobile-job.png" width="190" alt="A job on a phone">
 <img src="docs/screenshots/mobile-outage.png" width="190" alt="While AO3 is having trouble">

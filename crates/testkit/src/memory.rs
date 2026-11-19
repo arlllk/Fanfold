@@ -16,8 +16,9 @@ use fanfold_app::{
     ports::{
         BookCatalog, BookRecord, Checkpoint, Clock, CursorStore, DownloadError, DownloadRequest,
         DownloadedBook, Downloader, EnqueueOutcome, Event, EventSource, Jitter, JobCounts,
-        JobFilter, JobRepository, LibraryStore, LogEntry, MailBatch, MailSource, MetadataStore,
-        Notifier, NotifyEvent, Readiness, Recorded, SessionStore,
+        JobFilter, JobRepository, LibraryCatalog, LibraryEntry, LibraryPage, LibraryQuery,
+        LibrarySort, LibraryStatus, LibraryStore, LibraryTotals, LogEntry, MailBatch, MailSource,
+        MetadataStore, Notifier, NotifyEvent, Readiness, Recorded, SessionStore,
     },
 };
 use fanfold_domain::{
@@ -25,7 +26,7 @@ use fanfold_domain::{
     failure::FailureKind,
     job::{Job, JobId, JobSource, JobState, Target},
     metadata::{
-        Author, FollowSource, SeriesFacts, SeriesMetadata, SeriesPart, Tag, WorkFacts,
+        Author, FollowSource, SeriesFacts, SeriesMetadata, SeriesPart, Tag, TagKind, WorkFacts,
         WorkMetadata, WorkState, WorkStats, plan_work_update,
     },
     session::BrowserSession,
@@ -438,6 +439,145 @@ impl BookCatalog for InMemoryJobs {
 
     async fn remove(&self, work: WorkId) -> Result<bool, RepoError> {
         Ok(self.state()?.books.remove(&work).is_some())
+    }
+}
+
+/// The tags a library listing carries.
+const fn listed_tag(kind: TagKind) -> bool {
+    matches!(
+        kind,
+        TagKind::Fandom | TagKind::Relationship | TagKind::Warning
+    )
+}
+
+fn library_entry(state: &JobsState, book: &BookRecord) -> LibraryEntry {
+    let history = state.works.get(&book.work);
+    LibraryEntry {
+        book: book.clone(),
+        facts: history
+            .and_then(|h| h.versions.last())
+            .map(|v| v.facts.clone()),
+        tags: history.map_or_default(|h| {
+            open_items(&h.tags)
+                .into_iter()
+                .filter(|t| listed_tag(t.kind))
+                .collect()
+        }),
+        series: history.map_or_default(|h| open_items(&h.series)),
+        // The latest observation; on equal times the one recorded last (as the database).
+        stats: history
+            .and_then(|h| {
+                h.stats
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(i, (at, _))| (*at, *i))
+                    .map(|(_, (_, s))| *s)
+            })
+            .unwrap_or_default(),
+        last_checked: history.and_then(|h| h.last_checked),
+    }
+}
+
+/// Whether an entry matches a (lower-cased) search, as `LibraryQuery::search` defines it.
+fn library_matches(state: &JobsState, entry: &LibraryEntry, needle: &str) -> bool {
+    let has = |s: &str| s.to_lowercase().contains(needle);
+    if has(entry.title()) || entry.facts.as_ref().is_some_and(|f| has(&f.byline)) {
+        return true;
+    }
+    state.works.get(&entry.book.work).is_some_and(|h| {
+        open_items(&h.tags).iter().any(|t| has(&t.name))
+            || open_items(&h.series).iter().any(|s| has(&s.name))
+    })
+}
+
+fn library_order(sort: LibrarySort, a: &LibraryEntry, b: &LibraryEntry) -> std::cmp::Ordering {
+    use std::cmp::{Ordering, Reverse};
+    let lower = |e: &LibraryEntry| e.title().to_lowercase();
+    // `None` sorts last, ascending or descending, as `NULLS LAST` does.
+    let byline = |e: &LibraryEntry| {
+        e.facts
+            .as_ref()
+            .map(|f| f.byline.to_lowercase())
+            .map_or((1, String::new()), |b| (0, b))
+    };
+    let work = |e: &LibraryEntry| e.book.work;
+    let ordering: Ordering = match sort {
+        LibrarySort::Updated => {
+            let updated = |e: &LibraryEntry| e.facts.as_ref().and_then(|f| f.updated_on);
+            (updated(a).is_none(), Reverse(updated(a)))
+                .cmp(&(updated(b).is_none(), Reverse(updated(b))))
+                .then_with(|| b.book.updated_at.cmp(&a.book.updated_at))
+                .then_with(|| work(b).cmp(&work(a)))
+        }
+        LibrarySort::Title => lower(a).cmp(&lower(b)).then_with(|| work(a).cmp(&work(b))),
+        LibrarySort::Author => byline(a)
+            .cmp(&byline(b))
+            .then_with(|| lower(a).cmp(&lower(b)))
+            .then_with(|| work(a).cmp(&work(b))),
+        LibrarySort::Words => {
+            let words = |e: &LibraryEntry| e.facts.as_ref().map(|f| f.words);
+            (words(a).is_none(), Reverse(words(a)))
+                .cmp(&(words(b).is_none(), Reverse(words(b))))
+                .then_with(|| work(a).cmp(&work(b)))
+        }
+    };
+    ordering
+}
+
+#[async_trait]
+impl LibraryCatalog for InMemoryJobs {
+    async fn library(&self, query: &LibraryQuery) -> Result<LibraryPage, RepoError> {
+        let state = self.metadata_state()?;
+        let all: Vec<LibraryEntry> = state
+            .books
+            .values()
+            .map(|b| library_entry(&state, b))
+            .collect();
+        let totals = LibraryTotals {
+            books: all.len() as u64,
+            words: all
+                .iter()
+                .filter_map(|e| e.facts.as_ref())
+                .map(|f| f.words)
+                .sum(),
+            complete: all.iter().filter(|e| e.complete() == Some(true)).count() as u64,
+        };
+        let needle = query
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase);
+        let mut matching: Vec<LibraryEntry> = all
+            .into_iter()
+            .filter(|e| match query.status {
+                LibraryStatus::All => true,
+                LibraryStatus::Complete => e.complete() == Some(true),
+                LibraryStatus::InProgress => e.complete() == Some(false),
+            })
+            .filter(|e| {
+                needle
+                    .as_deref()
+                    .is_none_or(|n| library_matches(&state, e, n))
+            })
+            .collect();
+        matching.sort_by(|a, b| library_order(query.sort, a, b));
+        let count = matching.len() as u64;
+        let entries = matching
+            .into_iter()
+            .skip(query.offset as usize)
+            .take(query.limit as usize)
+            .collect();
+        Ok(LibraryPage {
+            entries,
+            matching: count,
+            totals,
+        })
+    }
+
+    async fn entry(&self, work: WorkId) -> Result<Option<LibraryEntry>, RepoError> {
+        let state = self.metadata_state()?;
+        Ok(state.books.get(&work).map(|b| library_entry(&state, b)))
     }
 }
 

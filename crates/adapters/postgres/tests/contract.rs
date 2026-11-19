@@ -124,6 +124,15 @@ async fn metadata_store_contract() {
     .await;
 }
 
+#[tokio::test]
+#[ignore = "needs PostgreSQL (TEST_DATABASE_URL)"]
+async fn library_catalog_contract() {
+    fanfold_testkit::contracts::library_catalog(|| async {
+        Arc::new(fresh_store().await) as Arc<dyn fanfold_testkit::contracts::LibraryFixture>
+    })
+    .await;
+}
+
 /// The analysis views answer "with which update was this tag added?" directly.
 #[tokio::test]
 #[ignore = "needs PostgreSQL (TEST_DATABASE_URL)"]

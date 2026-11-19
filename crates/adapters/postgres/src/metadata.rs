@@ -25,6 +25,8 @@ use sqlx::{PgConnection, Row, postgres::PgRow, types::Json};
 
 use crate::{PgStore, backend};
 
+mod library;
+
 fn corrupt(what: &str) -> RepoError {
     RepoError::Backend(format!("corrupt metadata row: {what}"))
 }

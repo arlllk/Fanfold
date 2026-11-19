@@ -77,6 +77,7 @@ fn rig_with_page_size(page_size: u32) -> Rig {
         jobs: jobs.clone(),
         catalog: jobs.clone(),
         metadata: jobs.clone(),
+        listing: jobs.clone(),
         admin: Arc::new(JobAdmin::new(jobs.clone(), clock.clone())),
         library: Arc::new(fanfold_app::library::LibraryAdmin::new(
             jobs.clone(),
@@ -1925,4 +1926,184 @@ async fn a_series_can_be_deleted_from_its_job_page() {
         fanfold_domain::job::JobState::Cancelled,
         "its queued listing is cancelled"
     );
+}
+
+// --------------------------------------------------------------------- library
+
+impl Rig {
+    /// A downloaded book whose work AO3 described (the testkit's realistic observation, edited).
+    async fn observed(
+        &self,
+        work: u64,
+        edit: impl FnOnce(&mut fanfold_domain::metadata::WorkMetadata),
+    ) {
+        let mut meta = fanfold_testkit::contracts::observed_work(work);
+        edit(&mut meta);
+        fanfold_app::ports::MetadataStore::record_work(
+            self.jobs.as_ref(),
+            &meta,
+            self.clock.now(),
+            None,
+        )
+        .await
+        .unwrap();
+        self.titled(work, &meta.facts.title).await;
+    }
+}
+
+#[tokio::test]
+async fn the_library_lists_every_book_with_what_ao3_said() {
+    let rig = rig();
+    let empty = get(&rig.ui, "/library").await;
+    assert_eq!(empty.status, StatusCode::OK);
+    assert!(empty.body.contains("Your library is empty"));
+    assert!(
+        empty
+            .body
+            .contains(r#"href="/library" aria-current="page""#),
+        "Library is in the navigation, and marked as the current page"
+    );
+
+    rig.observed(1, |m| {
+        m.facts.title = "Alpha Light".into();
+        m.facts.chapters_total = Some(2);
+    })
+    .await;
+    rig.observed(2, |m| m.facts.title = "Beta Tide".into())
+        .await;
+    rig.titled(3, "Gamma").await;
+
+    let page = get(&rig.ui, "/library").await.body;
+    for needle in [
+        "Alpha Light",
+        "Beta Tide",
+        "Gamma",
+        "<strong>3</strong> books",
+        "<strong>1</strong> complete",
+        "Original Work",
+        "by quillandink",
+        "Not checked yet",
+        r#"href="/library/1""#,
+        r#"class="rating r-t""#,
+        "Part 2 of",
+        "The Harbor Saga",
+        "120k words",
+    ] {
+        assert!(page.contains(needle), "{needle:?} in the library");
+    }
+
+    let complete = get(&rig.ui, "/library?status=complete").await.body;
+    assert!(complete.contains("Alpha Light") && !complete.contains("Beta Tide"));
+    assert!(complete.contains("1 of 3 books"));
+    assert!(
+        complete.contains(r#"name="status" value="complete""#),
+        "searching keeps the filter"
+    );
+
+    let search = get(&rig.ui, "/library?q=beta").await.body;
+    assert!(search.contains("Beta Tide") && !search.contains("Alpha Light"));
+    assert!(search.contains("books match “beta”"));
+    assert!(
+        search.contains(r#"value="beta""#),
+        "the box keeps the search"
+    );
+    assert!(
+        get(&rig.ui, "/library?q=zzz")
+            .await
+            .body
+            .contains("No books match"),
+        "a search that finds nothing says so"
+    );
+    assert_eq!(
+        get(&rig.ui, "/library?status=nope&sort=nope&page=0")
+            .await
+            .status,
+        StatusCode::OK,
+        "unknown parameters fall back to the defaults"
+    );
+
+    let fragment = send(&rig.ui, Method::GET, "/library", &[("x-fragment", "1")], "").await;
+    assert!(!fragment.body.contains("<html") && fragment.body.contains("Alpha Light"));
+    assert!(
+        fragment.body.contains("data-pill"),
+        "a live update carries the site pill"
+    );
+}
+
+#[tokio::test]
+async fn the_library_pages_through_many_books() {
+    let rig = rig_with_page_size(2);
+    for n in 1..=5 {
+        rig.titled(n, &format!("Book {n}")).await;
+    }
+    let first = get(&rig.ui, "/library?sort=title").await.body;
+    assert!(first.contains("Book 1") && first.contains("Book 2") && !first.contains("Book 3"));
+    assert!(first.contains(r#"href="/library?sort=title&amp;page=2""#));
+    assert!(!first.contains(r#"rel="prev""#));
+    let last = get(&rig.ui, "/library?sort=title&page=3").await.body;
+    assert!(last.contains("Book 5") && !last.contains("Book 4"));
+    assert!(last.contains(r#"rel="prev""#) && !last.contains(r#"rel="next""#));
+}
+
+#[tokio::test]
+async fn a_book_page_shows_everything_and_never_trusts_the_summary() {
+    let rig = rig();
+    rig.observed(7, |m| {
+        m.facts.summary_html =
+            r#"<p>Calm <script>alert("x")</script>&amp; quiet</p><img src=x onerror=boom>"#.into();
+    })
+    .await;
+    let page = get(&rig.ui, "/library/7").await;
+    assert_eq!(page.status, StatusCode::OK);
+    for needle in [
+        "The Keeper and the Logbook",
+        "by quillandink",
+        "Ada Marsh/Ben Ward",
+        "Enemies to Lovers",
+        "1. First Light",
+        "120,000",
+        "1,234",
+        r#"href="https://archiveofourown.org/works/7""#,
+        r#"<form method="post" action="/jobs">"#,
+        r#"value="https://archiveofourown.org/works/7""#,
+        "Delete the book",
+        "The Keeper and the Logbook [7].epub",
+        r#"aria-current="page">Library"#,
+    ] {
+        assert!(page.body.contains(needle), "{needle:?} on the book page");
+    }
+    assert!(
+        !page.body.contains("<script>alert") && !page.body.contains("<img src=x"),
+        "the summary's markup never reaches the page"
+    );
+    assert!(
+        page.body.contains("<p>Calm alert"),
+        "its text does, escaped"
+    );
+
+    assert_eq!(
+        get(&rig.ui, "/library/999").await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        get(&rig.ui, "/library/abc").await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn deleting_from_a_book_page_returns_to_the_library() {
+    let rig = rig();
+    rig.observed(5, |_| {}).await;
+    rig.library.seed("The Keeper and the Logbook [5].epub");
+    let page = get(&rig.ui, "/library/5").await.body;
+    assert!(page.contains(r#"name="back" value="library""#));
+
+    let reply = post(&rig.ui, "/works/5/delete", &form(&[("back", "library")])).await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location(), "/library?deleted_book=1");
+    assert_eq!(rig.library.files(), Vec::<String>::new());
+    let after = get(&rig.ui, reply.location()).await.body;
+    assert!(after.contains("The book was deleted from the library"));
+    assert!(after.contains("Your library is empty"));
 }

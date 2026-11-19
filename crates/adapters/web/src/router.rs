@@ -28,8 +28,8 @@ use axum::{
 use fanfold_app::{
     admin::{AdminError, JobAdmin},
     ports::{
-        BookCatalog, Clock, Event, EventSource, JobFilter, JobRepository, MetadataStore, Readiness,
-        SiteStatusSource,
+        BookCatalog, Clock, Event, EventSource, JobFilter, JobRepository, LibraryCatalog,
+        LibraryQuery, LibrarySort, LibraryStatus, MetadataStore, Readiness, SiteStatusSource,
     },
     session::{SessionAdmin, SessionError},
     stats::{MailStats, WorkerStats},
@@ -69,6 +69,8 @@ pub struct WebDeps {
     pub admin: Arc<JobAdmin>,
     /// The delete buttons.
     pub library: Arc<fanfold_app::library::LibraryAdmin>,
+    /// The library page: every book with its metadata.
+    pub listing: Arc<dyn LibraryCatalog>,
     pub session: Arc<SessionAdmin>,
     pub events: Arc<dyn EventSource>,
     pub site: Arc<dyn SiteStatusSource>,
@@ -311,6 +313,113 @@ async fn history_inner(
     ))
 }
 
+async fn library_page(
+    State(deps): State<Deps>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    match library_inner(&deps, &headers, query).await {
+        Ok(response) => response,
+        Err(problem) => problem_response(&headers, problem),
+    }
+}
+
+/// Longest search accepted; anything longer is cut (nobody types a 200-character title).
+const MAX_SEARCH_CHARS: usize = 200;
+
+async fn library_inner(
+    deps: &WebDeps,
+    headers: &HeaderMap,
+    query: Option<String>,
+) -> Result<Response, ProblemDetails> {
+    let pairs = query_pairs(query);
+    let page = forms::first(&pairs, "page")
+        .and_then(|p| p.parse::<u32>().ok())
+        .filter(|p| *p >= 1)
+        .unwrap_or(1);
+    let size = deps.page_size.max(1);
+    let library_query = LibraryQuery {
+        search: forms::first(&pairs, "q")
+            .map(|q| q.trim().chars().take(MAX_SEARCH_CHARS).collect::<String>())
+            .filter(|q| !q.is_empty()),
+        status: forms::first(&pairs, "status")
+            .and_then(LibraryStatus::parse)
+            .unwrap_or_default(),
+        sort: forms::first(&pairs, "sort")
+            .and_then(LibrarySort::parse)
+            .unwrap_or_default(),
+        limit: size,
+        offset: (page - 1).saturating_mul(size),
+    };
+    let result = deps
+        .listing
+        .library(&library_query)
+        .await
+        .map_err(|e| internal(&e))?;
+    let model = views::library::LibraryModel {
+        now: deps.clock.now(),
+        site: deps.site.site_status(),
+        query: library_query,
+        page,
+        result,
+    };
+    let notice = Notice::from_query(&pairs);
+    Ok(page_or_fragment(
+        headers,
+        &views::library::library_page(&model, notice),
+        &views::library::library(&model),
+    ))
+}
+
+async fn book_page(
+    State(deps): State<Deps>,
+    headers: HeaderMap,
+    Path(raw): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    match book_inner(&deps, &headers, &raw, query).await {
+        Ok(response) => response,
+        Err(problem) => problem_response(&headers, problem),
+    }
+}
+
+async fn book_inner(
+    deps: &WebDeps,
+    headers: &HeaderMap,
+    raw: &str,
+    query: Option<String>,
+) -> Result<Response, ProblemDetails> {
+    let work = parse_ao3_id(raw)
+        .and_then(WorkId::new)
+        .ok_or_else(|| invalid_id("work"))?;
+    let entry = deps
+        .listing
+        .entry(work)
+        .await
+        .map_err(|e| internal(&e))?
+        .ok_or_else(|| {
+            ProblemDetails::about_blank(StatusCode::NOT_FOUND)
+                .with_detail("That work is not in your library.")
+        })?;
+    let state = deps
+        .metadata
+        .work_state(work)
+        .await
+        .map_err(|e| internal(&e))?;
+    let model = views::library::BookModel {
+        now: deps.clock.now(),
+        site: deps.site.site_status(),
+        entry,
+        state,
+    };
+    let notice = Notice::from_query(&query_pairs(query));
+    Ok(page_or_fragment(
+        headers,
+        &views::library::book_page(&model, notice),
+        &views::library::book(&model),
+    ))
+}
+
 async fn job_page(
     State(deps): State<Deps>,
     headers: HeaderMap,
@@ -399,13 +508,15 @@ fn invalid_id(what: &str) -> ProblemDetails {
         .with_detail(format!("That is not a valid {what} id."))
 }
 
-/// Where to go back to after a delete: the job page it was pressed on, else the dashboard.
+/// Where to go back to after a delete: the job page it was pressed on, the library when it
+/// was pressed there, else the dashboard.
 fn back_to(pairs: &[(String, String)], query: &str) -> (Option<JobId>, String) {
     let job = forms::job_ids(pairs, "job").first().copied();
-    let to = job.map_or_else(
-        || format!("/?{query}"),
-        |job| format!("/jobs/{job}?{query}"),
-    );
+    let to = match job {
+        Some(job) => format!("/jobs/{job}?{query}"),
+        None if forms::first(pairs, "back") == Some("library") => format!("/library?{query}"),
+        None => format!("/?{query}"),
+    };
     (job, to)
 }
 
@@ -682,6 +793,8 @@ pub fn ui_router(deps: Deps) -> Router {
         .route("/jobs", get(history).post(add_job))
         .route("/jobs/retry", post(retry_selected))
         .route("/jobs/retry-failed", post(retry_failed))
+        .route("/library", get(library_page))
+        .route("/library/{id}", get(book_page))
         .route("/jobs/{id}", get(job_page))
         .route("/jobs/{id}/retry", post(retry_job))
         .route("/jobs/{id}/force-retry", post(force_retry_job))

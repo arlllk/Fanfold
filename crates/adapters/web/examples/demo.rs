@@ -164,6 +164,165 @@ async fn job(
     created.id
 }
 
+/// What AO3 "said" about a demo work: invented, varied metadata for the library page.
+#[allow(clippy::too_many_lines, reason = "one fixture, mostly data")]
+async fn observe(repo: &InMemoryJobs, work: u64, title: &str, n: u64, at: Timestamp) {
+    use fanfold_domain::metadata::{
+        Author, Chapter, Date, SeriesPart, Tag, TagKind, WorkFacts, WorkMetadata, WorkStats,
+    };
+    const FANDOMS: [&str; 5] = [
+        "Original Work",
+        "The Glass Orchard - Mara Vell",
+        "Starfall Academy (Video Game)",
+        "Harbor Lights (Podcast)",
+        "Lighthouse Chronicles (Web Series)",
+    ];
+    const AUTHORS: [&str; 5] = [
+        "quillandink",
+        "paperboats",
+        "nightjar_writes",
+        "Marigold & Thistle",
+        "lanternfish",
+    ];
+    const RATINGS: [&str; 5] = [
+        "General Audiences",
+        "Teen And Up Audiences",
+        "Mature",
+        "Explicit",
+        "Not Rated",
+    ];
+    const SHIPS: [&str; 4] = [
+        "Ada Marsh/Ben Ward",
+        "Ilse Harrow & Corin Vale",
+        "Juniper/Theo Lark",
+        "Wren Okafor/Sam Delacroix",
+    ];
+    const TROPES: [&str; 6] = [
+        "Found Family",
+        "Slow Burn",
+        "Hurt/Comfort",
+        "Fluff and Angst",
+        "Enemies to Lovers",
+        "Canon Divergence",
+    ];
+    let i = |k: u64, len: usize| usize::try_from(k).unwrap() % len;
+    let posted = 1 + u32::try_from(n % 9).unwrap() * 3;
+    let total = match n % 3 {
+        0 => Some(posted),
+        1 => Some(posted + 6),
+        _ => None,
+    };
+    let author = AUTHORS[i(n, 5)];
+    let day = |offset: u64| {
+        Date::new(2026, 1, 1)
+            .unwrap()
+            .checked_add(jiff::Span::new().days(i64::try_from(offset).unwrap()))
+            .unwrap()
+    };
+    let published = day(n * 9 % 300);
+    let updated = day(n * 9 % 300 + 4 + n % 17);
+    let fandom = FANDOMS[i(n, 5)];
+    let mut tags = vec![
+        Tag {
+            kind: TagKind::Fandom,
+            name: fandom.into(),
+        },
+        Tag {
+            kind: TagKind::Warning,
+            name: "No Archive Warnings Apply".into(),
+        },
+        Tag {
+            kind: TagKind::Category,
+            name: if n.is_multiple_of(2) { "F/M" } else { "Gen" }.into(),
+        },
+        Tag {
+            kind: TagKind::Relationship,
+            name: SHIPS[i(n, 4)].into(),
+        },
+        Tag {
+            kind: TagKind::Character,
+            name: "Ada Marsh".into(),
+        },
+        Tag {
+            kind: TagKind::Character,
+            name: "Ben Ward".into(),
+        },
+    ];
+    for k in 0..3 {
+        tags.push(Tag {
+            kind: TagKind::Freeform,
+            name: TROPES[i(n + k * 2, 6)].into(),
+        });
+    }
+    let meta = WorkMetadata {
+        work: WorkId::new(work).unwrap(),
+        facts: WorkFacts {
+            title: title.into(),
+            byline: author.into(),
+            summary_html: format!(
+                "<p>The lighthouse has been dark for {} years, and someone has to climb the stairs.</p>\
+                 <p>A story about keeping the light on &amp; the people who keep it with you.</p>",
+                n + 3
+            ),
+            language: "English".into(),
+            rating: RATINGS[i(n, 5)].into(),
+            restricted: n % 8 == 3,
+            status: if total == Some(posted) {
+                "Completed"
+            } else {
+                "In-Progress"
+            }
+            .into(),
+            published_on: Some(published),
+            updated_on: Some(updated),
+            chapters_posted: posted,
+            chapters_total: total,
+            words: 2_400 + n * 7_919 % 180_000,
+        },
+        authors: vec![Author {
+            user: author.into(),
+            pseud: author.into(),
+        }],
+        tags,
+        series: if n % 4 == 1 {
+            vec![SeriesPart {
+                id: fanfold_domain::work::SeriesId::new(5001).unwrap(),
+                name: "The Harbor Saga".into(),
+                part: Some(u32::try_from(n / 4 + 1).unwrap()),
+            }]
+        } else {
+            vec![]
+        },
+        chapters: (1..=posted)
+            .map(|c| Chapter {
+                number: c,
+                title: format!(
+                    "{c}. {}",
+                    [
+                        "First Light",
+                        "The Logbook",
+                        "Low Tide",
+                        "Salt and Glass",
+                        "Fog Signals"
+                    ][usize::try_from(c).unwrap() % 5]
+                ),
+                ao3_id: Some(u64::from(c) + work * 100),
+                posted_on: Some(day(n * 9 % 300 + u64::from(c))),
+            })
+            .collect(),
+        stats: WorkStats {
+            hits: Some(1_200 + n * 3_571 % 90_000),
+            kudos: Some(40 + n * 613 % 6_000),
+            comments: Some(5 + n * 37 % 900),
+            bookmarks: Some(3 + n * 97 % 1_500),
+        },
+        raw: serde_json::json!({}),
+    };
+    fanfold_app::ports::MetadataStore::record_work(repo, &meta, at, None)
+        .await
+        .unwrap();
+}
+
 /// The delete buttons, over an in-memory library.
 fn library_admin(
     repo: &Arc<InMemoryJobs>,
@@ -208,14 +367,12 @@ async fn main() {
         } else {
             Ok(())
         };
-        job(
-            &repo,
-            1000 + n,
-            &format!("{name} {}", n / 7 + 1),
-            600 - n * 20,
-            Some(outcome),
-        )
-        .await;
+        let full = format!("{name} {}", n / 7 + 1);
+        job(&repo, 1000 + n, &full, 600 - n * 20, Some(outcome)).await;
+        // The library: most books with what AO3 said; failures and one book left unchecked.
+        if !fail && n != 5 {
+            observe(&repo, 1000 + n, &full, n, ago(600 - n * 20)).await;
+        }
     }
     // Needs attention.
     let flaky = job(
@@ -256,6 +413,7 @@ async fn main() {
         jobs: repo.clone(),
         catalog: repo.clone(),
         metadata: repo.clone(),
+        listing: repo.clone(),
         admin: Arc::new(JobAdmin::new(repo.clone(), clock.clone())),
         library: library_admin(&repo, &clock),
         session: Arc::new(fanfold_app::session::SessionAdmin::new(
