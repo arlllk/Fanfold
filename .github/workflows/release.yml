@@ -189,6 +189,8 @@ jobs:
       - name: SBOM, SPDX
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
+          # renovate: datasource=github-releases depName=anchore/syft
+          syft-version: v1.57.2
           image: ${{ env.IMAGE }}@${{ env.DIGEST }}
           format: spdx-json
           output-file: fanfold-${{ env.VERSION }}.spdx.json
@@ -198,6 +200,8 @@ jobs:
       - name: SBOM, CycloneDX
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
+          # renovate: datasource=github-releases depName=anchore/syft
+          syft-version: v1.57.2
           image: ${{ env.IMAGE }}@${{ env.DIGEST }}
           format: cyclonedx-json
           output-file: fanfold-${{ env.VERSION }}.cdx.json
@@ -237,6 +241,8 @@ jobs:
         id: scan
         uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
+          # renovate: datasource=github-releases depName=anchore/grype
+          grype-version: v0.122.1
           sbom: fanfold-${{ env.VERSION }}.spdx.json
           vex: fanfold-${{ env.VERSION }}.openvex.json
           fail-build: false
