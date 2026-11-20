@@ -29,8 +29,10 @@ venv:
 test-postgres:
     scripts/with-postgres.sh cargo test -p fanfold-adapter-postgres -- --ignored
 
-# The real Python worker, against FanFicFare's offline test site (no network).
+# The real Python worker: its own unit tests, then through FanFicFare against its offline
+# test site and a fake FlareSolverr (no network).
 test-worker:
+    {{ffd_python}} -I -B -m unittest discover -s crates/adapters/fanficfare/worker
     FFD_PYTHON={{ffd_python}} cargo test -p fanfold-adapter-fanficfare -- --ignored
 
 # Config -> secrets -> PostgreSQL + filesystem + FanFicFare -> worker.

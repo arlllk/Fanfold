@@ -1470,8 +1470,10 @@ mod tests {
     /// A stand-in for `FlareSolverr`: answers every command with a fresh Cloudflare clearance and
     /// session cookie, and records the request bodies.
     async fn fake_flaresolverr() -> (u16, Arc<Mutex<Vec<serde_json::Value>>>) {
-        fake_flaresolverr_serving("<html><head><title>fake</title></head><body></body></html>")
-            .await
+        fake_flaresolverr_serving(
+            "<html><head><title>fake</title></head><body><div id=\"main\"></div></body></html>",
+        )
+        .await
     }
 
     /// [`fake_flaresolverr`], answering every page with `page` and HTTP status 200, as the real
@@ -1872,6 +1874,94 @@ mod tests {
             !seen.lock().unwrap().is_empty(),
             "it went through FlareSolverr"
         );
+    }
+
+    /// What AO3's bot filter answered from a flagged address (November 2026, HTTP 429 as plain
+    /// text, which `FlareSolverr` reports as a 200).
+    const AO3_BOT_FILTER: &str = "The bot servers are currently overloaded, please try again \
+        later. You are seeing this page because our systems think you may be a robot. If you are \
+        not a robot, this could be due to using a VPN or privacy-focused browser.";
+
+    async fn download_through_flaresolverr_serving(page: &'static str) -> DownloadError {
+        let scratch = tempfile::tempdir().unwrap();
+        let (port, seen) = fake_flaresolverr_serving(page).await;
+        let ini = flaresolverr_ini(scratch.path(), port);
+        let err = real_downloader(
+            scratch.path(),
+            &ini,
+            "https://archiveofourown.org/works/{id}",
+        )
+        .download(&request(None))
+        .await
+        .expect_err("that is not the work");
+        assert!(
+            !seen.lock().unwrap().is_empty(),
+            "it went through FlareSolverr"
+        );
+        err
+    }
+
+    /// Regression (work 10000001 in production, jobs failed after five tries): AO3's bot filter
+    /// was parsed as the work and crashed FanFicFare (`'NoneType' object has no attribute
+    /// 'get_text'`), a transient failure retried within minutes. It is a rate limit: the queue
+    /// waits for the site, and the job's tries are not used up.
+    #[tokio::test]
+    #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
+    async fn ao3_s_bot_filter_through_flaresolverr_is_a_rate_limit() {
+        let err = download_through_flaresolverr_serving(AO3_BOT_FILTER).await;
+        assert_eq!(err.kind, FailureKind::RateLimited, "{}", err.message);
+        assert!(err.message.contains("bot protection"), "{}", err.message);
+        assert!(err.message.contains("may be a robot"), "{}", err.message);
+    }
+
+    /// Whatever else answers in AO3's place is an outage, and the job log says what it was.
+    #[tokio::test]
+    #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
+    async fn a_page_that_is_not_ao3_s_is_an_outage_that_shows_what_it_was() {
+        let err = download_through_flaresolverr_serving(
+            "<html><body><h1>502 Bad Gateway</h1><hr>nginx</body></html>",
+        )
+        .await;
+        assert_eq!(err.kind, FailureKind::SiteUnavailable, "{}", err.message);
+        assert!(err.message.contains("502 Bad Gateway"), "{}", err.message);
+    }
+
+    /// An AO3 page FanFicFare cannot read (AO3 changed its markup) is named, not a bare
+    /// `AttributeError`.
+    #[tokio::test]
+    #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
+    async fn an_ao3_page_fanficfare_cannot_read_is_named_in_the_failure() {
+        let err = download_through_flaresolverr_serving(
+            "<html><body><div id=\"main\" class=\"works-show region\">\
+             <p>A layout nobody has seen before</p></div></body></html>",
+        )
+        .await;
+        assert_eq!(err.kind, FailureKind::Transient, "{}", err.message);
+        assert!(err.message.contains("could not read"), "{}", err.message);
+        assert!(
+            err.message.contains("archiveofourown.org/works/"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("A layout nobody"), "{}", err.message);
+    }
+
+    /// The bot filter is no empty series either.
+    #[tokio::test]
+    #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
+    async fn ao3_s_bot_filter_is_not_an_empty_series() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (port, _seen) = fake_flaresolverr_serving(AO3_BOT_FILTER).await;
+        let ini = flaresolverr_ini(scratch.path(), port);
+        let err = real_downloader(
+            scratch.path(),
+            &ini,
+            "https://archiveofourown.org/works/{id}",
+        )
+        .list_series(fanfold_domain::work::SeriesId::new(77).unwrap())
+        .await
+        .expect_err("an error page lists nothing");
+        assert_eq!(err.kind, FailureKind::RateLimited, "{}", err.message);
     }
 
     /// A synthetic AO3 series page (the markup of a real one, every text made up).
