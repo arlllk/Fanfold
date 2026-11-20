@@ -10,21 +10,31 @@ Protocol (one story or series per process):
           pass Cloudflare once first (see apply_clearance); FanFicFare then fetches by itself.
   stdout: FanFicFare's own chatter is captured; the LAST line printed is a JSON
           object, either
-            {"status": "ok", "path", "title", "changed", "log"}
+            {"status": "ok", "path", "title", "changed", "metadata", "log"}
           or, for "list_series",
             {"status": "listed", "name", "summary_html", "complete", "works", "raw", "log"}
           or
             {"status": "error", "kind", "message", "log"}
           A download's "metadata" (see work_metadata) is what the site said about the work,
           read from FanFicFare's own story object, with lists kept as lists.
-          `kind` is one of: site_unavailable, rate_limited, blocked, auth_failed,
-          not_found, transient, permanent  (see fanfold-domain's FailureKind).
+          `kind` is one of KINDS (fanfold-domain's FailureKind).
 
 The Rust side never parses FanFicFare's text; this script is the only place that
 knows how FanFicFare reports problems.
+
+Every page FanFicFare fetches passes the page guard (install_page_guard) first: an error
+page that arrives looking like a successful response (FlareSolverr reports HTTP 200 for
+whatever its browser ended up showing) is turned into the HTTP error it stands for, before
+FanFicFare can parse it as the work, the chapter list or the series it asked for.
+
+Runs as `python -I -c <this file>`, so it is one file that imports only the standard library
+and FanFicFare. The pure parts are unit tested in test_ffd_worker.py.
 """
 
+from __future__ import annotations
+
 import contextlib
+import dataclasses
 import datetime
 import hashlib
 import html
@@ -36,52 +46,160 @@ import re
 import sys
 import time
 import traceback
-import zipfile
+import urllib.parse
 import xml.etree.ElementTree as ET
+import zipfile
+from collections.abc import Callable
+from typing import Any
 
 LOG_TAIL_CHARS = 20000
 
+# ----------------------------------------------------------------------------- failure kinds
+
+SITE_UNAVAILABLE = "site_unavailable"
+RATE_LIMITED = "rate_limited"
+BLOCKED = "blocked"
+AUTH_FAILED = "auth_failed"
+NOT_FOUND = "not_found"
+TRANSIENT = "transient"
+PERMANENT = "permanent"
+KINDS = (SITE_UNAVAILABLE, RATE_LIMITED, BLOCKED, AUTH_FAILED, NOT_FOUND, TRANSIENT, PERMANENT)
+
+
+class WorkerError(Exception):
+    """A failure already classified: becomes {"status": "error", "kind", "message"}."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        assert kind in KINDS, kind
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+
+
 EXCEPTION_KINDS = {
-    "StoryDoesNotExist": "not_found",
-    "FailedToLogin": "auth_failed",
-    "NeedTimedOneTimePassword": "auth_failed",
-    "AccessDenied": "auth_failed",
-    "AdultCheckRequired": "permanent",
-    "InvalidStoryURL": "permanent",
-    "UnknownSite": "permanent",
-    "PersonalIniFailed": "permanent",
-    "RegularExpresssionFailed": "permanent",
-    "ConflictingOptions": "permanent",
+    "StoryDoesNotExist": NOT_FOUND,
+    "FailedToLogin": AUTH_FAILED,
+    "NeedTimedOneTimePassword": AUTH_FAILED,
+    "AccessDenied": AUTH_FAILED,
+    "AdultCheckRequired": PERMANENT,
+    "InvalidStoryURL": PERMANENT,
+    "UnknownSite": PERMANENT,
+    "PersonalIniFailed": PERMANENT,
+    "RegularExpresssionFailed": PERMANENT,  # sic: FanFicFare's spelling
+    "ConflictingOptions": PERMANENT,
 }
 
-# FanFicFare reports many problems by printing and returning; match on its text.
+# FanFicFare reports many problems by printing and returning; match on its text. The first
+# rules are the page guard's own messages, which FanFicFare may pass on as text.
 TEXT_RULES = (
-    ("error code: 1010", "blocked"),
-    ("retry later", "rate_limited"),
-    ("too many requests", "rate_limited"),
-    ("login failed", "auth_failed"),
-    ("only available to registered users", "auth_failed"),
+    ("bot protection", RATE_LIMITED),
+    ("browser check", BLOCKED),
+    ("not an ao3 page", SITE_UNAVAILABLE),
+    ("error code: 1010", BLOCKED),
+    ("retry later", RATE_LIMITED),
+    ("too many requests", RATE_LIMITED),
+    ("login failed", AUTH_FAILED),
+    ("only available to registered users", AUTH_FAILED),
     # FanFicFare's login could not even start (no usable token): only another way in helps.
-    ("failed getting login token", "auth_failed"),
-    ("adult check required", "permanent"),
-    ("does not exist", "not_found"),
-    ("downtime", "site_unavailable"),
-    ("maintenance", "site_unavailable"),
-    ("timed out", "site_unavailable"),
-    ("connection", "site_unavailable"),
+    ("failed getting login token", AUTH_FAILED),
+    ("adult check required", PERMANENT),
+    ("does not exist", NOT_FOUND),
+    ("downtime", SITE_UNAVAILABLE),
+    ("maintenance", SITE_UNAVAILABLE),
+    ("timed out", SITE_UNAVAILABLE),
+    ("connection", SITE_UNAVAILABLE),
 )
-
 
 # Lines FanFicFare's CLI prints before giving up without raising or calling its failure callback.
 FATAL_PRINTS = ("Login Failed on non-interactive process",)
 
-# Cloudflare's own error page (5xx origin errors, 1xxx blocks). FlareSolverr renders it in its
-# browser and reports HTTP 200, so FanFicFare would parse it as the page it asked for.
+
+def classify_text(text: str) -> str | None:
+    lowered = text.lower()
+    for needle, kind in TEXT_RULES:
+        if needle in lowered:
+            return kind
+    return None
+
+
+def classify_status(status: int) -> str:
+    if status == 429:
+        return RATE_LIMITED
+    if status == 403:
+        return BLOCKED
+    if status in (404, 410):
+        return NOT_FOUND
+    if status >= 500:  # includes Cloudflare 520-527
+        return SITE_UNAVAILABLE
+    return TRANSIENT
+
+
+def chained_status(exc: BaseException) -> int | None:
+    """The HTTP status of the error that caused `exc`, following __cause__/__context__.
+
+    FanFicFare often wraps a failed request in a generic error ("Failed getting login token
+    from token_dispenser.json" around a 525): the wrapped status says what really happened.
+    """
+    seen = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status = getattr(current, "status_code", None)
+        if isinstance(status, int):
+            return status
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def classify_exception(exc: BaseException) -> str:
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return classify_status(status)
+    name = type(exc).__name__
+    if name in EXCEPTION_KINDS:
+        return EXCEPTION_KINDS[name]
+    status = chained_status(exc)
+    if status is not None:
+        return classify_status(status)
+    lowered = name.lower()
+    if "timeout" in lowered or "connection" in lowered:
+        return SITE_UNAVAILABLE
+    return classify_text(str(exc)) or TRANSIENT
+
+
+# ------------------------------------------------------------------------------ page guard
+
+# Hosts FanFicFare's AO3 adapter accepts (adapter_archiveofourownorg.getAcceptDomains).
+AO3_DOMAINS = (
+    "archiveofourown.org",
+    "archiveofourown.com",
+    "archiveofourown.net",
+    "archiveofourown.gay",
+    "ao3.org",
+)
+# Every page AO3 itself renders (works, chapters, series, login, its own error pages) has
+# its layout's main region; pages from anything in front of it (Cloudflare, AO3's bot
+# filter, a proxy) do not.
+AO3_LAYOUT = re.compile(r'<div\b[^>]*\bid="main"')
+# Error pages are short and the layout marker is near the top: never scan a whole book.
+INSPECT_CHARS = 64 * 1024
+SNIPPET_CHARS = 200
+
+# Cloudflare's own error page (5xx origin errors, 1xxx blocks).
 CLOUDFLARE_ERROR_PAGE = re.compile(r'id="cf-error-details"')
 CLOUDFLARE_ERROR_CODE = re.compile(r"Error code:?\s*(\d{3,4})", re.IGNORECASE)
 
+# Cloudflare could not get an answer from the origin (AO3): 520-527. These are retried at
+# once, a few times: during AO3's partial 525 outages roughly half of all fresh connections
+# fail and a retry is a fresh coin toss, while the request never reached AO3, so retrying is
+# safe even for a login form. Nothing else is retried here: a block or a rate limit only
+# gets worse for asking again at once; the job queue backs off instead.
+CLOUDFLARE_ORIGIN_ERRORS = range(520, 528)
+CLOUDFLARE_RETRIES = 3
+CLOUDFLARE_RETRY_DELAY_S = 1.0
 
-def cloudflare_error(text):
+
+def cloudflare_error(text: Any) -> int | None:
     """The error code if `text` is a Cloudflare error page, else None."""
     if not isinstance(text, str) or not CLOUDFLARE_ERROR_PAGE.search(text):
         return None
@@ -89,59 +207,218 @@ def cloudflare_error(text):
     return int(match.group(1)) if match else 520
 
 
-def status_for_cloudflare(code):
+def status_for_cloudflare(code: int) -> int:
     """The HTTP status that classifies a Cloudflare error code like the real response would."""
     if code < 1000:
         return code  # 520-530: the origin (AO3) is unreachable
     return 429 if code == 1015 else 403  # 1015 is Cloudflare's rate limit, other 1xxx are blocks
 
 
-# Cloudflare could not get an answer from the origin (AO3): 520-527. These are retried at
-# once, a few times: during AO3's partial 525 outages roughly half of all fresh connections
-# fail and a retry is a fresh coin toss, while the request never reached AO3, so retrying is
-# safe even for a login form. Blocks and rate limits (1xxx) are never retried.
-CLOUDFLARE_ORIGIN_ERRORS = range(520, 528)
-CLOUDFLARE_RETRIES = 3
-CLOUDFLARE_RETRY_DELAY_S = 1.0
+def visible_text(page: str) -> str:
+    """The words a reader would see on `page`, whitespace collapsed."""
+    page = re.sub(r"(?is)<(script|style)\b.*?</\1\s*>", " ", page)
+    page = re.sub(r"(?s)<!--.*?-->", " ", page)
+    page = re.sub(r"(?s)<[^>]*>", " ", page)
+    return " ".join(html.unescape(page).split())
 
 
-def install_cloudflare_guard():
-    """Make FanFicFare's FlareSolverr fetcher retry, then fail, on a Cloudflare error page.
+def snippet(page: str) -> str:
+    words = visible_text(page)
+    return words if len(words) <= SNIPPET_CHARS else words[: SNIPPET_CHARS - 1] + "…"
 
-    Without this, an AO3 page that came back as Cloudflare's "525: SSL handshake failed"
-    is taken for a real page: a chapter list with no chapters gives a book with only a
-    title page, and FanFicFare reports success. FanFicFare's own plain-HTTP fetcher already
-    retries 525s (retry_http_525_failures); this gives the FlareSolverr path the same.
+
+@dataclasses.dataclass(frozen=True)
+class KnownPage:
+    """A page something in front of AO3 sends instead of the one asked for."""
+
+    name: str
+    status: int  # the HTTP status it stands for, which classifies it
+    description: str  # starts the error message; TEXT_RULES must classify it the same way
+    matches: Callable[[str, str], bool]  # (raw page, visible text)
+
+
+KNOWN_PAGES = (
+    # AO3's bot filter, in front of the Archive since the autumn 2026 incident. It answers
+    # 429 with a few lines of plain text; FlareSolverr turns that into a 200.
+    KnownPage(
+        "ao3_bot_filter",
+        429,
+        "AO3's bot protection refused the request (it asks to try again later)",
+        lambda raw, words: re.search(
+            r"systems think you may be a robot|bot servers are currently overloaded", words, re.I
+        )
+        is not None,
+    ),
+    # AO3's own rate limit: a bare "Retry later".
+    KnownPage(
+        "ao3_retry_later",
+        429,
+        "AO3 asked to retry later (its rate limit)",
+        lambda raw, words: len(words) < 200 and words.lower().startswith("retry later"),
+    ),
+    # Cloudflare's interstitial: the browser check was not passed.
+    KnownPage(
+        "cloudflare_challenge",
+        403,
+        "Cloudflare's browser check was not passed",
+        lambda raw, words: re.search(
+            r"<title>\s*Just a moment\.\.\.\s*</title>|/cdn-cgi/challenge-platform/", raw, re.I
+        )
+        is not None,
+    ),
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class Rejection:
+    """Why a fetched page is not the page asked for."""
+
+    status: int
+    message: str
+    retry_now: bool = False
+
+
+def is_ao3_page(url: str) -> bool:
+    """Whether `url` is an AO3 page (not an API call or a file)."""
+    parts = urllib.parse.urlsplit(url or "")
+    host = (parts.hostname or "").lower()
+    on_ao3 = any(host == d or host.endswith("." + d) for d in AO3_DOMAINS)
+    return on_ao3 and parts.scheme in ("http", "https") and not parts.path.endswith(".json")
+
+
+def page_text(content: Any) -> str | None:
+    """The start of a response as text; None for anything that is not a page."""
+    if isinstance(content, (bytes, bytearray)):
+        head = bytes(content[:INSPECT_CHARS])
+        if b"\x00" in head:
+            return None  # binary: an image
+        text = head.decode("utf-8", errors="replace")
+    elif isinstance(content, str):
+        text = content[:INSPECT_CHARS]
+    else:
+        return None
+    if text.lstrip().startswith(("{", "[")):
+        return None  # JSON (the login token, FlareSolverr's own answers)
+    return text
+
+
+def judge(url: str, content: Any) -> Rejection | None:
+    """None if `content` may be the page at `url`, else why it is not."""
+    text = page_text(content)
+    if text is None or AO3_LAYOUT.search(text):
+        return None
+    code = cloudflare_error(text)
+    if code is not None:
+        return Rejection(
+            status_for_cloudflare(code),
+            "Cloudflare error code: %d instead of %s" % (code, url),
+            retry_now=code in CLOUDFLARE_ORIGIN_ERRORS,
+        )
+    words = visible_text(text)
+    for page in KNOWN_PAGES:
+        if page.matches(text, words):
+            return Rejection(page.status, "%s, instead of %s: “%s”" % (page.description, url, snippet(text)))
+    if is_ao3_page(url):
+        # Something answered for AO3 that is none of the above: an error page, a proxy, a
+        # maintenance notice. Never let FanFicFare parse it as the work.
+        return Rejection(503, "the site sent something that is not an AO3 page instead of %s: “%s”" % (url, snippet(text)))
+    return None
+
+
+class PageLog:
+    """The last AO3 page fetched, to say which page FanFicFare could not read."""
+
+    def __init__(self) -> None:
+        self.url: str | None = None
+        self.text = ""
+
+    def record(self, url: str, content: Any) -> None:
+        text = page_text(content)
+        if text is not None and is_ao3_page(url):
+            self.url, self.text = url, text
+
+
+PAGES = PageLog()
+
+
+def install_page_guard() -> None:
+    """Check every page FanFicFare fetches, through any fetcher, before it is parsed.
+
+    Hooks the one method all of FanFicFare's fetchers share (Fetcher.do_request), below its
+    cache, so a rejected page is never cached either. Cloudflare's 52x pages are retried at
+    once (FanFicFare's plain-HTTP fetcher has retry_http_525_failures; this gives every path
+    the same); everything else becomes FanFicFare's own HTTPErrorFFF with the status the page
+    stands for, which classify_exception turns into the right kind.
+
+    Why: FlareSolverr reports HTTP 200 for whatever its browser shows, so Cloudflare's "525"
+    once became a book with only a title page, and AO3's bot filter became
+    "AttributeError: 'NoneType' object has no attribute 'get_text'".
     """
     from fanficfare import exceptions
-    from fanficfare.fetchers import fetcher_flaresolverr_proxy as module
+    from fanficfare.fetchers import base_fetcher
 
-    fetcher = module.FlareSolverr_ProxyFetcher
-    if getattr(fetcher.request, "_cloudflare_guard", False):
+    fetcher = base_fetcher.Fetcher
+    if getattr(fetcher.do_request, "_page_guard", False):
         return
-    original = fetcher.request
+    original = fetcher.do_request
 
-    def request(self, method, url, headers=None, parameters=None):
+    def do_request(self, method, url, parameters=None, referer=None, usecache=True, image=False):
         for attempt in range(CLOUDFLARE_RETRIES + 1):
-            response = original(self, method, url, headers=headers, parameters=parameters)
-            code = cloudflare_error(getattr(response, "content", None))
-            if code is None:
+            response = original(
+                self, method, url, parameters=parameters, referer=referer, usecache=usecache, image=image
+            )
+            if image:
                 return response
-            if code not in CLOUDFLARE_ORIGIN_ERRORS or attempt == CLOUDFLARE_RETRIES:
-                raise exceptions.HTTPErrorFFF(
-                    url,
-                    status_for_cloudflare(code),
-                    "Cloudflare error code: %d (through FlareSolverr)" % code,
-                    None,
-                )
+            content = getattr(response, "content", None)
+            rejection = judge(url, content)
+            if rejection is None:
+                PAGES.record(url, content)
+                return response
+            if not rejection.retry_now or attempt == CLOUDFLARE_RETRIES:
+                raise exceptions.HTTPErrorFFF(url, rejection.status, rejection.message, None)
             delay = CLOUDFLARE_RETRY_DELAY_S * (attempt + 1)
-            print("Cloudflare error %d for %s; retrying in %.0f s (%d of %d)"
-                  % (code, url, delay, attempt + 1, CLOUDFLARE_RETRIES))
+            print("%s; retrying in %.0f s (%d of %d)" % (rejection.message, delay, attempt + 1, CLOUDFLARE_RETRIES))
             time.sleep(delay)
+        raise AssertionError("unreachable")
 
-    request._cloudflare_guard = True
-    fetcher.request = request
+    do_request._page_guard = True
+    fetcher.do_request = do_request
 
+
+PARSE_ERRORS = (AttributeError, TypeError, KeyError, IndexError)
+# FanFicFare's site adapters, wherever the venv is (site-packages, or Debian's dist-packages).
+ADAPTER_DIR = re.compile(r"/(site|dist)-packages/fanficfare/adapters/")
+
+
+def raised_while_parsing(exc: BaseException) -> bool:
+    """Whether `exc` is FanFicFare's site adapter tripping over a page it did not expect."""
+    if not isinstance(exc, PARSE_ERRORS):
+        return False
+    frames = traceback.extract_tb(exc.__traceback__)
+    return any(ADAPTER_DIR.search(f.filename.replace(os.sep, "/")) for f in frames)
+
+
+def unreadable_page(exc: BaseException, pages: PageLog = PAGES) -> WorkerError | None:
+    """A clear failure for FanFicFare crashing on a page that passed the guard.
+
+    The guard rejects what is not an AO3 page, so this is an AO3 page FanFicFare cannot read:
+    most likely AO3 changed its markup and FanFicFare needs an update. Retried like any
+    unclassified failure, with the page named so the job log says what happened.
+    """
+    if not raised_while_parsing(exc):
+        return None
+    if pages.url is None:
+        where = "a page"
+    else:
+        where = "%s (it began: “%s”)" % (pages.url, snippet(pages.text))
+    return WorkerError(
+        TRANSIENT,
+        "FanFicFare could not read %s: %s: %s. If this keeps happening, AO3 may have changed "
+        "its pages and FanFicFare needs an update." % (where, type(exc).__name__, exc),
+    )
+
+
+# ------------------------------------------------------------------------- work metadata
 
 # FanFicFare metadata list -> tag kind, in AO3's order.
 TAG_LISTS = (
@@ -156,12 +433,12 @@ SERIES_SLOTS = 10
 AO3_ID = re.compile(r"/(works|series|chapters|users|pseuds)/([^/?#]+)")
 
 
-def ids_in(url):
+def ids_in(url: str | None) -> dict[str, str]:
     """{"works": "123", "users": "name", ...} from an AO3 URL."""
     return {kind: value for kind, value in AO3_ID.findall(url or "")}
 
 
-def to_int(value):
+def to_int(value: Any) -> int | None:
     """AO3 numbers come as text with thousands separators ("120,000"); None if absent."""
     if isinstance(value, bool):
         return None
@@ -171,39 +448,39 @@ def to_int(value):
     return int(digits) if digits else None
 
 
-def to_date(value):
+def to_date(value: Any) -> str | None:
     if isinstance(value, (datetime.datetime, datetime.date)):
         return value.strftime("%Y-%m-%d")
     match = re.match(r"(\d{4}-\d{2}-\d{2})", str(value or ""))
     return match.group(1) if match else None
 
 
-def json_safe(value):
+def json_safe(value: Any) -> Any:
     return json.loads(json.dumps(value, default=str))
 
 
-def text(story, key):
-    return html.unescape(str(story.getMetadata(key, removeallentities=False, doreplacements=False) or ""))
-
-
-def work_metadata(adapter):
+def work_metadata(adapter: Any) -> dict[str, Any]:
     """What FanFicFare learned about the work, in the shape the Rust side records."""
     story = adapter.story
-    raw = lambda key: story.getMetadataRaw(key)  # noqa: E731
-    lst = lambda key: [html.unescape(str(v)) for v in story.getList(key, doreplacements=False) if str(v).strip()]  # noqa: E731
+
+    def text(key: str) -> str:
+        return html.unescape(str(story.getMetadata(key, removeallentities=False, doreplacements=False) or ""))
+
+    def listed(key: str) -> list[str]:
+        return [html.unescape(str(v)) for v in story.getList(key, doreplacements=False) if str(v).strip()]
 
     authors = []
-    names, urls = lst("author"), lst("authorUrl")
+    names, urls = listed("author"), listed("authorUrl")
     for i, name in enumerate(names):
         found = ids_in(urls[i] if i < len(urls) else "")
         authors.append({"user": found.get("users", name), "pseud": found.get("pseuds", name)})
 
-    tags = [{"kind": kind, "name": name} for key, kind in TAG_LISTS for name in lst(key)]
+    tags = [{"kind": kind, "name": name} for key, kind in TAG_LISTS for name in listed(key)]
 
     series = []
     for slot in range(SERIES_SLOTS):
-        label = text(story, "series%02d" % slot)
-        series_id = ids_in(text(story, "series%02dUrl" % slot)).get("series")
+        label = text("series%02d" % slot)
+        series_id = ids_in(text("series%02dUrl" % slot)).get("series")
         if not label or not series_id or not series_id.isdigit():
             continue
         name, part = label, None
@@ -222,25 +499,25 @@ def work_metadata(adapter):
             "posted_on": to_date(info.get("date")),
         })
 
-    posted, _, total = text(story, "chapterslashtotal").partition("/")
+    posted, _, total = text("chapterslashtotal").partition("/")
     return {
-        "title": text(story, "title"),
-        "byline": text(story, "byline") or ", ".join(names),
+        "title": text("title"),
+        "byline": text("byline") or ", ".join(names),
         "summary_html": str(story.getMetadata("description", removeallentities=False, doreplacements=False) or ""),
-        "language": text(story, "language"),
-        "rating": text(story, "rating"),
-        "restricted": bool(text(story, "restricted")),
-        "status": text(story, "status"),
-        "published_on": to_date(raw("datePublished")),
-        "updated_on": to_date(raw("dateUpdated")),
-        "chapters_posted": to_int(posted) or len(chapters) or to_int(text(story, "numChapters")) or 0,
+        "language": text("language"),
+        "rating": text("rating"),
+        "restricted": bool(text("restricted")),
+        "status": text("status"),
+        "published_on": to_date(story.getMetadataRaw("datePublished")),
+        "updated_on": to_date(story.getMetadataRaw("dateUpdated")),
+        "chapters_posted": to_int(posted) or len(chapters) or to_int(text("numChapters")) or 0,
         "chapters_total": to_int(total),
-        "words": to_int(text(story, "numWords")) or 0,
+        "words": to_int(text("numWords")) or 0,
         "authors": authors,
         "tags": tags,
         "series": series,
         "chapters": chapters,
-        "stats": {key: to_int(text(story, key)) for key in ("hits", "kudos", "comments", "bookmarks")},
+        "stats": {key: to_int(text(key)) for key in ("hits", "kudos", "comments", "bookmarks")},
         "raw": json_safe(story.getAllMetadata(removeallentities=False, doreplacements=False)),
     }
 
@@ -248,10 +525,10 @@ def work_metadata(adapter):
 class AdapterCapture:
     """Keeps the adapter FanFicFare's CLI creates, so its metadata can be read afterwards."""
 
-    def __init__(self):
-        self.adapter = None
+    def __init__(self) -> None:
+        self.adapter: Any = None
 
-    def install(self):
+    def install(self) -> None:
         from fanficfare import adapters
 
         original = adapters.getAdapter
@@ -268,33 +545,10 @@ class AdapterCapture:
         adapters.getAdapter = get_adapter
 
 
-def list_series(cli, request, buffer):
-    """A series page: its name, summary, status and works in order."""
-    from fanficfare.geturls import GetURLs
-
-    options = build_options(cli, request, None, request["url"])
-    try:
-        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
-            configuration = cli.get_configuration(request["url"], None, None, options)
-            page = GetURLs(configuration).get_urls_from_page(request["url"])
-    finally:
-        save_cookies(options, request)
-    works = []
-    for url in page.get("urllist", []):
-        work = ids_in(url).get("works")
-        if work and work.isdigit() and int(work) not in works:
-            works.append(int(work))
-    status = page.get("status")
-    return {
-        "name": html.unescape(str(page.get("name") or "")),
-        "summary_html": str(page.get("desc") or ""),
-        "complete": {"Completed": True, "In-Progress": False}.get(status),
-        "works": works,
-        "raw": json_safe({key: page[key] for key in page if key != "desc"}),
-    }
+# ---------------------------------------------------------------------------------- books
 
 
-def chapter_count(path):
+def chapter_count(path: str) -> int | None:
     """How many chapters FanFicFare finds in an EPUB (None if it cannot read one)."""
     from fanficfare.epubutils import get_dcsource_chaptercount
 
@@ -304,70 +558,7 @@ def chapter_count(path):
         return None
 
 
-def classify_text(text):
-    lowered = text.lower()
-    for needle, kind in TEXT_RULES:
-        if needle in lowered:
-            return kind
-    return None
-
-
-def classify_status(status):
-    if status == 429:
-        return "rate_limited"
-    if status == 403:
-        return "blocked"
-    if status in (404, 410):
-        return "not_found"
-    if status >= 500:  # includes Cloudflare 520-526
-        return "site_unavailable"
-    return "transient"
-
-
-def chained_status(exc):
-    """The HTTP status of the error that caused `exc`, following __cause__/__context__.
-
-    FanFicFare often wraps a failed request in a generic error ("Failed getting login token
-    from token_dispenser.json" around a 525): the wrapped status says what really happened.
-    """
-    seen = set()
-    current = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        status = getattr(current, "status_code", None)
-        if isinstance(status, int):
-            return status
-        current = current.__cause__ or current.__context__
-    return None
-
-
-def classify_exception(exc):
-    status = getattr(exc, "status_code", None)
-    if isinstance(status, int):
-        return classify_status(status)
-    name = type(exc).__name__
-    if name in EXCEPTION_KINDS:
-        return EXCEPTION_KINDS[name]
-    status = chained_status(exc)
-    if status is not None:
-        return classify_status(status)
-    lowered = name.lower()
-    if "timeout" in lowered or "connection" in lowered:
-        return "site_unavailable"
-    return classify_text(str(exc)) or "transient"
-
-
-def emit(payload):
-    out = sys.__stdout__
-    out.write("\n" + json.dumps(payload) + "\n")
-    out.flush()
-
-
-def tail(text):
-    return text[-LOG_TAIL_CHARS:]
-
-
-def sha256(path):
+def sha256(path: str) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(1 << 16), b""):
@@ -375,7 +566,7 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def epub_title(path):
+def epub_title(path: str) -> str:
     with zipfile.ZipFile(path) as archive:
         container = ET.fromstring(archive.read("META-INF/container.xml"))
         rootfile = next(e for e in container.iter() if e.tag.endswith("rootfile"))
@@ -386,7 +577,10 @@ def epub_title(path):
     return ""
 
 
-def build_options(cli, request, existing, target):
+# ------------------------------------------------------------------------------- sessions
+
+
+def build_options(cli: Any, request: dict[str, Any], existing: str | None, target: str) -> Any:
     argv = ["--non-interactive", "-f", "epub"]
     if request.get("personal_ini"):
         argv += ["-c", request["personal_ini"]]
@@ -397,8 +591,7 @@ def build_options(cli, request, existing, target):
     if existing:
         argv += ["-u"]
     else:
-        out_path = os.path.join(request["workdir"], "story.epub")
-        argv += ["-o", "output_filename=" + out_path]
+        argv += ["-o", "output_filename=" + os.path.join(request["workdir"], "story.epub")]
     argv.append(target)  # validateOptions insists on a positional argument
     parser = cli.mkParser(False)
     options, args = parser.parse_args(argv)
@@ -407,11 +600,7 @@ def build_options(cli, request, existing, target):
     return options
 
 
-class ClearanceError(Exception):
-    """FlareSolverr could not pass Cloudflare for us."""
-
-
-def apply_clearance(request):
+def apply_clearance(request: dict[str, Any]) -> None:
     """Have FlareSolverr pass Cloudflare once; leave its cookies and User-Agent for FanFicFare.
 
     Used for the login fallback. AO3 refuses a login submitted *through* FlareSolverr (its
@@ -433,10 +622,14 @@ def apply_clearance(request):
         with urllib.request.urlopen(http_request, timeout=timeout_ms / 1000 + 30) as response:
             answer = json.load(response)
     except Exception as exc:  # noqa: BLE001 - any failure to talk to FlareSolverr
-        raise ClearanceError("cannot reach FlareSolverr: %s" % exc)
+        raise WorkerError(SITE_UNAVAILABLE, "cannot reach FlareSolverr: %s" % exc) from exc
     solution = answer.get("solution") if answer.get("status") == "ok" else None
     if not solution:
-        raise ClearanceError("FlareSolverr failed: %s" % answer.get("message"))
+        raise WorkerError(SITE_UNAVAILABLE, "FlareSolverr failed: %s" % answer.get("message"))
+    # Clearance earned on an error page is no clearance: say what the site really sent.
+    rejection = judge(spec["url"], solution.get("response"))
+    if rejection is not None:
+        raise WorkerError(classify_status(rejection.status), rejection.message)
 
     path = request["cookies"]
     jar = http.cookiejar.MozillaCookieJar(path)
@@ -468,7 +661,7 @@ def apply_clearance(request):
             handle.write(user_agent)
 
 
-def save_cookies(options, request):
+def save_cookies(options: Any, request: dict[str, Any]) -> None:
     """Write the cookie jar back to the file it was loaded from, success or not.
 
     A run that Cloudflare refused may still have rotated cookies, and the caller decides
@@ -484,14 +677,50 @@ def save_cookies(options, request):
         pass
 
 
-def attempt(cli, request, existing, buffer):
-    """Run FanFicFare once. Returns (output_path, failures)."""
-    failures = []
+# ------------------------------------------------------------------------------ operations
 
-    def warn(message):
+
+def list_series(cli: Any, request: dict[str, Any], buffer: io.StringIO) -> dict[str, Any]:
+    """A series page: its name, summary, status and works in order."""
+    from fanficfare.geturls import GetURLs
+
+    options = build_options(cli, request, None, request["url"])
+    try:
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            configuration = cli.get_configuration(request["url"], None, None, options)
+            page = GetURLs(configuration).get_urls_from_page(request["url"])
+    finally:
+        save_cookies(options, request)
+    works: list[int] = []
+    for url in page.get("urllist", []):
+        work = ids_in(url).get("works")
+        if work and work.isdigit() and int(work) not in works:
+            works.append(int(work))
+    if not works:
+        raise WorkerError(
+            classify_text(buffer.getvalue()) or SITE_UNAVAILABLE,
+            "the series page listed no works (the site probably sent an error page)",
+        )
+    return {
+        "status": "listed",
+        "name": html.unescape(str(page.get("name") or "")),
+        "summary_html": str(page.get("desc") or ""),
+        "complete": {"Completed": True, "In-Progress": False}.get(page.get("status")),
+        "works": works,
+        "raw": json_safe({key: page[key] for key in page if key != "desc"}),
+    }
+
+
+def run_fanficfare(
+    cli: Any, request: dict[str, Any], existing: str | None, buffer: io.StringIO
+) -> tuple[str, list[str]]:
+    """Run FanFicFare's download once. Returns (output_path, failures it reported)."""
+    failures: list[str] = []
+
+    def warn(message: Any) -> None:
         print(message)
 
-    def fail(message):
+    def fail(message: Any) -> None:
         failures.append(str(message))
         print(message)
 
@@ -506,120 +735,112 @@ def attempt(cli, request, existing, buffer):
     return out_path, failures
 
 
-def read_request():
+def download(cli: Any, request: dict[str, Any], buffer: io.StringIO, capture: AdapterCapture) -> dict[str, Any]:
+    existing = request.get("existing")
+    if existing and chapter_count(existing) == 0:
+        # A book with no chapters (written before the checks below existed) cannot be
+        # updated: FanFicFare refuses it as "no recognizable chapters", forever. Replace it.
+        print("the stored book has no chapters: downloading it again", file=buffer)
+        existing = None
+    before = sha256(existing) if existing else None
+    out_path, failures = run_fanficfare(cli, request, existing, buffer)
+
+    # A failed update leaves the old file where it was, so "a file exists" proves nothing:
+    # FanFicFare reporting a failure is a failure, whatever is on disk. It reports some of
+    # them only by printing a line and returning, with no callback and no exception.
+    log = buffer.getvalue()
+    printed = [line for line in log.splitlines() if line.startswith(FATAL_PRINTS)]
+    if failures or printed:
+        message = (failures or printed)[-1]
+        raise WorkerError(classify_text(message) or classify_text(log) or TRANSIENT, message)
+
+    if not (os.path.exists(out_path) and os.path.getsize(out_path) > 0):
+        message = (log.strip().splitlines() or ["no output produced"])[-1]
+        raise WorkerError(classify_text(message) or classify_text(log) or TRANSIENT, message)
+
+    if chapter_count(out_path) == 0:
+        # FanFicFare checks the chapter count the site *claims* (AO3's work stats), not the
+        # chapters it found, so an error page in place of the chapter list gives a book with
+        # only a title page, "successfully". On an update it would replace a good book. The
+        # page guard should catch that page first; this is the last line of defence.
+        raise WorkerError(
+            classify_text(log) or SITE_UNAVAILABLE,
+            "FanFicFare found no chapters (the site probably sent an error page)",
+        )
+
+    metadata = None
+    if capture.adapter is not None:
+        try:
+            metadata = work_metadata(capture.adapter)
+        except Exception:  # noqa: BLE001 - the book matters more than its details
+            print("could not read the work's details:\n" + traceback.format_exc(), file=buffer)
+    return {
+        "status": "ok",
+        "path": out_path,
+        "title": epub_title(out_path),
+        "changed": before is None or sha256(out_path) != before,
+        "metadata": metadata,
+    }
+
+
+# ------------------------------------------------------------------------------------ main
+
+
+def emit(payload: dict[str, Any]) -> None:
+    out = sys.__stdout__
+    out.write("\n" + json.dumps(payload) + "\n")
+    out.flush()
+
+
+def tail(text: str) -> str:
+    return text[-LOG_TAIL_CHARS:]
+
+
+def read_request() -> dict[str, Any]:
     try:
         request = json.load(sys.stdin)
+        if not isinstance(request, dict):
+            raise ValueError("not a JSON object")
         for key in ("url", "workdir"):
             if not isinstance(request.get(key), str) or not request[key]:
                 raise ValueError("missing %r" % key)
         return request
     except Exception as exc:  # noqa: BLE001
-        emit({"status": "error", "kind": "permanent", "message": "bad worker request: %s" % exc, "log": ""})
-        return None
+        raise WorkerError(PERMANENT, "bad worker request: %s" % exc) from exc
 
 
-def main():
-    request = read_request()
-    if request is None:
-        return
+def run(request: dict[str, Any], buffer: io.StringIO) -> dict[str, Any]:
+    """Do what `request` asks; returns the success payload, raises on failure."""
     logging.getLogger("fanficfare").setLevel(logging.WARNING)  # DEBUG would flood stderr
     os.makedirs(request["workdir"], exist_ok=True)
     os.chdir(request["workdir"])
+    from fanficfare import cli
+
+    install_page_guard()
+    capture = AdapterCapture()
+    capture.install()
+    if request.get("clearance") and request.get("cookies"):
+        apply_clearance(request)
+    if request.get("op") == "list_series":
+        return list_series(cli, request, buffer)
+    return download(cli, request, buffer, capture)
+
+
+def main() -> None:
     buffer = io.StringIO()
     try:
-        from fanficfare import cli
-
-        install_cloudflare_guard()
-        capture = AdapterCapture()
-        capture.install()
-        if request.get("clearance") and request.get("cookies"):
-            try:
-                apply_clearance(request)
-            except ClearanceError as exc:
-                emit({"status": "error", "kind": "site_unavailable", "message": str(exc), "log": ""})
-                return
-        if request.get("op") == "list_series":
-            listing = list_series(cli, request, buffer)
-            if not listing["works"]:
-                log = buffer.getvalue()
-                emit({
-                    "status": "error",
-                    "kind": classify_text(log) or "site_unavailable",
-                    "message": "the series page listed no works (the site probably sent an error page)",
-                    "log": tail(log),
-                })
-                return
-            emit(dict(listing, status="listed", log=tail(buffer.getvalue())))
-            return
-        existing = request.get("existing")
-        if existing and chapter_count(existing) == 0:
-            # A book with no chapters (written before the checks below existed) cannot be
-            # updated: FanFicFare refuses it as "no recognizable chapters", forever. Replace it.
-            print("the stored book has no chapters: downloading it again", file=buffer)
-            existing = None
-        before = sha256(existing) if existing else None
-        out_path, failures = attempt(cli, request, existing, buffer)
-
-        # A failed update leaves the old file where it was, so "a file exists" proves nothing:
-        # FanFicFare reporting a failure is a failure, whatever is on disk. It reports some of
-        # them only by printing a line and returning, with no callback and no exception.
-        log = buffer.getvalue()
-        printed = [line for line in log.splitlines() if line.startswith(FATAL_PRINTS)]
-        if failures or printed:
-            message = (failures or printed)[-1]
-            emit({
-                "status": "error",
-                "kind": classify_text(message) or classify_text(log) or "transient",
-                "message": message,
-                "log": tail(log),
-            })
-            return
-
-        produced = os.path.exists(out_path) and os.path.getsize(out_path) > 0
-        if produced and chapter_count(out_path) == 0:
-            # FanFicFare checks the chapter count the site *claims* (AO3's work stats), not the
-            # chapters it found, so an error page in place of the chapter list gives a book with
-            # only a title page, "successfully". On an update it would replace a good book.
-            log = buffer.getvalue()
-            emit({
-                "status": "error",
-                "kind": classify_text(log) or "site_unavailable",
-                "message": "FanFicFare found no chapters (the site probably sent an error page)",
-                "log": tail(log),
-            })
-            return
-        if produced:
-            changed = before is None or sha256(out_path) != before
-            metadata = None
-            if capture.adapter is not None:
-                try:
-                    metadata = work_metadata(capture.adapter)
-                except Exception:  # noqa: BLE001 - the book matters more than its details
-                    print("could not read the work's details:\n" + traceback.format_exc(), file=buffer)
-            emit({
-                "status": "ok",
-                "path": out_path,
-                "title": epub_title(out_path),
-                "changed": changed,
-                "metadata": metadata,
-                "log": tail(buffer.getvalue()),
-            })
-            return
-        log = buffer.getvalue()
-        message = failures[-1] if failures else (log.strip().splitlines() or ["no output produced"])[-1]
-        emit({
-            "status": "error",
-            "kind": classify_text(message) or classify_text(log) or "transient",
-            "message": message,
-            "log": tail(log),
-        })
-    except SystemExit as exc:
-        emit({"status": "error", "kind": "permanent", "message": "invalid options: %s" % exc, "log": tail(buffer.getvalue())})
+        payload = run(read_request(), buffer)
+        emit(dict(payload, log=tail(buffer.getvalue())))
+    except WorkerError as exc:
+        emit({"status": "error", "kind": exc.kind, "message": exc.message, "log": tail(buffer.getvalue())})
+    except SystemExit as exc:  # FanFicFare's option parser exits on bad options
+        emit({"status": "error", "kind": PERMANENT, "message": "invalid options: %s" % exc, "log": tail(buffer.getvalue())})
     except Exception as exc:  # noqa: BLE001 - classification is the point
+        known = unreadable_page(exc)
         emit({
             "status": "error",
-            "kind": classify_exception(exc),
-            "message": "%s: %s" % (type(exc).__name__, exc),
+            "kind": known.kind if known else classify_exception(exc),
+            "message": known.message if known else "%s: %s" % (type(exc).__name__, exc),
             "log": tail(buffer.getvalue() + "\n" + traceback.format_exc()),
         })
 

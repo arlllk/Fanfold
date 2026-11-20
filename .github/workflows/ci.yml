@@ -114,7 +114,10 @@ jobs:
         run: scripts/with-postgres.sh cargo test --locked -p fanfold-adapter-postgres -- --ignored
 
       - name: Integration, Python worker
-        run: cargo test --locked -p fanfold-adapter-fanficfare -- --ignored
+        run: |
+          set -euo pipefail
+          "$FFD_PYTHON" -I -B -m unittest discover -s crates/adapters/fanficfare/worker
+          cargo test --locked -p fanfold-adapter-fanficfare -- --ignored
 
       - name: Integration, end to end
         run: scripts/with-postgres.sh cargo test --locked -p fanfold-server --test e2e -- --ignored
