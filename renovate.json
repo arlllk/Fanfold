@@ -52,12 +52,12 @@
     },
     {
       "customType": "regex",
-      "description": "Tool versions in workflows, marked with a `# renovate: datasource=... depName=...` comment on the line above a `version:` input (uv, for setup-uv in ci.yml).",
+      "description": "Tool versions in workflows, marked with a `# renovate: datasource=... depName=...` comment on the line above a `version:`-style input: uv (setup-uv, ci.yml), Syft (sbom-action) and Grype (scan-action). Syft and Grype are pinned because the actions' bundled defaults lag: Syft 1.54 listed every package of the DHI base twice (it reads both /var/lib/dpkg/status and status.d), which doubled every finding in the Security tab.",
       "managerFilePatterns": [
         "/(^|/)\\.github/workflows/[^/]+\\.ya?ml$/"
       ],
       "matchStrings": [
-        "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+)\\s*\\n\\s*version:\\s*\"?(?<currentValue>[^\\s\"]+)\"?"
+        "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+)\\s*\\n\\s*(?:version|syft-version|grype-version):\\s*\"?(?<currentValue>[^\\s\"]+)\"?"
       ]
     }
   ],
@@ -82,6 +82,14 @@
         "ghcr.io/astral-sh/uv"
       ],
       "groupName": "uv"
+    },
+    {
+      "description": "Syft and Grype, the SBOM and the scan: one PR for both, as they read the image the same way.",
+      "matchDepNames": [
+        "anchore/syft",
+        "anchore/grype"
+      ],
+      "groupName": "Syft and Grype"
     },
     {
       "description": "A new runner OS can break the build in ways CI only half covers: propose it on the dependency dashboard and wait for approval. (The runtime base, dhi.io/python X.Y.Z-debian13, gets version and digest updates like any image; a new Debian release is a new tag suffix, changed by hand, as is a new Python minor version, which ci.yml, the justfile and pyrefly.toml must follow.)",
