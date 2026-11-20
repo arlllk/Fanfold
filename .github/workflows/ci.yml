@@ -116,6 +116,8 @@ jobs:
       - name: Integration, Python worker
         run: |
           set -euo pipefail
+          "$(dirname "$FFD_PYTHON")/pyrefly" check --config crates/adapters/fanficfare/worker/pyrefly.toml \
+            --python-interpreter-path "$FFD_PYTHON"
           "$FFD_PYTHON" -I -B -m unittest discover -s crates/adapters/fanficfare/worker
           cargo test --locked -p fanfold-adapter-fanficfare -- --ignored
 

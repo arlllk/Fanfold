@@ -12,6 +12,9 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import json
+import tempfile
+from unittest import mock
 import unittest
 
 import ffd_worker as w
@@ -45,13 +48,19 @@ AO3_WORK_QUOTING_ERRORS = (
 )
 
 
+def rejected(page: object, url: str = WORK) -> w.Rejection:
+    rejection = w.judge(url, page)
+    assert rejection is not None, "accepted: %r" % (page,)
+    return rejection
+
+
 class JudgeTest(unittest.TestCase):
     def test_ao3_s_own_pages_pass_whatever_they_say(self):
         self.assertIsNone(w.judge(WORK, AO3_WORK_QUOTING_ERRORS))
         self.assertIsNone(w.judge(WORK, AO3_WORK_QUOTING_ERRORS.encode()))
 
     def test_the_bot_filter_is_a_rate_limit(self):
-        rejection = w.judge(WORK, AO3_BOT_FILTER)
+        rejection = rejected(AO3_BOT_FILTER)
         self.assertEqual(rejection.status, 429)
         self.assertFalse(rejection.retry_now, "asking again at once only makes it worse")
         self.assertEqual(w.classify_status(rejection.status), w.RATE_LIMITED)
@@ -61,27 +70,28 @@ class JudgeTest(unittest.TestCase):
 
     def test_a_bare_retry_later_is_a_rate_limit(self):
         for page in ("Retry later\n", "<html><body><p>Retry later</p></body></html>"):
-            self.assertEqual(w.judge(WORK, page).status, 429, page)
-        self.assertEqual(w.classify_text(w.judge(WORK, "Retry later").message), w.RATE_LIMITED)
+            self.assertEqual(rejected(page).status, 429, page)
+        self.assertEqual(w.classify_text(rejected("Retry later").message), w.RATE_LIMITED)
 
     def test_cloudflare_origin_errors_are_retried_at_once_and_mean_the_site_is_down(self):
-        rejection = w.judge(WORK, CLOUDFLARE_525)
+        rejection = rejected(CLOUDFLARE_525)
         self.assertEqual((rejection.status, rejection.retry_now), (525, True))
         self.assertEqual(w.classify_status(rejection.status), w.SITE_UNAVAILABLE)
         self.assertIn("525", rejection.message)
 
     def test_cloudflare_blocks_and_rate_limits_are_not_retried_at_once(self):
-        self.assertEqual(w.judge(WORK, CLOUDFLARE_1015), w.Rejection(429, w.judge(WORK, CLOUDFLARE_1015).message))
-        blocked = w.judge(WORK, CLOUDFLARE_1015.replace("1015", "1020"))
+        limited = rejected(CLOUDFLARE_1015)
+        self.assertEqual((limited.status, limited.retry_now), (429, False))
+        blocked = rejected(CLOUDFLARE_1015.replace("1015", "1020"))
         self.assertEqual((blocked.status, blocked.retry_now), (403, False))
 
     def test_a_cloudflare_challenge_is_a_block(self):
-        rejection = w.judge(WORK, CLOUDFLARE_CHALLENGE)
+        rejection = rejected(CLOUDFLARE_CHALLENGE)
         self.assertEqual(rejection.status, 403)
         self.assertEqual(w.classify_text(rejection.message), w.BLOCKED)
 
     def test_any_other_page_in_ao3_s_place_is_an_outage_named_in_the_message(self):
-        rejection = w.judge(WORK, "<html><body><h1>502 Bad Gateway</h1><hr>nginx</body></html>")
+        rejection = rejected("<html><body><h1>502 Bad Gateway</h1><hr>nginx</body></html>")
         self.assertEqual(w.classify_status(rejection.status), w.SITE_UNAVAILABLE)
         self.assertEqual(w.classify_text(rejection.message), w.SITE_UNAVAILABLE)
         self.assertIn("502 Bad Gateway nginx", rejection.message)
@@ -97,7 +107,7 @@ class JudgeTest(unittest.TestCase):
         self.assertIsNone(w.judge(WORK, None))
 
     def test_cloudflare_s_pages_are_caught_on_any_site(self):
-        self.assertEqual(w.judge("https://example.com/", CLOUDFLARE_525).status, 525)
+        self.assertEqual(rejected(CLOUDFLARE_525, "https://example.com/").status, 525)
 
     def test_every_ao3_host_is_ao3(self):
         for host in ("archiveofourown.org", "www.archiveofourown.org", "ao3.org", "archiveofourown.gay"):
@@ -107,7 +117,7 @@ class JudgeTest(unittest.TestCase):
 
     def test_only_the_start_of_a_large_page_is_read(self):
         huge = '<div id="main">' + "x" * (10 * w.INSPECT_CHARS)
-        self.assertEqual(len(w.page_text(huge)), w.INSPECT_CHARS)
+        self.assertEqual(len(w.page_text(huge) or ""), w.INSPECT_CHARS)
         self.assertIsNone(w.judge(WORK, huge))
 
 
@@ -166,6 +176,7 @@ class UnreadablePageTest(unittest.TestCase):
         pages.record(WORK, '<div id="main"><p>Something new</p></div>')
         exc = self.crash_in("/venv/site-packages/fanficfare/adapters/base_otw_adapter.py")
         error = w.unreadable_page(exc, pages)
+        assert error is not None
         self.assertEqual(error.kind, w.TRANSIENT)
         self.assertIn(WORK, error.message)
         self.assertIn("Something new", error.message)
@@ -174,6 +185,101 @@ class UnreadablePageTest(unittest.TestCase):
     def test_other_crashes_are_left_alone(self):
         self.assertIsNone(w.unreadable_page(self.crash_in("/src/fanficfare/crates/adapters/else.py"), w.PageLog()))
         self.assertIsNone(w.unreadable_page(RuntimeError("no"), w.PageLog()))
+
+
+class RequestTest(unittest.TestCase):
+    MINIMAL = {"url": WORK, "workdir": "/tmp/w"}
+
+    def refused(self, raw: object, why: str) -> None:
+        with self.assertRaises(w.WorkerError) as caught:
+            w.parse_request(raw)
+        self.assertEqual(caught.exception.kind, w.PERMANENT)
+        self.assertIn(why, caught.exception.message)
+
+    def test_what_the_rust_side_sends_is_read_field_by_field(self):
+        request = w.parse_request(dict(
+            self.MINIMAL, op="list_series", existing=None, personal_ini="/p.ini", cookies="/c.txt",
+            user_agent=None, clearance={"flaresolverr": "http://fs:8191", "timeout_ms": 5000, "url": WORK},
+        ))
+        self.assertEqual(request.op, "list_series")
+        self.assertEqual((request.existing, request.personal_ini, request.cookies), (None, "/p.ini", "/c.txt"))
+        self.assertEqual(request.clearance, w.Clearance("http://fs:8191", WORK, 5000))
+
+    def test_a_download_is_the_default(self):
+        self.assertEqual(w.parse_request(self.MINIMAL), w.Request("download", WORK, "/tmp/w"))
+
+    def test_anything_else_is_refused_saying_why(self):
+        self.refused([], "not a JSON object")
+        self.refused({"workdir": "/w"}, "'url'")
+        self.refused(dict(self.MINIMAL, url=""), "'url'")
+        self.refused(dict(self.MINIMAL, op="delete"), "unknown op")
+        self.refused(dict(self.MINIMAL, existing=7), "'existing'")
+        self.refused(dict(self.MINIMAL, clearance="yes"), "'clearance'")
+        clearance = {"flaresolverr": "http://fs", "url": WORK}
+        self.refused(dict(self.MINIMAL, clearance=dict(clearance, timeout_ms=True)), "timeout_ms")
+        self.refused(dict(self.MINIMAL, clearance=dict(clearance, timeout_ms=0)), "timeout_ms")
+        self.refused(dict(self.MINIMAL, clearance={"url": WORK}), "'flaresolverr'")
+
+
+class DefenceTest(unittest.TestCase):
+    def test_a_fetcher_overriding_the_hooked_method_is_found(self):
+        class Base:
+            def do_request(self) -> None: ...
+
+        class Plain(Base): ...
+
+        class Sneaky(Plain):
+            def do_request(self) -> None: ...
+
+        self.assertEqual(w.overriding_fetchers(Base), ["Sneaky"])
+
+    def test_an_ao3_download_the_guard_saw_nothing_of_is_refused(self):
+        with self.assertRaises(w.WorkerError) as caught:
+            w.check_guard_saw_pages(WORK, w.PageLog())
+        self.assertEqual(caught.exception.kind, w.PERMANENT)
+        self.assertIn("Update ffd_worker.py", caught.exception.message)
+        seen = w.PageLog()
+        seen.record(WORK, '<div id="main"></div>')
+        w.check_guard_saw_pages(WORK, seen)
+        w.check_guard_saw_pages("https://test1.com?sid=1", w.PageLog())  # FanFicFare's offline test site
+
+    def test_a_result_that_cannot_be_printed_is_still_one_line_of_json(self):
+        circular: dict[str, object] = {}
+        circular["self"] = circular
+        out = io.StringIO()
+        with mock.patch.object(w.sys, "__stdout__", out):
+            w.emit({"status": "ok", "metadata": circular})
+        answer = json.loads(out.getvalue().strip().splitlines()[-1])
+        self.assertEqual((answer["status"], answer["kind"]), ("error", w.TRANSIENT))
+
+    def test_an_unreadable_epub_has_no_title(self):
+        with tempfile.NamedTemporaryFile(suffix=".epub") as handle:
+            handle.write(b"not a zip")
+            handle.flush()
+            self.assertIsNone(w.epub_title(handle.name))
+
+
+@unittest.skipUnless(HAS_FANFICFARE, "needs FanFicFare (the pinned venv)")
+class FanFicFareContractTest(unittest.TestCase):
+    """What the worker assumes about the pinned FanFicFare: fails on the update that breaks it."""
+
+    def test_no_fetcher_slips_past_the_page_guard(self):
+        from fanficfare.fetchers import base_fetcher, fetcher_flaresolverr_proxy, fetcher_requests  # noqa: F401
+
+        self.assertEqual(w.overriding_fetchers(base_fetcher.Fetcher), [])
+
+    def test_installing_the_hooks_twice_hooks_once(self):
+        from fanficfare import adapters
+        from fanficfare.fetchers import base_fetcher
+
+        w.install_page_guard()
+        guard = base_fetcher.Fetcher.do_request
+        w.install_page_guard()
+        self.assertIs(base_fetcher.Fetcher.do_request, guard)
+        w.AdapterCapture().install()
+        unhooked = getattr(adapters.getAdapter, w.HOOK_MARK)
+        w.AdapterCapture().install()
+        self.assertIs(getattr(adapters.getAdapter, w.HOOK_MARK), unhooked, "never a hook around a hook")
 
 
 @unittest.skipUnless(HAS_FANFICFARE, "needs FanFicFare (the pinned venv)")
