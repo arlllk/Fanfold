@@ -29,6 +29,10 @@ venv:
 test-postgres:
     scripts/with-postgres.sh cargo test -p fanfold-adapter-postgres -- --ignored
 
+# The Python worker, type-checked against the pinned FanFicFare it hooks into (needs `just venv`).
+lint-python:
+    {{parent_directory(ffd_python)}}/pyrefly check --config crates/adapters/fanficfare/worker/pyrefly.toml --python-interpreter-path {{ffd_python}}
+
 # The real Python worker: its own unit tests, then through FanFicFare against its offline
 # test site and a fake FlareSolverr (no network).
 test-worker:
@@ -70,7 +74,7 @@ fuzz-all seconds="30":
 
 # --- everything -------------------------------------------------------------------
 
-ci: fmt-check lint test integration
+ci: fmt-check lint lint-python test integration
 
 fmt-check:
     cargo fmt --all -- --check

@@ -1,0 +1,8 @@
+# Pyrefly type-checks the worker against the FanFicFare in python/uv.lock (`just lint-python`,
+# and CI). The worker hooks FanFicFare's classes and calls its functions; FanFicFare ships no
+# type hints, but Pyrefly reads its source, so an update that renames, removes or reshapes
+# anything the worker uses fails here instead of in a download. The interpreter (the venv with
+# that FanFicFare) is passed on the command line: FFD_PYTHON, like the worker tests.
+project-includes = ["*.py"]
+python-version = "3.13" # the image's (Debian's, in the distroless base)
+preset = "default"

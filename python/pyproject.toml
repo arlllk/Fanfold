@@ -13,5 +13,11 @@ dependencies = [
   "fanficfare==4.63.0",
 ]
 
+# Development only: `uv sync` installs it for the tests and CI; the image's `--no-dev` does not.
+[dependency-groups]
+dev = [
+  "pyrefly==1.5.0", # type-checks the worker against FanFicFare (crates/adapters/fanficfare/worker)
+]
+
 [tool.uv]
 package = false
