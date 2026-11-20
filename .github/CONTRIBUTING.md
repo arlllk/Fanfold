@@ -78,15 +78,21 @@ FanFicFare, the only Python dependency, is declared in `python/pyproject.toml` a
 `python/uv.lock`. The image, CI and `just venv` all install exactly that lock with
 `uv sync --locked`. After changing `pyproject.toml`, run `uv lock --project python`.
 
-The image runs Debian's Python (3.13, from the distroless base), and CI's integration tests use
-the same minor version.
+The image runs Python 3.15 from its base, a Docker Hardened Image (`dhi.io/python`, Debian 13),
+and CI's integration tests, `just venv` and Pyrefly use the same minor version. Building the
+image needs `docker login dhi.io` (a free Docker account); CI logs in with the repository
+secrets `DHI_USERNAME` and `DHI_TOKEN`, so pull requests from forks cannot build the image.
 
 ## Security: SBOMs, attestations, vulnerability scans
 
-The image is distroless: no shell, no package manager. Everything in it is visible to
-scanners: the Debian packages, the Python venv, and the Rust crates (built with
+The image has no shell and no package manager. Everything in it is visible to
+scanners: the Debian packages (CPython included), the Python venv, and the Rust crates (built with
 `cargo auditable`, which embeds the dependency list in the binary).
 
+- **Docker's VEX statements** for the hardened base image are applied to every scan
+  (`scripts/dhi_vex.py`): Docker publishes, for each CVE a scanner finds in the base image's
+  packages, whether the image is affected; the ones it is not are not reported. Each release
+  carries the document it was scanned with (`fanfold-X.Y.Z.openvex.json`).
 - **Every build** (PRs included) is scanned with Grype. CI fails on a critical vulnerability that
   already has a fix; everything else is listed in the log.
 - **Every release** has SBOMs, SPDX and CycloneDX, attached to its GitHub release, for your own

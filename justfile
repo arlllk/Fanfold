@@ -23,7 +23,7 @@ test:
 # A venv with exactly the FanFicFare the image ships (python/uv.lock), for the integration
 # tests. Needs uv. Re-run after the lock changes.
 venv:
-    UV_PROJECT_ENVIRONMENT={{justfile_directory()}}/.venv uv sync --project python --locked --no-build
+    UV_PROJECT_ENVIRONMENT={{justfile_directory()}}/.venv uv sync --project python --locked --no-build --python 3.15
 
 # The shared port contracts, run against a real PostgreSQL.
 test-postgres:
@@ -32,11 +32,13 @@ test-postgres:
 # The Python worker, type-checked against the pinned FanFicFare it hooks into (needs `just venv`).
 lint-python:
     {{parent_directory(ffd_python)}}/pyrefly check --config crates/adapters/fanficfare/worker/pyrefly.toml --python-interpreter-path {{ffd_python}}
+    {{parent_directory(ffd_python)}}/pyrefly check --config scripts/pyrefly.toml --python-interpreter-path {{ffd_python}}
 
 # The real Python worker: its own unit tests, then through FanFicFare against its offline
 # test site and a fake FlareSolverr (no network).
 test-worker:
     {{ffd_python}} -I -B -m unittest discover -s crates/adapters/fanficfare/worker
+    {{ffd_python}} -I -B -m unittest discover -s scripts
     FFD_PYTHON={{ffd_python}} cargo test -p fanfold-adapter-fanficfare -- --ignored
 
 # Config -> secrets -> PostgreSQL + filesystem + FanFicFare -> worker.

@@ -13,6 +13,14 @@
     "custom.regex"
   ],
   "automergeStrategy": "merge-commit",
+  "hostRules": [
+    {
+      "description": "dhi.io (Docker Hardened Images, the runtime base) serves only a logged-in Docker account. The two secrets are Renovate's own, set in the Mend developer portal for this repository (not the GitHub Actions secrets of the same names).",
+      "matchHost": "dhi.io",
+      "username": "{{ secrets.DHI_USERNAME }}",
+      "password": "{{ secrets.DHI_TOKEN }}"
+    }
+  ],
   "lockFileMaintenance": {
     "enabled": true,
     "automerge": true,
@@ -41,6 +49,16 @@
         "image=(?<depName>moby/buildkit):(?<currentValue>v[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
       ],
       "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "Tool versions in workflows, marked with a `# renovate: datasource=... depName=...` comment on the line above a `version:` input (uv, for setup-uv in ci.yml).",
+      "managerFilePatterns": [
+        "/(^|/)\\.github/workflows/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+)\\s*\\n\\s*version:\\s*\"?(?<currentValue>[^\\s\"]+)\"?"
+      ]
     }
   ],
   "packageRules": [
@@ -59,7 +77,14 @@
       "groupName": "GitHub Actions"
     },
     {
-      "description": "A new runner OS can break the build in ways CI only half covers: propose it on the dependency dashboard and wait for approval. (The runtime base, distroless python3-debian13, only ever gets digest updates, which automerge; its next Debian release is a new image name, changed by hand.)",
+      "description": "uv is pinned twice, the image's (Dockerfile, uv stage) and CI's (setup-uv in ci.yml): one PR moves both, so CI's venv is built by the uv the image is.",
+      "matchDepNames": [
+        "ghcr.io/astral-sh/uv"
+      ],
+      "groupName": "uv"
+    },
+    {
+      "description": "A new runner OS can break the build in ways CI only half covers: propose it on the dependency dashboard and wait for approval. (The runtime base, dhi.io/python X.Y.Z-debian13, gets version and digest updates like any image; a new Debian release is a new tag suffix, changed by hand, as is a new Python minor version, which ci.yml, the justfile and pyrefly.toml must follow.)",
       "matchDatasources": [
         "github-runners"
       ],

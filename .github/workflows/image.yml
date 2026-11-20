@@ -19,6 +19,11 @@ name: image
 
 on:
   workflow_call:
+    secrets:
+      DHI_USERNAME:
+        required: true
+      DHI_TOKEN:
+        required: true
     inputs:
       version:
         description: "Release version without the leading v (e.g. 1.4.2). Empty: build and test only."
@@ -78,6 +83,26 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver-opts: image=moby/buildkit:v0.35.1@sha256:baf6138eb8c37644800c7c913fba051e840ebb9ba13eaf92d92ef9a1712d0b4c
+
+      # The runtime base is a Docker Hardened Image, which dhi.io serves only to a logged-in
+      # Docker account (a read-only access token). Forks get no secrets, so their image build
+      # stops here, with this message instead of a pull error.
+      - name: Check dhi.io credentials
+        env:
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+        run: |
+          if [ -z "$DHI_USERNAME" ] || [ -z "$DHI_TOKEN" ]; then
+            echo "::error::no dhi.io credentials (DHI_USERNAME, DHI_TOKEN): the base image cannot be pulled. Pull requests from forks cannot build the image."
+            exit 1
+          fi
+
+      - name: Log in to dhi.io
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: dhi.io
+          username: ${{ secrets.DHI_USERNAME }}
+          password: ${{ secrets.DHI_TOKEN }}
 
       # Registry names must be lowercase, and the repository is `arlllk/Fanfold`.
       # Reproducible builds: every timestamp in the image is the commit's (buildx passes
@@ -161,7 +186,7 @@ jobs:
             -I -c "import fanficfare; print('FanFicFare', fanficfare.__file__)"
           echo "::endgroup::"
 
-          # The image is distroless (no shell), so the probe is the image's own Python.
+          # The image has no shell, so the probe is the image's own Python.
           echo "::group::read-only root, writable mounts, not root, and no shell anywhere"
           docker run --rm "${hardened[@]}" --entrypoint /opt/venv/bin/python fanfold:ci -I -c '
           import os
@@ -186,7 +211,15 @@ jobs:
             --read-only --cap-drop ALL fanfold:ci check-config
           echo "::endgroup::"
 
-      # Vulnerabilities in everything the image contains: Debian packages (distroless records
+      # Docker's own VEX statements for the DHI base (scripts/dhi_vex.py): the findings Docker
+      # determined do not affect it are not reported, here or in the Security tab.
+      - name: VEX for the base image
+        env:
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+        run: python3 -I -B scripts/dhi_vex.py --dockerfile Dockerfile --output "$RUNNER_TEMP/fanfold.openvex.json"
+
+      # Vulnerabilities in everything the image contains: Debian packages (the base records
       # them), the Python venv, and the Rust crates (embedded by cargo-auditable). Fails only on
       # a critical one that already has a fix, i.e. one that a dependency update would remove;
       # the full list is in the log. (Releases also get a full scan in the Security tab, see
@@ -195,6 +228,7 @@ jobs:
         uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           image: fanfold:ci
+          vex: ${{ runner.temp }}/fanfold.openvex.json
           fail-build: true
           severity-cutoff: critical
           only-fixed: true

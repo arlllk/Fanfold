@@ -4,5 +4,5 @@
 # anything the worker uses fails here instead of in a download. The interpreter (the venv with
 # that FanFicFare) is passed on the command line: FFD_PYTHON, like the worker tests.
 project-includes = ["*.py"]
-python-version = "3.13" # the image's (Debian's, in the distroless base)
+python-version = "3.15" # the image's (see the Dockerfile's python-base)
 preset = "default"

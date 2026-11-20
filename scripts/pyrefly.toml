@@ -1,0 +1,5 @@
+# Pyrefly for the repository's helper scripts (`just lint-python`, and CI). Standard library only,
+# so any Python 3.13+ runs them: GitHub's runners, the venv, the image's.
+project-includes = ["*.py"]
+python-version = "3.13"
+preset = "default"

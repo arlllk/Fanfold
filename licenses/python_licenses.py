@@ -192,7 +192,7 @@ def main():
             out += [f"--- {name} ---", text, ""]
         out.append("")
     notice = "\n".join(out).rstrip("\n") + "\n"
-    # `--output FILE` writes the notice there (the distroless image build has no shell to
+    # `--output FILE` writes the notice there (the image build has no shell to
     # redirect stdout); otherwise it goes to stdout.
     if len(sys.argv) == 3 and sys.argv[1] == "--output":
         target = PurePosixPath(sys.argv[2])
