@@ -29,9 +29,10 @@
 # and Python package in it, in /usr/share/doc/fanfold. The build fails if a dependency has a
 # licence that is not on the allowlists in licenses/ (copyleft needs to be allowed by name).
 #
-# HARDENING. The runtime is distroless: the binary, Python and the venv, the libraries they link,
-# CA certificates and tzdata. No shell, no package manager, no coreutils, so there is nothing to
-# `exec` into and much less to patch (use an ephemeral debug container to look inside). The image
+# HARDENING. The runtime is a Docker Hardened Image: the binary, Python and the venv, the
+# libraries they link, CA certificates and tzdata. No shell, no package manager, no coreutils, so
+# there is nothing to `exec` into and much less to patch (look inside with an ephemeral debug
+# container: `kubectl debug`, or `docker debug` locally). The image
 # runs as a non-root user, needs no capabilities, and works with a
 # read-only root filesystem: the only places the service writes are /library, /tmp/fanfold and
 # /run/fanfold, and each can be a volume or an empty tmpfs. It also runs under rootless
@@ -43,12 +44,20 @@
 #     -v library:/library -v ./config.toml:/etc/fanfold/config.toml:ro fanfold
 
 # ------------------------------------------------------------------------ python base
-# Distroless: Debian's Python 3.13 and the shared libraries it needs, and nothing else (no shell,
-# no package manager, no coreutils). Every Debian package in it is recorded in
-# /var/lib/dpkg/status.d, so vulnerability scanners see all of it. One definition, shared by the
-# venv and the runtime stage: the venv's interpreter is a link into this image, so the two must be
-# the very same image. (It also has what the fanfold binary links: libc, libm, libgcc_s.)
-FROM gcr.io/distroless/python3-debian13:latest@sha256:60faad2efce94a847f32e2adbcaefeb2e4fd3e3a78075a3abb600904a5e010e9 AS python-base
+# Docker Hardened Image (dhi.io, needs `docker login dhi.io`; CI logs in with the DHI_USERNAME and
+# DHI_TOKEN secrets): Python 3.15 on Debian 13 and the shared libraries it needs, no shell, no
+# package manager, no coreutils. (It does carry pip, setuptools and wheel for the system Python;
+# the venv has none, and the root filesystem is read-only, so nothing installs at run time.)
+# Every package in it, CPython included, is recorded in /var/lib/dpkg/status.d, so vulnerability
+# scanners and the release SBOM see all of it; Docker's own SBOM is in /opt/docker/sbom.
+# Python lives in /usr (/usr/bin/python3): images from before DHI moved it out of /opt would
+# break the venv, whose interpreter is a link to it. For the same reason this one definition is
+# shared by the venv and the runtime stage: they must be the very same image. (No `-dev` build
+# image is needed: uv is copied in and every RUN is exec form.) It also has what the fanfold
+# binary links: glibc (Debian's, as the build stage), libm, libgcc_s. Keep the Python minor
+# version in step with ci.yml (uv sync --python), the justfile (venv) and
+# crates/adapters/fanficfare/worker/pyrefly.toml.
+FROM dhi.io/python:3.15.2-debian13@sha256:c64f425f437fc8aa493db6df6f1696ecf332ce6fb4c3bf91b56056fd2473061b AS python-base
 
 # ----------------------------------------------------------------------------- chef
 FROM rust:1.100.0-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS chef
@@ -128,6 +137,8 @@ FROM ghcr.io/astral-sh/uv:0.13.9@sha256:d3b601f0c7b118bc1753febf7c41cc80981df678
 # The base image has no shell, so every RUN below is in exec form (a JSON list), and the
 # little filesystem work there is is done by its Python.
 FROM python-base AS venv
+# The base runs as its nonroot user (65532); building the venv in /opt needs root.
+USER 0
 # Reproducible bytecode: with SOURCE_DATE_EPOCH set, Python writes hash-checked .pyc files
 # instead of ones stamped with the source file's mtime.
 ARG SOURCE_DATE_EPOCH
@@ -153,6 +164,8 @@ RUN ["/opt/venv/bin/python", "-I", "-B", "/licenses/python_licenses.py", \
 
 # --------------------------------------------------------------------------- runtime
 FROM python-base AS runtime
+# Root only for the RUN below (the base runs as 65532); the service runs as APP_UID (USER below).
+USER 0
 
 # Who the service runs as. Any other uid works too, with `--user UID:GID` (or runAsUser):
 # the writable directories below are group-writable for exactly that reason, so pass the

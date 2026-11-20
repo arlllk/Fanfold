@@ -138,6 +138,9 @@ jobs:
       contents: read
       packages: write
     uses: ./.github/workflows/image.yml
+    secrets:
+      DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+      DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
     with:
       version: ${{ needs.tag.outputs.version }}
 
@@ -170,6 +173,12 @@ jobs:
     steps:
       - name: Image name
         run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      # The released commit: its Dockerfile names the base image whose VEX the scan uses.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/v${{ env.VERSION }}
+          persist-credentials: false
 
       - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
@@ -213,11 +222,23 @@ jobs:
           sbom-path: fanfold-${{ env.VERSION }}.spdx.json
           push-to-registry: true
 
+      # Docker's VEX statements for the DHI base (scripts/dhi_vex.py), so what Docker found does
+      # not affect it stays out of the Security tab. Attached to the release as well: it is
+      # what explains every finding a scan of the SBOM reports that the Security tab does not.
+      - name: VEX for the base image
+        env:
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+        run: |
+          python3 -I -B scripts/dhi_vex.py --dockerfile Dockerfile --output "fanfold-$VERSION.openvex.json"
+          gh release upload "v$VERSION" "fanfold-$VERSION.openvex.json" --clobber
+
       - name: Vulnerability scan
         id: scan
         uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           sbom: fanfold-${{ env.VERSION }}.spdx.json
+          vex: fanfold-${{ env.VERSION }}.openvex.json
           fail-build: false
           output-format: sarif
 
