@@ -388,7 +388,7 @@ async fn main() {
     .await;
     for (minutes, error) in [
         (9, "HTTP Error 525 from archiveofourown.org"),
-        (4, "Cloudflare error code: 525 (through FlareSolverr)"),
+        (4, "Cloudflare error code: 525"),
     ] {
         let at = ago(minutes);
         log(&repo, flaky, at, LogLevel::Info, "starting attempt 1").await;

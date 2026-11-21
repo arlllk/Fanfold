@@ -165,8 +165,8 @@ jobs:
           path = "/library"
           [downloader]
           python = "/opt/venv/bin/python"
-          [downloader.flaresolverr]
-          url = "http://flaresolverr:8191"
+          [downloader.browser]
+          url = "http://fanfold-browser:8191"
           TOML
 
           hardened=(--read-only --cap-drop ALL --security-opt no-new-privileges
