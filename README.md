@@ -258,8 +258,8 @@ back-off) can still get through the other. The job log says which way each try w
    covers public works. In testing, full downloads took 15-30 seconds. If FlareSolverr is down,
    jobs wait and retry without using up their attempts, and finish once it is back.
 2. **Directly, without FlareSolverr** (even tries): plain requests, the way FanFicFare fetches on
-   its own, with the stored login cookie, logging in with the `[ao3]` credentials only if AO3
-   asks for it.
+   its own and as AutomatedFanfic does: no stored cookies, and a fresh login with the `[ao3]`
+   credentials on every run when you set them (anonymous otherwise).
 3. **Only if AO3 says the work needs a login**, a **login fallback** runs. AO3 rejects a login
    form submitted *through* FlareSolverr (it answers "Auth Error"), so FlareSolverr is used
    only to pass Cloudflare. Fanfold then fetches over plain HTTP carrying that clearance, using

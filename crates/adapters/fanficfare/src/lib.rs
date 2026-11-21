@@ -53,6 +53,9 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct LoginFallback {
     /// FanFicFare settings for the fallback: plain requests, with the login if there is one.
     pub personal_ini: PathBuf,
+    /// FanFicFare settings for the tries that skip `FlareSolverr`: plain requests, logging in
+    /// on every run when there is a login (`always_login`).
+    pub direct_ini: PathBuf,
     /// Origin of the `FlareSolverr` server.
     pub flaresolverr: url::Url,
     /// How long `FlareSolverr` may take to pass Cloudflare.
@@ -113,20 +116,15 @@ enum Attempt {
     /// anonymously, so no cookies are sent along (they would mix with its own browser's);
     /// otherwise it is plain requests with the stored session.
     First,
-    /// With a login fallback configured, every other try skips `FlareSolverr` altogether:
-    /// plain requests, as `AutomatedFanfic` fetches, with the stored login cookie (none of
-    /// Cloudflare's: those belong to `FlareSolverr`'s browser) and FanFicFare's own
-    /// `User-Agent`, logging in with the account when AO3 asks. AO3's bot filter and
-    /// Cloudflare judge the two routes apart, so when one is refused the next try may pass.
+    /// With a login fallback configured, every other try skips `FlareSolverr` altogether and
+    /// fetches exactly as `AutomatedFanfic` does: plain requests, FanFicFare's own
+    /// `User-Agent`, no stored cookies, and a fresh login on every run when there are
+    /// credentials ([`LoginFallback::direct_ini`]). AO3 refuses a session it has flagged
+    /// (seen: the long-lived stored one refused for hours while a fresh login from the same
+    /// address passed), so this route shares nothing with the others.
     Direct,
     /// The login fallback: Cloudflare passed by `FlareSolverr`, then plain requests.
     Fallback,
-}
-
-/// Cookies Cloudflare sets for the browser that passed its check. Sent from anywhere else
-/// they do not help, and may mark the request as a replay.
-fn is_cloudflare_cookie(name: &str) -> bool {
-    name == "cf_clearance" || name.starts_with("__cf") || name == "_cfuvid"
 }
 
 /// Cookie values shorter than this are not scrubbed from logs: a value like `true`
@@ -201,7 +199,9 @@ impl FanFicFareDownloader {
     /// never fails the download: it just runs without the session, as before.
     async fn prepare_session(&self, workdir: &Path, attempt: Attempt) -> Option<PreparedSession> {
         let support = self.session.as_ref()?;
-        if attempt == Attempt::First && self.config.login_fallback.is_some() {
+        // With a fallback configured, only the fallback carries the stored session: the other
+        // routes start every run with no cookies at all.
+        if attempt != Attempt::Fallback && self.config.login_fallback.is_some() {
             return None;
         }
         let stored = match support.store.load().await {
@@ -214,19 +214,9 @@ impl FanFicFareDownloader {
                 None
             }
         };
-        let now = support.clock.now();
         let text = match &stored {
-            Some(session) if attempt == Attempt::Direct => {
-                let cookies: Vec<_> = session
-                    .live_cookies(now)
-                    .into_iter()
-                    .filter(|c| !is_cloudflare_cookie(&c.name))
-                    .collect();
-                to_netscape(&cookies)
-            }
-            Some(session) => to_netscape(&session.live_cookies(now)),
-            // Start from nothing, so a login FanFicFare does is kept for next time.
-            None if attempt != Attempt::First => to_netscape(&[]),
+            Some(session) => to_netscape(&session.live_cookies(support.clock.now())),
+            None if attempt == Attempt::Fallback => to_netscape(&[]),
             None => return None,
         };
         let cookies_file = workdir.join("cookies.txt");
@@ -500,8 +490,9 @@ impl FanFicFareDownloader {
             .map(|p| p.to_string_lossy().into_owned());
         let fallback = self.config.login_fallback.as_ref();
         let ini_path = match (attempt, fallback) {
+            (Attempt::Direct, Some(fallback)) => Some(&fallback.direct_ini),
             // Plain requests, logging in only when a page asks for it.
-            (Attempt::Direct | Attempt::Fallback, Some(fallback)) => Some(&fallback.personal_ini),
+            (Attempt::Fallback, Some(fallback)) => Some(&fallback.personal_ini),
             _ => self.config.personal_ini.as_ref(),
         };
         let ini_str = ini_path.map(|p| p.to_string_lossy().into_owned());
@@ -1040,6 +1031,7 @@ mod tests {
 
     const FIRST_INI: &str = "/run/fanfold/personal.ini";
     const LOGIN_INI: &str = "/run/fanfold/personal-login.ini";
+    const DIRECT_INI: &str = "/run/fanfold/personal-direct.ini";
 
     /// Plays the worker for the two tries of a download and records what it was asked.
     struct TwoTryRunner {
@@ -1097,6 +1089,7 @@ mod tests {
                 redactions: vec![],
                 login_fallback: Some(LoginFallback {
                     personal_ini: PathBuf::from(LOGIN_INI),
+                    direct_ini: PathBuf::from(DIRECT_INI),
                     flaresolverr: "http://flaresolverr:8191".parse().unwrap(),
                     flaresolverr_timeout: Duration::from_secs(45),
                 }),
@@ -1246,6 +1239,7 @@ mod tests {
                 redactions: vec![],
                 login_fallback: Some(LoginFallback {
                     personal_ini: PathBuf::from(LOGIN_INI),
+                    direct_ini: PathBuf::from(DIRECT_INI),
                     flaresolverr: "http://flaresolverr:8191".parse().unwrap(),
                     flaresolverr_timeout: Duration::from_secs(45),
                 }),
@@ -1293,21 +1287,21 @@ mod tests {
             let req = runner.request.lock().unwrap().clone().unwrap();
             assert_eq!(req["clearance"], serde_json::Value::Null, "try {tries}");
             assert_eq!(req["user_agent"], serde_json::Value::Null, "try {tries}");
+            assert_eq!(
+                req["cookies"],
+                serde_json::Value::Null,
+                "try {tries}: only the login fallback carries the stored session"
+            );
             if tries % 2 == 0 {
                 assert_eq!(req["personal_ini"], FIRST_INI, "try {tries}");
-                assert_eq!(req["cookies"], serde_json::Value::Null);
                 assert!(
                     err.log
                         .contains("through FlareSolverr; the next try goes directly")
                 );
             } else {
-                assert_eq!(req["personal_ini"], LOGIN_INI, "try {tries}: can log in");
-                let (file, _) = runner.seen.lock().unwrap().clone().unwrap();
-                assert!(file.contains("login-token-0123456789"), "{file}");
-                assert!(file.contains("view_adult"), "{file}");
-                assert!(
-                    !file.contains("cf_clearance") && !file.contains("__cf_bm"),
-                    "Cloudflare's cookies belong to FlareSolverr's browser: {file}"
+                assert_eq!(
+                    req["personal_ini"], DIRECT_INI,
+                    "try {tries}: logs in afresh, as AutomatedFanfic does"
                 );
                 assert!(
                     err.log
@@ -1322,10 +1316,10 @@ mod tests {
                 err.log
             );
         }
-        let kept = store.load().await.unwrap().unwrap();
-        assert!(
-            kept.cookies.iter().any(|c| c.name == "cf_clearance"),
-            "a direct try leaves the stored clearance alone"
+        assert_eq!(
+            store.load().await.unwrap(),
+            Some(session),
+            "the stored session is left alone"
         );
     }
 
@@ -1853,7 +1847,8 @@ mod tests {
                 url_template: "http://test1.com?sid={id}".into(),
                 redactions: vec![],
                 login_fallback: Some(LoginFallback {
-                    personal_ini: login_ini,
+                    personal_ini: login_ini.clone(),
+                    direct_ini: login_ini,
                     flaresolverr: format!("http://127.0.0.1:{port}").parse().unwrap(),
                     flaresolverr_timeout: Duration::from_secs(10),
                 }),
