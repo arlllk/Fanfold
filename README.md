@@ -119,8 +119,8 @@ password = { file = "/run/secrets/x" } # a file (a trailing newline is ignored)
 | `[database]` | `host`, `port` (5432), `name`, `user`, `password`, `ssl_mode` (`require`), `max_connections` (5) | PostgreSQL connection. Use a session-level connection: a pooler in transaction mode breaks live updates. |
 | `[library]` | `path`, `scratch` (`/tmp/fanfold`) | `path` is the folder of finished books; `scratch` is temporary per-download space. |
 | `[ao3]` | `username`, `password` | Your AO3 login. Required unless you use FlareSolverr; with FlareSolverr it is optional and only used for works that need a login. |
-| `[downloader]` | `python`, `timeout` (`10m`), `personal_ini` | The Python with FanFicFare installed, the longest one download may take, and where the generated FanFicFare settings are written. |
-| `[downloader.flaresolverr]` | `url`, `timeout` (`60s`) | Optional. Fetch through FlareSolverr. See [Getting past Cloudflare](#getting-past-cloudflare). |
+| `[downloader]` | `python`, `timeout` (`10m`), `personal_ini`, `proxy` | The Python with FanFicFare installed, the longest one download may take, where the generated FanFicFare settings are written, and optionally an HTTP proxy for every request that does not go through FlareSolverr. See [Fetching from another network](#fetching-from-another-network). |
+| `[downloader.flaresolverr]` | `url`, `timeout` (`60s`), `sessions` (`true`) | Optional. Fetch through FlareSolverr, or a server with its API such as Byparr (then `sessions = false`). See [Getting past Cloudflare](#getting-past-cloudflare). |
 | `[retry]` | `max_attempts` (5), `base` (`1m`), `cap` (`1h`) | A failing job is retried with a doubling delay (with `1m`/`1h`: 1, 2, 4, 8... minutes, then hourly), AO3 outages and rate limits included, so a struggling AO3 is asked ever more rarely. Only failures that are the work's own fault use up attempts; AO3 being down does not. |
 | `[breaker]` | `failure_threshold` (3), `open_for` (`2m`), `max_open_for` (`1h`) | After this many site-wide failures in a row, Fanfold pauses downloads and probes now and then. |
 | `[worker]` | `poll_interval` (`5s`), `concurrency` (1) | Keep concurrency at 1: AO3 rate-limits. |
@@ -231,6 +231,23 @@ There are two setups.
 Fanfold logs in with the `[ao3]` username and password and fetches everything directly, so
 restricted works are available. Fine when Cloudflare lets your network through.
 
+### Fetching from another network
+
+If AO3 refuses requests from the network Fanfold runs on, its traffic can leave from another
+one, such as a home connection: run an HTTP proxy there
+(or one that tunnels to it) and set:
+
+```toml
+[downloader]
+proxy = "http://home-proxy:8080"   # an HTTP proxy (CONNECT for HTTPS); no credentials
+```
+
+Every request FanFicFare makes over plain HTTP then goes through it: all downloads without
+FlareSolverr, and with FlareSolverr the direct tries and the login fallback. FlareSolverr's own
+browser is not affected: point it at the same proxy in its own settings (Byparr:
+`PROXY_SERVER`), so that the Cloudflare clearance it earns for the login fallback is used from
+the same address.
+
 ### FlareSolverr (recommended when plain requests fail)
 
 [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) is a separate service that drives a
@@ -249,10 +266,14 @@ url = "http://flaresolverr:8191"    # the origin only
 timeout = "60s"                     # per request; must be below downloader.timeout
 ```
 
+[Byparr](https://github.com/ThePhaseless/Byparr) speaks the same API with a Firefox-based
+browser. It has no sessions, so add `sessions = false` for it. It only fetches pages (no form
+posts), which is all the FlareSolverr tries need.
+
 Each try of a download goes one of two ways, taking turns: the first try, the third, and so
-on go through FlareSolverr; the second, the fourth, and so on fetch directly. AO3's bot filter
-and Cloudflare judge the two apart, so when one is being refused, the next try (after the
-back-off) can still get through the other. The job log says which way each try went.
+on go through FlareSolverr; the second, the fourth, and so on fetch directly. When one route
+is being refused, the next try (after the back-off) uses the other. The job log says which way
+each try went.
 
 1. **Anonymously, through FlareSolverr** (odd tries). This is usually the better route, and it
    covers public works. In testing, full downloads took 15-30 seconds. If FlareSolverr is down,

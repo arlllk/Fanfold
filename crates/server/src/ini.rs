@@ -39,6 +39,8 @@ fn check(name: &'static str, value: &str) -> Result<String, IniError> {
 pub struct FlareSolverr<'a> {
     pub url: &'a url::Url,
     pub timeout: std::time::Duration,
+    /// Keep one browser for all the requests of a download. Byparr has no sessions.
+    pub sessions: bool,
 }
 
 /// How much longer FanFicFare waits for `FlareSolverr` than `FlareSolverr` waits for a page.
@@ -62,8 +64,9 @@ fn flaresolverr_section(fs: &FlareSolverr<'_>) -> Result<String, IniError> {
     // instead of FlareSolverr's real answer (FanFicFare's docs say the same).
     let wait = fs.timeout.as_secs() + FLARESOLVERR_MARGIN_S;
     // A session keeps one browser (and its cookies) across the requests of a download.
+    let sessions = fs.sessions;
     Ok(format!(
-        "[defaults]\nuse_flaresolverr_proxy:true\nuse_flaresolverr_session:true\n\
+        "[defaults]\nuse_flaresolverr_proxy:true\nuse_flaresolverr_session:{sessions}\n\
          flaresolverr_proxy_protocol:{}\nflaresolverr_proxy_address:{host}\n\
          flaresolverr_proxy_port:{port}\nflaresolverr_proxy_timeout:{millis}\n\
          connect_timeout:{wait}\n\n",
@@ -118,6 +121,22 @@ pub fn render_login_fallback_ini(
     }
     ini.push_str("max_request_retries:3\n");
     Ok(SecretString::from(ini))
+}
+
+/// Add an HTTP proxy to the end of a rendered ini (its `[archiveofourown.org]` section), for
+/// FanFicFare's plain requests.
+///
+/// Never for an ini that fetches through `FlareSolverr`: FanFicFare would send its calls to
+/// `FlareSolverr` itself through the proxy too.
+pub fn with_proxy(ini: SecretString, proxy: Option<&url::Url>) -> Result<SecretString, IniError> {
+    let Some(proxy) = proxy else {
+        return Ok(ini);
+    };
+    let proxy = check("downloader.proxy", proxy.as_str().trim_end_matches('/'))?;
+    Ok(SecretString::from(format!(
+        "{}http_proxy:{proxy}\nhttps_proxy:{proxy}\n",
+        ini.expose_secret()
+    )))
 }
 
 /// Write `content` readable by the owner only, replacing any previous file.
@@ -229,6 +248,7 @@ mod tests {
         let fs = FlareSolverr {
             url: &url,
             timeout: std::time::Duration::from_secs(secs),
+            sessions: true,
         };
         render_personal_ini(None, Some(&fs))
             .unwrap()
@@ -277,6 +297,35 @@ mod tests {
         assert!(with_flaresolverr("http://fs.example.org", 5).contains("port:80\n"));
         assert!(with_flaresolverr("http://127.0.0.1:9000/", 1).contains("timeout:1000\n"));
         assert!(with_flaresolverr("http://[::1]:8191", 1).contains("address:[::1]\n"));
+    }
+
+    #[test]
+    fn byparr_gets_no_session_requests() {
+        let url = fs_url("http://byparr:8191");
+        let fs = FlareSolverr {
+            url: &url,
+            timeout: std::time::Duration::from_secs(60),
+            sessions: false,
+        };
+        let ini = render_personal_ini(None, Some(&fs)).unwrap();
+        assert!(
+            ini.expose_secret()
+                .contains("\nuse_flaresolverr_session:false\n")
+        );
+    }
+
+    #[test]
+    fn a_proxy_is_added_to_the_site_section() {
+        let proxy: url::Url = "http://home-egress.egress:8080".parse().unwrap();
+        let ini = with_proxy(render_personal_ini(None, None).unwrap(), Some(&proxy)).unwrap();
+        assert_eq!(
+            ini.expose_secret(),
+            "[archiveofourown.org]\nis_adult:true\nmax_request_retries:3\n\
+             http_proxy:http://home-egress.egress:8080\n\
+             https_proxy:http://home-egress.egress:8080\n"
+        );
+        let none = with_proxy(render_personal_ini(None, None).unwrap(), None).unwrap();
+        assert!(!none.expose_secret().contains("proxy"));
     }
 
     #[test]
