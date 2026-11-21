@@ -23,9 +23,8 @@ use fanfold_app::{
     admin::JobAdmin,
     ports::{
         BookCatalog, BookRecord, Clock, EnqueueOutcome, JobRepository, LogEntry, LogLevel,
-        SessionStore, SiteStatus, SiteStatusSource,
+        SiteStatus, SiteStatusSource,
     },
-    session::SessionAdmin,
     stats::WorkerStats,
 };
 use fanfold_domain::{
@@ -34,7 +33,7 @@ use fanfold_domain::{
     retry::RetryPolicy,
     work::WorkId,
 };
-use fanfold_testkit::memory::{FakeClock, InMemoryJobs, InMemorySession};
+use fanfold_testkit::memory::{FakeClock, InMemoryJobs};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
@@ -59,7 +58,6 @@ struct Rig {
     stop: tokio::sync::watch::Sender<bool>,
     jobs: Arc<InMemoryJobs>,
     library: Arc<fanfold_testkit::memory::InMemoryLibrary>,
-    session_store: Arc<InMemorySession>,
     clock: Arc<FakeClock>,
     site: Arc<FixedSite>,
     ui: Router,
@@ -70,7 +68,6 @@ fn rig_with_page_size(page_size: u32) -> Rig {
     let jobs = Arc::new(InMemoryJobs::new());
     let clock = Arc::new(FakeClock::at_secs(NOW));
     let site = Arc::new(FixedSite(Mutex::new(SiteStatus::Healthy)));
-    let session_store = Arc::new(InMemorySession::new());
     let library = Arc::new(fanfold_testkit::memory::InMemoryLibrary::new());
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let deps = Arc::new(WebDeps {
@@ -86,12 +83,6 @@ fn rig_with_page_size(page_size: u32) -> Rig {
             jobs.clone(),
             clock.clone(),
         )),
-        session: Arc::new(SessionAdmin::new(
-            session_store.clone(),
-            clock.clone(),
-            "archiveofourown.org",
-            Duration::from_hours(24),
-        )),
         events: jobs.clone(),
         site: site.clone(),
         clock: clock.clone(),
@@ -105,7 +96,6 @@ fn rig_with_page_size(page_size: u32) -> Rig {
     });
     Rig {
         stop,
-        session_store,
         jobs,
         library,
         clock,
@@ -324,7 +314,7 @@ async fn pages_contain_nothing_the_csp_would_block() {
     let job = rig.queue(1).await;
     rig.titled(1, "A Story").await;
     rig.log(job.id, LogLevel::Info, "starting attempt 1").await;
-    for path in ["/", "/jobs", "/session", &format!("/jobs/{}", job.id)] {
+    for path in ["/", "/jobs", &format!("/jobs/{}", job.id)] {
         let body = get(&rig.ui, path).await.body;
         assert!(!body.contains(" style="), "{path}: inline style");
         assert!(
@@ -1507,425 +1497,12 @@ async fn the_job_page_markup_puts_the_facts_beside_the_log() {
     );
 }
 
-// ------------------------------------------------------------- browser session
+// ------------------------------------------------------------------- forms
 
 fn form(fields: &[(&str, &str)]) -> String {
     url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(fields)
         .finish()
-}
-
-const SECRET: &str = "super-secret-cookie-value-0123456789";
-const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:160.0) Gecko/20100101 Firefox/160.0";
-
-fn cookies_txt() -> String {
-    format!(
-        "# Netscape HTTP Cookie File\n\
-         .archiveofourown.org\tTRUE\t/\tTRUE\t{soon}\t__cfwaitingroom\t{SECRET}\n\
-         archiveofourown.org\tFALSE\t/\tFALSE\t{later}\tremember_user_token\t{SECRET}2\n\
-         .archiveofourown.org\tTRUE\t/\tTRUE\t\t_cfuvid\t{SECRET}3\n\
-         .elsewhere.example\tTRUE\t/\tTRUE\t{later}\tunrelated\tx\n",
-        soon = NOW + 600,
-        later = NOW + 90 * 86_400,
-    )
-}
-
-#[tokio::test]
-async fn the_session_page_invites_an_import_when_there_is_none() {
-    let rig = rig();
-    let body = get(&rig.ui, "/session").await.body;
-    assert!(body.contains("No session stored"), "{body}");
-    assert!(body.contains(r#"name="cookies""#) && body.contains(r#"name="user_agent""#));
-    assert!(body.contains("Import"));
-    assert!(
-        !body.contains("Forget the session"),
-        "nothing to forget yet"
-    );
-    assert!(body.contains(r#"aria-current="page">Session"#), "{body}");
-}
-
-#[tokio::test]
-async fn importing_cookies_stores_them_and_shows_expiry_but_never_values() {
-    let rig = rig();
-    let reply = post(
-        &rig.ui,
-        "/session",
-        &form(&[("cookies", &cookies_txt()), ("user_agent", UA)]),
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::SEE_OTHER);
-    assert_eq!(reply.location(), "/session?imported=3");
-
-    let stored = rig.session_store.load().await.unwrap().unwrap();
-    assert_eq!(stored.user_agent, UA);
-    assert_eq!(
-        stored.cookies.len(),
-        3,
-        "the other site's cookie is dropped"
-    );
-
-    let page = get(&rig.ui, "/session?imported=3").await.body;
-    assert!(page.contains("Imported 3 cookies"), "{page}");
-    for name in ["__cfwaitingroom", "remember_user_token", "_cfuvid"] {
-        assert!(page.contains(name), "{name}");
-    }
-    assert!(!page.contains("unrelated"));
-    assert!(page.contains("Expiring soon") && page.contains("Valid") && page.contains("Session"));
-    assert!(page.contains("in 10 min"), "relative expiry: {page}");
-    assert!(page.contains(UA));
-    assert!(
-        !page.contains(SECRET),
-        "a cookie value must never be rendered"
-    );
-    assert!(
-        page.contains("1 expiring soon"),
-        "the warning banner: {page}"
-    );
-    assert!(page.contains("Forget the session"));
-}
-
-#[tokio::test]
-async fn a_har_supplies_the_user_agent_and_merges_with_what_is_stored() {
-    let rig = rig();
-    let har = serde_json::json!({"log": {"entries": [{"request": {
-        "url": "https://archiveofourown.org/works/1",
-        "headers": [{"name": "User-Agent", "value": UA}],
-        "cookies": [{"name": "cf_clearance", "value": SECRET}]},
-        "response": {}}]}})
-    .to_string();
-    let reply = post(&rig.ui, "/session", &form(&[("cookies", &har)])).await;
-    assert_eq!(reply.location(), "/session?imported=1");
-    post(&rig.ui, "/session", &form(&[("cookies", &cookies_txt())])).await;
-
-    let stored = rig.session_store.load().await.unwrap().unwrap();
-    assert_eq!(stored.user_agent, UA);
-    assert_eq!(stored.cookies.len(), 4, "HAR and cookies.txt are combined");
-}
-
-#[tokio::test]
-async fn expired_cookies_raise_a_warning() {
-    let rig = rig();
-    let text = format!(
-        ".archiveofourown.org\tTRUE\t/\tTRUE\t{}\tcf_clearance\tv\n",
-        NOW + 30
-    );
-    post(
-        &rig.ui,
-        "/session",
-        &form(&[("cookies", &text), ("user_agent", UA)]),
-    )
-    .await;
-    rig.clock.advance(Duration::from_secs(60));
-    let page = get(&rig.ui, "/session").await.body;
-    assert!(page.contains("1 expired"), "{page}");
-    assert!(page.contains("Expired"));
-}
-
-#[tokio::test]
-async fn a_bad_import_is_a_clear_problem_and_changes_nothing() {
-    let rig = rig();
-    for (text, expect) in [
-        ("", "nothing to import"),
-        ("{not json", "not a valid HAR"),
-        (
-            ".example.com\tTRUE\t/\tTRUE\t0\ta\tb\n",
-            "no cookies for archiveofourown.org",
-        ),
-        ("one two three", "not a cookies.txt entry"),
-    ] {
-        let reply = post(
-            &rig.ui,
-            "/session",
-            &form(&[("cookies", text), ("user_agent", UA)]),
-        )
-        .await;
-        assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY, "{text:?}");
-        assert!(reply.body.contains(expect), "{text:?}: {}", reply.body);
-    }
-    // A cookies file with no User-Agent anywhere says what to do.
-    let reply = post(&rig.ui, "/session", &form(&[("cookies", &cookies_txt())])).await;
-    assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert!(reply.body.contains("User-Agent"), "{}", reply.body);
-    assert_eq!(rig.session_store.load().await.unwrap(), None);
-
-    let json = send(
-        &rig.ui,
-        Method::POST,
-        "/session",
-        &[
-            ("content-type", "application/x-www-form-urlencoded"),
-            ("sec-fetch-site", "same-origin"),
-        ],
-        &form(&[("cookies", "")]),
-    )
-    .await;
-    assert_eq!(json.status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert!(
-        json.body.contains("urn:fanfold:problem:invalid-session"),
-        "{}",
-        json.body
-    );
-}
-
-#[tokio::test]
-async fn forgetting_the_session_clears_it() {
-    let rig = rig();
-    post(
-        &rig.ui,
-        "/session",
-        &form(&[("cookies", &cookies_txt()), ("user_agent", UA)]),
-    )
-    .await;
-    let reply = post(&rig.ui, "/session/clear", "").await;
-    assert_eq!(
-        (reply.status, reply.location()),
-        (StatusCode::SEE_OTHER, "/session?cleared=1")
-    );
-    assert_eq!(rig.session_store.load().await.unwrap(), None);
-    assert!(
-        get(&rig.ui, "/session?cleared=1")
-            .await
-            .body
-            .contains("forgotten")
-    );
-}
-
-#[tokio::test]
-async fn pasting_a_large_file_works_here_but_not_on_the_other_forms() {
-    let rig = rig();
-    let mut text = cookies_txt();
-    text.push_str("# ");
-    text.push_str(&"padding ".repeat(15_000));
-    text.push('\n');
-    let reply = post(
-        &rig.ui,
-        "/session",
-        &form(&[("cookies", &text), ("user_agent", UA)]),
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
-    let huge = form(&[("cookies", &"a".repeat(3 * 1024 * 1024))]);
-    assert_eq!(
-        post(&rig.ui, "/session", &huge).await.status,
-        StatusCode::PAYLOAD_TOO_LARGE
-    );
-}
-
-#[tokio::test]
-async fn session_changes_are_protected_against_cross_site_posts() {
-    let rig = rig();
-    let reply = send(
-        &rig.ui,
-        Method::POST,
-        "/session",
-        &[
-            ("content-type", "application/x-www-form-urlencoded"),
-            ("sec-fetch-site", "cross-site"),
-        ],
-        &form(&[("cookies", &cookies_txt()), ("user_agent", UA)]),
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::FORBIDDEN);
-    assert_eq!(rig.session_store.load().await.unwrap(), None);
-}
-
-#[tokio::test]
-async fn session_storage_outages_are_503_problems() {
-    let rig = rig();
-    rig.session_store
-        .break_with(Some(fanfold_app::error::RepoError::Backend(
-            "secret dsn".into(),
-        )));
-    let page = get(&rig.ui, "/session").await;
-    assert_eq!(page.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(!page.body.contains("secret dsn"));
-}
-
-#[tokio::test]
-async fn the_session_fragment_is_just_the_live_region() {
-    let rig = rig();
-    let fragment = send(
-        &rig.ui,
-        Method::GET,
-        "/session",
-        &[("accept", "text/html"), ("x-fragment", "1")],
-        "",
-    )
-    .await;
-    assert!(!fragment.body.contains("<html"));
-    assert!(fragment.body.contains("Browser session"));
-    assert!(
-        !fragment.body.contains("<form"),
-        "forms stay outside the live region"
-    );
-}
-
-#[tokio::test]
-async fn a_series_link_queues_a_series_job_shown_by_its_name() {
-    use fanfold_app::ports::MetadataStore as _;
-    use fanfold_domain::{
-        job::Target,
-        metadata::{SeriesFacts, SeriesMetadata},
-        work::SeriesId,
-    };
-    let rig = rig();
-    let link = ["https://archiveofourown.org", "/series/2000001"].concat();
-    let reply = post(&rig.ui, "/jobs", &form(&[("url", &link)])).await;
-    assert_eq!(reply.status, StatusCode::SEE_OTHER);
-    let series = SeriesId::new(2_000_001).unwrap();
-    let job = rig.jobs.all_jobs()[0].clone();
-    assert_eq!(job.target, Target::Series(series));
-
-    // Before the listing, the job is named by its number; after it, by the series' name.
-    let unnamed = get(&rig.ui, &format!("/jobs/{}", job.id)).await.body;
-    assert!(unnamed.contains("Series #2000001"), "{unnamed}");
-    rig.jobs
-        .record_series(
-            &SeriesMetadata {
-                series,
-                facts: SeriesFacts {
-                    name: "The Harbor Saga".into(),
-                    summary_html: String::new(),
-                    complete: Some(false),
-                    works: vec![WorkId::new(1).unwrap()],
-                },
-                raw: serde_json::Value::Null,
-            },
-            rig.clock.now(),
-            None,
-        )
-        .await
-        .unwrap();
-    let page = get(&rig.ui, &format!("/jobs/{}", job.id)).await.body;
-    assert!(page.contains("The Harbor Saga"));
-    assert!(page.contains("series #2000001"));
-    assert!(page.contains(r#"href="https://archiveofourown.org/series/2000001""#));
-    let dashboard = get(&rig.ui, "/").await.body;
-    assert!(dashboard.contains("The Harbor Saga") && dashboard.contains(">Series<"));
-    assert!(dashboard.contains("Add a work or a series"));
-    rig.jobs.claim_next(rig.clock.now()).await.unwrap();
-    let mut done = JobRepository::get(rig.jobs.as_ref(), job.id)
-        .await
-        .unwrap()
-        .unwrap();
-    done.succeed(rig.clock.now()).unwrap();
-    rig.jobs.save(&done).await.unwrap();
-    let finished = get(&rig.ui, &format!("/jobs/{}", job.id)).await.body;
-    assert!(
-        finished.contains("List the series again")
-            && !finished.contains("Re-download from scratch")
-    );
-}
-
-#[tokio::test]
-async fn a_book_can_be_deleted_from_its_job_page() {
-    let rig = rig();
-    let job = rig.queue(5).await;
-    rig.succeed(job.id).await;
-    let page = get(&rig.ui, &format!("/jobs/{}", job.id)).await.body;
-    assert!(
-        !page.contains("Delete the book"),
-        "no book, nothing to delete"
-    );
-
-    rig.titled(5, "Story").await;
-    rig.library.seed("Story [5].epub");
-    let page = get(&rig.ui, &format!("/jobs/{}", job.id)).await.body;
-    assert!(page.contains(r#"action="/works/5/delete""#) && page.contains("Delete the book"));
-    assert!(
-        page.contains("<details class=\"danger\">"),
-        "folded away behind a summary"
-    );
-
-    let reply = post(
-        &rig.ui,
-        "/works/5/delete",
-        &form(&[("job", &job.id.to_string())]),
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::SEE_OTHER);
-    assert_eq!(
-        reply.location(),
-        format!("/jobs/{}?deleted_book=1", job.id).as_str()
-    );
-    assert_eq!(rig.library.files(), Vec::<String>::new());
-    let after = get(&rig.ui, reply.location()).await.body;
-    assert!(after.contains("The book was deleted from the library"));
-    assert!(!after.contains("Delete the book"), "nothing left to delete");
-    assert!(
-        after.contains("deleted the book: Story [5].epub"),
-        "the log says so"
-    );
-
-    assert_eq!(
-        post(&rig.ui, "/works/abc/delete", "").await.status,
-        StatusCode::NOT_FOUND
-    );
-}
-
-#[tokio::test]
-async fn a_running_download_blocks_the_delete_with_a_clear_conflict() {
-    let rig = rig();
-    let job = rig.queue(5).await;
-    rig.titled(5, "Story").await;
-    rig.claim(job.id).await;
-    let reply = post(
-        &rig.ui,
-        "/works/5/delete",
-        &form(&[("job", &job.id.to_string())]),
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::CONFLICT);
-    assert!(
-        reply.body.contains("downloading right now"),
-        "{}",
-        reply.body
-    );
-}
-
-#[tokio::test]
-async fn a_series_can_be_deleted_from_its_job_page() {
-    use fanfold_domain::{job::Target, work::SeriesId};
-    let rig = rig();
-    let series = SeriesId::new(77).unwrap();
-    let EnqueueOutcome::Created(job) = rig
-        .jobs
-        .enqueue(Target::Series(series), JobSource::Manual, rig.clock.now())
-        .await
-        .unwrap()
-    else {
-        panic!("must create")
-    };
-    let page = get(&rig.ui, &format!("/jobs/{}", job.id)).await.body;
-    assert!(page.contains(r#"action="/series/77/delete""#));
-    assert!(page.contains("Delete the series and its books"));
-    assert!(page.contains("except those that also belong to another series you follow"));
-
-    let reply = post(
-        &rig.ui,
-        "/series/77/delete",
-        &form(&[("job", &job.id.to_string())]),
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::SEE_OTHER);
-    assert_eq!(
-        reply.location(),
-        format!("/jobs/{}?deleted_series=0&kept=0", job.id).as_str()
-    );
-    let after = get(&rig.ui, reply.location()).await.body;
-    assert!(
-        after.contains("The series is no longer followed. Deleted 0 books."),
-        "{after}"
-    );
-    assert_eq!(
-        JobRepository::get(rig.jobs.as_ref(), job.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .state,
-        fanfold_domain::job::JobState::Cancelled,
-        "its queued listing is cancelled"
-    );
 }
 
 // --------------------------------------------------------------------- library

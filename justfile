@@ -35,7 +35,7 @@ lint-python:
     {{parent_directory(ffd_python)}}/pyrefly check --config scripts/pyrefly.toml --python-interpreter-path {{ffd_python}}
 
 # The real Python worker: its own unit tests, then through FanFicFare against its offline
-# test site and a fake FlareSolverr (no network).
+# test site and a fake fanfold-browser (no network).
 # fanfold-browser's queue, pacing and cool-down, with a fake browser (no Camoufox needed).
 test-browser:
     python3 -I -B -m unittest discover -s browser

@@ -128,21 +128,10 @@ h2 .more { margin-left: auto; text-transform: none; letter-spacing: 0; font-weig
 .btn.danger { color: var(--failed); }
 .btn:disabled { opacity: .5; cursor: not-allowed; }
 
-/* ---- browser session ------------------------------------------------------------ */
+/* ---- shared bits ---------------------------------------------------------------- */
 .muted { color: var(--muted); }
-.session-form { margin-bottom: 24px; }
-.session-form form + form { margin-top: 12px; }
-.session-form textarea, .session-form input[type="text"] {
-  display: block; width: 100%; padding: 12px 14px; margin-bottom: 12px; font: inherit; font-size: 1rem;
-  color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
-}
-.session-form textarea { font-family: var(--mono); font-size: .85rem; min-height: 9rem; resize: vertical; }
-.session-form input[type="text"] { min-height: 48px; }
 .tablewrap { overflow-x: auto; }
-.cookies { width: 100%; border-collapse: collapse; font-size: .95rem; }
-.cookies th { text-align: left; color: var(--muted); font-weight: 600; font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
-.cookies th, .cookies td { padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: baseline; white-space: nowrap; }
-.cookies code, code { font-family: var(--mono); font-size: .9em; overflow-wrap: anywhere; }
+code { font-family: var(--mono); font-size: .9em; overflow-wrap: anywhere; }
 
 /* ---- the shelf: the last results, one spine per job ------------------------------- */
 .shelf { display: flex; flex-wrap: wrap; gap: 4px; padding: 0; margin: 0; list-style: none; }

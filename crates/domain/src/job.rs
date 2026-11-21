@@ -211,8 +211,7 @@ pub struct Job {
     /// Failures that consumed retry budget so far.
     pub attempt: u32,
     /// Failed tries since the job was last queued by hand, whether they spent budget or not.
-    /// Paces the back-off (so a long AO3 outage is probed ever more rarely, not every minute)
-    /// and lets the downloader vary how each try fetches.
+    /// Paces the back-off, so a long AO3 outage is probed ever more rarely, not every minute.
     #[serde(default)]
     pub tries: u32,
     /// Earliest time a queued job may be claimed.

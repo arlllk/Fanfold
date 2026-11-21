@@ -18,7 +18,6 @@ use fanfold_domain::{
         Chapter, FollowSource, SeriesMetadata, SeriesPart, Tag, WorkFacts, WorkMetadata, WorkState,
         WorkStats,
     },
-    session::BrowserSession,
     work::{SeriesId, WorkId},
 };
 use tokio::sync::broadcast;
@@ -460,9 +459,6 @@ pub struct DownloadRequest {
     pub work: WorkId,
     /// Existing library file to update incrementally, when there is one.
     pub existing: Option<PathBuf>,
-    /// Tries of this job that already failed ([`fanfold_domain::job::Job::tries`]): a
-    /// downloader with more than one way to fetch varies it by this.
-    pub tries: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -493,12 +489,7 @@ pub trait Downloader: Send + Sync {
     async fn download(&self, request: &DownloadRequest) -> Result<DownloadedBook, DownloadError>;
 
     /// List a series: its facts and its works in order. Fails like a download does.
-    /// `tries` is as in [`DownloadRequest::tries`].
-    async fn list_series(
-        &self,
-        series: SeriesId,
-        tries: u32,
-    ) -> Result<SeriesMetadata, DownloadError>;
+    async fn list_series(&self, series: SeriesId) -> Result<SeriesMetadata, DownloadError>;
 
     /// Discard whatever scratch space backs `book`. Called exactly once for every
     /// book `download` returned, after it was published or abandoned. Best effort:
@@ -514,33 +505,6 @@ pub trait Downloader: Send + Sync {
 pub trait CursorStore: Send + Sync {
     async fn get(&self, name: &str) -> Result<Option<String>, RepoError>;
     async fn set(&self, name: &str, value: &str) -> Result<(), RepoError>;
-}
-
-// --------------------------------------------------------------------- session
-
-/// The one browser session (cookies and `User-Agent`) the downloader presents to the site.
-///
-/// Two writers exist: the person importing fresh cookies, and the downloader folding back
-/// the cookies a run rotated. The first always wins, so [`refresh`](Self::refresh) only
-/// applies when nothing was imported since the run began.
-#[cfg_attr(any(test, feature = "mocks"), mockall::automock)]
-#[async_trait]
-pub trait SessionStore: Send + Sync {
-    async fn load(&self) -> Result<Option<BrowserSession>, RepoError>;
-
-    /// Replace the session unconditionally (an import).
-    async fn save(&self, session: &BrowserSession) -> Result<(), RepoError>;
-
-    /// Store `session` only if the stored one still has `based_on` as its `updated_at`.
-    /// Returns whether it was stored.
-    async fn refresh(
-        &self,
-        session: &BrowserSession,
-        based_on: fanfold_domain::Timestamp,
-    ) -> Result<bool, RepoError>;
-
-    /// Forget the session. Returns whether there was one.
-    async fn clear(&self) -> Result<bool, RepoError>;
 }
 
 // ---------------------------------------------------------------------- events

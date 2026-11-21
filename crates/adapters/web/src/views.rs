@@ -6,13 +6,11 @@
 
 use fanfold_app::{
     ports::{BookRecord, JobCounts, JobFilter, LogEntry, LogLevel, SiteStatus},
-    session::SessionView,
     worker::ATTEMPT_START_PREFIX,
 };
 use fanfold_domain::{
     Timestamp,
     job::{Job, JobId, JobSource, JobState, Target},
-    session::CookieStatus,
 };
 use maud::{DOCTYPE, Markup, html};
 
@@ -99,11 +97,6 @@ pub enum Notice {
         retried: u32,
         skipped: u32,
     },
-    /// Cookies were imported into the browser session.
-    SessionImported {
-        cookies: u32,
-    },
-    SessionCleared,
     /// A book was deleted (`false`: there was none to delete).
     DeletedBook(bool),
     /// A series was deleted: books deleted, books kept for another series.
@@ -144,10 +137,6 @@ impl Notice {
             })
         } else if let Some(file) = num("deleted_book") {
             Some(Self::DeletedBook(file > 0))
-        } else if let Some(cookies) = num("imported") {
-            Some(Self::SessionImported { cookies })
-        } else if num("cleared").is_some() {
-            Some(Self::SessionCleared)
         } else {
             num("retried").map(|retried| Self::Bulk {
                 retried,
@@ -164,7 +153,6 @@ pub enum Nav {
     Dashboard,
     Library,
     History,
-    Session,
     None,
 }
 
@@ -202,18 +190,13 @@ fn notice_view(notice: Notice) -> Markup {
             None,
         ),
         Notice::DeletedBook(false) => ("warn", "There was no book to delete.", None),
-        Notice::Bulk { .. } | Notice::SessionImported { .. } | Notice::DeletedSeries { .. } => {
-            ("", "", None)
-        }
-        Notice::SessionCleared => ("warn", "The browser session was forgotten.", None),
+        Notice::Bulk { .. } | Notice::DeletedSeries { .. } => ("", "", None),
     };
     html! {
         p class=(format!("notice {class}")) role="status" {
             @if let Notice::Bulk { retried, skipped } = notice {
                 "Queued " (retried) " again."
                 @if skipped > 0 { " Skipped " (skipped) " that could not be retried (already queued, or changed since you looked)." }
-            } @else if let Notice::SessionImported { cookies } = notice {
-                "Imported " (cookies) " cookies. They are used from the next download."
             } @else if let Notice::DeletedSeries { deleted, kept } = notice {
                 "The series is no longer followed. Deleted " (deleted) (if deleted == 1 { " book" } else { " books" }) "."
                 @if kept > 0 { " Kept " (kept) " that also belong to another series you follow." }
@@ -271,7 +254,6 @@ pub fn page(frame: Frame<'_>, above: &Markup, content: &Markup) -> Markup {
                             (nav_link("Dashboard", "/", nav == Nav::Dashboard))
                             (nav_link("Library", "/library", nav == Nav::Library))
                             (nav_link("History", "/jobs", nav == Nav::History))
-                            (nav_link("Session", "/session", nav == Nav::Session))
                         }
                         span class="livedot" title="Live updates" {}
                     }
@@ -741,130 +723,6 @@ pub fn job_page(m: &JobModel, notice: Option<Notice>) -> Markup {
         notice,
     };
     page(frame, &bar(m.site, m.now, None), &job_content(m))
-}
-
-// ---------------------------------------------------------------------- session
-
-#[derive(Debug)]
-pub struct SessionModel {
-    pub now: Timestamp,
-    pub site: SiteStatus,
-    /// The site the cookies are for, shown in the help text.
-    pub cookie_site: String,
-    pub session: Option<SessionView>,
-}
-
-const fn cookie_status(status: CookieStatus) -> (&'static str, &'static str) {
-    match status {
-        CookieStatus::Session => ("cancelled", "Session"),
-        CookieStatus::Valid => ("done", "Valid"),
-        CookieStatus::ExpiringSoon => ("retrying", "Expiring soon"),
-        CookieStatus::Expired => ("failed", "Expired"),
-    }
-}
-
-/// The stored session, without a single cookie value.
-#[must_use]
-pub fn session_content(m: &SessionModel) -> Markup {
-    html! {
-        h1 { "Browser session" }
-        @match &m.session {
-            None => {
-                p class="muted" {
-                    "No session stored. Downloads run without cookies, so a site that checks for a browser "
-                    "(Cloudflare) may refuse or slow them down."
-                }
-            }
-            Some(view) => {
-                @let expired = view.cookies.iter().filter(|c| c.status == CookieStatus::Expired).count();
-                @let soon = view.cookies.iter().filter(|c| c.status == CookieStatus::ExpiringSoon).count();
-                @if expired > 0 || soon > 0 {
-                    p class="notice warn" role="status" {
-                        @if expired > 0 { (expired) " expired (no longer sent). " }
-                        @if soon > 0 { (soon) " expiring soon. " }
-                        "Import fresh cookies below to keep downloads working."
-                    }
-                }
-                p {
-                    "Sent as " code { (view.user_agent) } ". Updated " (when(m.now, view.updated_at)) "."
-                    @if let Some(next) = view.next_expiry {
-                        " Next expiry " (when(m.now, next)) "."
-                    }
-                }
-                div class="tablewrap" {
-                    table class="cookies" {
-                        thead { tr { th { "Cookie" } th { "Domain" } th { "Expires" } th { "State" } } }
-                        tbody {
-                            @for c in &view.cookies {
-                                @let (class, label) = cookie_status(c.status);
-                                tr {
-                                    td { code { (c.name) } @if c.http_only { " " small class="muted" { "HttpOnly" } } }
-                                    td { (c.domain) }
-                                    td {
-                                        @if let Some(at) = c.expires { (when(m.now, at)) } @else { span class="muted" { "when the session ends" } }
-                                    }
-                                    td { span class=(format!("chip {class}")) { (label) } }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// The import and clear forms. Outside the live region so a refresh never wipes
-/// what is being pasted.
-#[must_use]
-pub fn session_forms(m: &SessionModel) -> Markup {
-    html! {
-        section class="add session-form" {
-            form method="post" action="/session" {
-                label for="cookies" { "Import cookies" }
-                p class="muted" {
-                    "Paste a " code { "cookies.txt" } " (Netscape format) or a HAR file saved from your "
-                    "browser's network tab for " (m.cookie_site) ". A HAR also supplies the exact "
-                    "User-Agent, which Cloudflare ties its clearance cookie to. Imports are merged "
-                    "with what is stored: paste both to combine them. Values are never shown again."
-                }
-                textarea id="cookies" name="cookies" rows="8" required spellcheck="false"
-                         autocomplete="off" autocapitalize="off" placeholder="# Netscape HTTP Cookie File …  or  {\"log\": …" {}
-                label for="user_agent" { "User-Agent " span class="muted" { "(optional with a HAR)" } }
-                input id="user_agent" name="user_agent" type="text" autocomplete="off" spellcheck="false"
-                      autocapitalize="off" placeholder="Mozilla/5.0 (X11; Linux x86_64; rv:…) Gecko/… Firefox/…";
-                div class="field" {
-                    button class="btn primary" type="submit" { "Import" }
-                }
-            }
-            @if m.session.is_some() {
-                form method="post" action="/session/clear" {
-                    button class="btn danger" type="submit" { "Forget the session" }
-                }
-            }
-        }
-    }
-}
-
-/// The session page as a live update.
-#[must_use]
-pub fn session_detail(m: &SessionModel) -> Markup {
-    live(m.site, m.now, &session_content(m))
-}
-
-#[must_use]
-pub fn session_page(m: &SessionModel, notice: Option<Notice>) -> Markup {
-    let frame = Frame {
-        title: "Session",
-        nav: Nav::Session,
-        job: None,
-        notice,
-    };
-    page(
-        frame,
-        &html! { (bar(m.site, m.now, None)) (session_forms(m)) },
-        &session_content(m),
-    )
 }
 
 // ----------------------------------------------------------------------- errors

@@ -114,25 +114,8 @@ pub struct Ao3Config {
     pub password: SecretRef,
 }
 
-/// Fetch pages through a `FlareSolverr` server (a real browser that passes Cloudflare's
-/// checks) instead of plain HTTP requests.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FlareSolverrConfig {
-    /// Origin of the server, e.g. `http://flaresolverr:8191`.
-    pub url: url::Url,
-    /// How long `FlareSolverr` may spend on one request (solving a challenge included).
-    /// Must be shorter than `downloader.timeout`.
-    #[serde(default = "default_flaresolverr_timeout")]
-    pub timeout: Dur,
-    /// Keep one browser per download (`FlareSolverr` sessions). Set to `false` for a server
-    /// without sessions, such as Byparr.
-    #[serde(default = "default_true")]
-    pub sessions: bool,
-}
-
 /// Send every request to AO3 through fanfold-browser (one browser that keeps the only cookies
-/// and paces the requests). Replaces `[downloader.flaresolverr]`.
+/// and paces the requests).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserConfig {
@@ -148,23 +131,13 @@ const fn default_browser_timeout() -> Dur {
     Dur(Duration::from_secs(180))
 }
 
-const fn default_flaresolverr_timeout() -> Dur {
-    Dur(Duration::from_secs(60))
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DownloaderConfig {
     pub python: String,
     pub timeout: Dur,
-    /// Optional. See [`FlareSolverrConfig`].
-    pub flaresolverr: Option<FlareSolverrConfig>,
     /// Optional. See [`BrowserConfig`].
     pub browser: Option<BrowserConfig>,
-    /// Optional HTTP proxy for FanFicFare's plain requests to AO3 (every try that does not go
-    /// through `FlareSolverr`), e.g. one that leaves from a home connection. A `FlareSolverr`
-    /// server's own browser is pointed at a proxy in its own settings.
-    pub proxy: Option<url::Url>,
     /// Where the rendered `personal.ini` is written. Point this at a memory-backed
     /// `emptyDir` so credentials never touch disk.
     pub personal_ini: PathBuf,
@@ -175,9 +148,7 @@ impl Default for DownloaderConfig {
         Self {
             python: "python3".into(),
             timeout: Dur(Duration::from_secs(600)),
-            flaresolverr: None,
             browser: None,
-            proxy: None,
             personal_ini: PathBuf::from("/run/fanfold/personal.ini"),
         }
     }
@@ -330,10 +301,8 @@ pub struct DiscordConfig {
 pub struct Config {
     pub database: DatabaseConfig,
     pub library: LibraryConfig,
-    /// AO3 login. Required unless `downloader.flaresolverr` is set. With `FlareSolverr` it is
-    /// optional and used only as the fallback when AO3 says a work needs a login: AO3 rejects a
-    /// login submitted *through* `FlareSolverr`, so that login is made over plain HTTP, with the
-    /// Cloudflare clearance `FlareSolverr` earned.
+    /// AO3 login. Required unless `downloader.browser` is set; through the browser it is optional
+    /// and used only when a work asks for a login (restricted works).
     pub ao3: Option<Ao3Config>,
     #[serde(default)]
     pub downloader: DownloaderConfig,
@@ -383,7 +352,7 @@ impl std::fmt::Debug for Ao3Credentials {
 /// Every secret, resolved.
 pub struct Secrets {
     pub database_password: SecretString,
-    /// `None` when downloads go through `FlareSolverr`, which cannot log in.
+    /// `None` without an `[ao3]` table (through fanfold-browser, public works only).
     pub ao3: Option<Ao3Credentials>,
     pub discord_webhook: Option<SecretString>,
     pub discord_failures_webhook: Option<SecretString>,
@@ -393,37 +362,6 @@ pub struct Secrets {
 impl std::fmt::Debug for Secrets {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Secrets").finish_non_exhaustive()
-    }
-}
-
-impl FlareSolverrConfig {
-    /// What is wrong with these settings, for `validate`.
-    fn problems(&self, download_timeout: Duration) -> Vec<String> {
-        let mut problems = Vec::new();
-        if !matches!(self.url.scheme(), "http" | "https") || self.url.host_str().is_none() {
-            problems.push("downloader.flaresolverr.url must be an http(s) URL with a host".into());
-        }
-        if !matches!(self.url.path(), "" | "/") || self.url.query().is_some() {
-            problems.push(
-                "downloader.flaresolverr.url must be just an origin (no path or query): \
-                 FanFicFare appends /v1 itself"
-                    .into(),
-            );
-        }
-        if !self.url.username().is_empty() || self.url.password().is_some() {
-            problems.push("downloader.flaresolverr.url cannot carry credentials".into());
-        }
-        if self.timeout.0.is_zero() {
-            problems.push("downloader.flaresolverr.timeout must be greater than 0".into());
-        }
-        if self.timeout.0 >= download_timeout {
-            problems.push(
-                "downloader.flaresolverr.timeout must be shorter than downloader.timeout, \
-                 or the download is killed before FlareSolverr can answer"
-                    .into(),
-            );
-        }
-        problems
     }
 }
 
@@ -539,10 +477,8 @@ impl Config {
             "web.page_size must be 5-100",
         );
         require(
-            self.ao3.is_some()
-                || self.downloader.flaresolverr.is_some()
-                || self.downloader.browser.is_some(),
-            "[ao3] is required unless downloader.flaresolverr or downloader.browser is set",
+            self.ao3.is_some() || self.downloader.browser.is_some(),
+            "[ao3] is required unless downloader.browser is set",
         );
         if let Some(browser) = &self.downloader.browser {
             let url = &browser.url;
@@ -561,35 +497,6 @@ impl Config {
             require(
                 !browser.timeout.0.is_zero() && browser.timeout.0 < self.downloader.timeout.0,
                 "downloader.browser.timeout must be greater than 0 and shorter than downloader.timeout",
-            );
-            require(
-                self.downloader.flaresolverr.is_none(),
-                "downloader.browser and downloader.flaresolverr cannot both be set: \
-                 the browser makes every request",
-            );
-            require(
-                self.downloader.proxy.is_none(),
-                "downloader.proxy has no effect with downloader.browser: \
-                 set the browser's own proxy (fanfold-browser's BROWSER_PROXY)",
-            );
-        }
-        if let Some(fs) = &self.downloader.flaresolverr {
-            for problem in fs.problems(self.downloader.timeout.0) {
-                require(false, &problem);
-            }
-        }
-        if let Some(proxy) = &self.downloader.proxy {
-            require(
-                matches!(proxy.scheme(), "http" | "https") && proxy.host_str().is_some(),
-                "downloader.proxy must be an http(s) URL with a host",
-            );
-            require(
-                matches!(proxy.path(), "" | "/") && proxy.query().is_none(),
-                "downloader.proxy must be just an origin (no path or query)",
-            );
-            require(
-                proxy.username().is_empty() && proxy.password().is_none(),
-                "downloader.proxy cannot carry credentials",
             );
         }
         if let Some(mail) = &self.mail {
@@ -767,7 +674,6 @@ password = { env = "AO3_PASSWORD" }
         assert!(c.discord.is_none());
     }
 
-    /// MINIMAL without its `[ao3]` table, plus `FlareSolverr`.
     fn via_browser(extra: &str) -> String {
         let without_ao3 = MINIMAL.split("[ao3]").next().unwrap();
         format!(
@@ -785,7 +691,7 @@ password = { env = "AO3_PASSWORD" }
     }
 
     #[test]
-    fn the_browser_service_is_checked_and_replaces_flaresolverr_and_the_proxy() {
+    fn the_browser_service_settings_are_checked() {
         for (text, problem) in [
             (
                 via_browser("timeout = \"20m\""),
@@ -799,13 +705,6 @@ password = { env = "AO3_PASSWORD" }
                 via_browser("").replace("http://fanfold-browser:8191", "http://b:8191/v1"),
                 "just an origin",
             ),
-            (
-                format!(
-                    "{}\n[downloader.flaresolverr]\nurl = \"http://fs:8191\"\n",
-                    via_browser("")
-                ),
-                "cannot both be set",
-            ),
         ] {
             let problems = invalid(&text);
             assert!(
@@ -813,120 +712,34 @@ password = { env = "AO3_PASSWORD" }
                 "{problem}: {problems:?}"
             );
         }
-        let with_proxy = via_browser("").replace(
-            "[downloader.browser]",
-            "[downloader]\nproxy = \"http://home:8080\"\n[downloader.browser]",
-        );
-        assert!(invalid(&with_proxy).iter().any(|p| p.contains("no effect")));
     }
 
+    /// `FlareSolverr` and the proxy are gone: a config that still names them is refused loudly
+    /// instead of being half-applied.
     #[test]
-    fn byparr_through_a_home_proxy() {
-        let without_ao3 = MINIMAL.split("[ao3]").next().unwrap();
-        let text = format!(
-            "{without_ao3}\n[downloader]\nproxy = \"http://home-egress.egress:8080\"\n\
-             [downloader.flaresolverr]\nurl = \"http://byparr:8191\"\nsessions = false\n"
-        );
-        let c = parse(&text).unwrap();
-        assert!(!c.downloader.flaresolverr.as_ref().unwrap().sessions);
-        assert_eq!(
-            c.downloader.proxy.as_ref().map(url::Url::as_str),
-            Some("http://home-egress.egress:8080/")
-        );
-        let defaults = parse(&via_flaresolverr("")).unwrap();
-        assert!(defaults.downloader.flaresolverr.unwrap().sessions);
-        assert_eq!(defaults.downloader.proxy, None);
-    }
-
-    #[test]
-    fn a_proxy_must_be_a_plain_origin() {
-        for (proxy, problem) in [
-            ("socks5://home:1080", "http(s) URL"),
-            ("http://home:8080/path", "just an origin"),
-            ("http://user:pw@home:8080", "credentials"),
+    fn the_removed_flaresolverr_and_proxy_settings_are_refused() {
+        for old in [
+            "[downloader.flaresolverr]\nurl = \"http://fs:8191\"\n",
+            "[downloader]\nproxy = \"http://home:8080\"\n",
         ] {
-            let text = format!("{MINIMAL}\n[downloader]\nproxy = \"{proxy}\"\n");
-            let problems = invalid(&text);
             assert!(
-                problems.iter().any(|p| p.contains(problem)),
-                "{proxy}: {problems:?}"
+                matches!(
+                    parse(&format!("{MINIMAL}\n{old}")),
+                    Err(ConfigError::Parse(_))
+                ),
+                "{old}"
             );
         }
     }
 
-    fn via_flaresolverr(extra: &str) -> String {
-        let without_ao3 = MINIMAL.split("[ao3]").next().unwrap();
-        format!(
-            "{without_ao3}\n[downloader.flaresolverr]\nurl = \"http://flaresolverr:8191\"\n{extra}"
-        )
-    }
-
     #[test]
-    fn flaresolverr_replaces_the_ao3_login() {
-        let c = parse(&via_flaresolverr("")).unwrap();
-        let fs = c.downloader.flaresolverr.as_ref().unwrap();
-        assert_eq!(fs.url.as_str(), "http://flaresolverr:8191/");
-        assert_eq!(fs.timeout.0, Duration::from_secs(60), "default timeout");
-        assert!(c.ao3.is_none());
-        let secrets = c.resolve_secrets(&FakeSecrets::default_with_db()).unwrap();
-        assert!(secrets.ao3.is_none(), "no AO3 secret is needed or read");
-    }
-
-    #[test]
-    fn without_flaresolverr_the_ao3_login_is_required() {
+    fn without_the_browser_the_ao3_login_is_required() {
         let without_ao3 = MINIMAL.split("[ao3]").next().unwrap();
         let problems = invalid(without_ao3);
         assert_eq!(
             problems,
-            ["[ao3] is required unless downloader.flaresolverr or downloader.browser is set"]
+            ["[ao3] is required unless downloader.browser is set"]
         );
-    }
-
-    #[test]
-    fn flaresolverr_and_a_login_work_together_the_login_is_the_fallback() {
-        let both = format!("{MINIMAL}\n[downloader.flaresolverr]\nurl = \"http://fs:8191\"\n");
-        let c = parse(&both).unwrap();
-        assert!(c.ao3.is_some() && c.downloader.flaresolverr.is_some());
-        let mut fake = FakeSecrets::default_with_db();
-        fake.env.insert("AO3_USERNAME".into(), "alice".into());
-        fake.env.insert("AO3_PASSWORD".into(), "hunter2".into());
-        let secrets = c.resolve_secrets(&fake).unwrap();
-        assert!(
-            secrets.ao3.is_some(),
-            "the credentials are resolved for the fallback"
-        );
-    }
-
-    #[test]
-    fn flaresolverr_settings_are_checked() {
-        for (extra, expect) in [
-            ("timeout = \"0s\"", "greater than 0"),
-            ("timeout = \"10m\"", "shorter than downloader.timeout"),
-            ("timeout = \"15m\"", "shorter than downloader.timeout"),
-        ] {
-            let problems = invalid(&via_flaresolverr(extra));
-            assert!(
-                problems.iter().any(|p| p.contains(expect)),
-                "{extra}: {problems:?}"
-            );
-        }
-        for (url, expect) in [
-            ("ftp://fs:8191", "http(s) URL"),
-            ("http://fs:8191/v1", "just an origin"),
-            ("http://fs:8191/?x=1", "just an origin"),
-            ("http://user:pw@fs:8191", "credentials"),
-        ] {
-            let text = via_flaresolverr("").replace("http://flaresolverr:8191", url);
-            let problems = invalid(&text);
-            assert!(
-                problems.iter().any(|p| p.contains(expect)),
-                "{url}: {problems:?}"
-            );
-        }
-        assert!(matches!(
-            parse(&via_flaresolverr("surprise = 1")),
-            Err(ConfigError::Parse(_))
-        ));
     }
 
     #[test]
@@ -1151,16 +964,6 @@ password = { env = "MAIL_PASSWORD" }
     struct FakeSecrets {
         env: HashMap<String, String>,
         files: HashMap<std::path::PathBuf, String>,
-    }
-
-    impl FakeSecrets {
-        /// Just the database password MINIMAL refers to.
-        fn default_with_db() -> Self {
-            let mut fake = Self::default();
-            fake.files
-                .insert("/run/secrets/db/password".into(), "pw".into());
-            fake
-        }
     }
 
     impl SecretSource for FakeSecrets {

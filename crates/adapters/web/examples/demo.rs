@@ -388,7 +388,7 @@ async fn main() {
     .await;
     for (minutes, error) in [
         (9, "HTTP Error 525 from archiveofourown.org"),
-        (4, "Cloudflare error code: 525 (through FlareSolverr)"),
+        (4, "Cloudflare error code: 525"),
     ] {
         let at = ago(minutes);
         log(&repo, flaky, at, LogLevel::Info, "starting attempt 1").await;
@@ -416,12 +416,6 @@ async fn main() {
         listing: repo.clone(),
         admin: Arc::new(JobAdmin::new(repo.clone(), clock.clone())),
         library: library_admin(&repo, &clock),
-        session: Arc::new(fanfold_app::session::SessionAdmin::new(
-            Arc::new(fanfold_testkit::memory::InMemorySession::new()),
-            clock.clone(),
-            "archiveofourown.org",
-            std::time::Duration::from_hours(24),
-        )),
         events: repo.clone(),
         site: Arc::new(Site(Mutex::new(status))),
         clock,

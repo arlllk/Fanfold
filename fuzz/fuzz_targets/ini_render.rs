@@ -11,7 +11,7 @@ fuzz_target!(|data: &[u8]| {
     let (user, pass) = text.split_once('\u{0}').unwrap_or((&text, "x"));
     let user = SecretString::from(user.to_owned());
     let pass = SecretString::from(pass.to_owned());
-    if let Ok(ini) = render_personal_ini(Some((&user, &pass)), None) {
+    if let Ok(ini) = render_personal_ini(Some((&user, &pass))) {
         assert_eq!(ini.expose_secret().lines().count(), 6);
     }
 });

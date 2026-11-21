@@ -27,7 +27,6 @@ pub enum ProblemType {
     JobNotFound,
     InvalidJobState,
     AlreadyActive,
-    InvalidSession,
     ServiceUnavailable,
     Internal,
 }
@@ -41,7 +40,6 @@ impl ProblemType {
             Self::JobNotFound => "urn:fanfold:problem:job-not-found",
             Self::InvalidJobState => "urn:fanfold:problem:invalid-job-state",
             Self::AlreadyActive => "urn:fanfold:problem:already-active",
-            Self::InvalidSession => "urn:fanfold:problem:invalid-session",
             Self::ServiceUnavailable => "urn:fanfold:problem:service-unavailable",
             Self::Internal => "urn:fanfold:problem:internal",
         }
@@ -249,21 +247,6 @@ impl From<&fanfold_app::library::DeleteError> for ProblemDetails {
             DeleteError::Repo(e) => Self::from(&AppError::Repo(e.clone())),
             DeleteError::Store(_) => Self::about_blank(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_detail("The file could not be deleted; the server log has the details."),
-        }
-    }
-}
-
-impl From<&fanfold_app::session::SessionError> for ProblemDetails {
-    fn from(err: &fanfold_app::session::SessionError) -> Self {
-        use fanfold_app::session::SessionError;
-        match err {
-            SessionError::Import(_) | SessionError::NeedUserAgent => Self::typed(
-                ProblemType::InvalidSession,
-                "Cannot use those cookies",
-                StatusCode::UNPROCESSABLE_ENTITY,
-            )
-            .with_detail(err.to_string()),
-            SessionError::Repo(e) => Self::from(&AppError::Repo(e.clone())),
         }
     }
 }
