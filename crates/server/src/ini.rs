@@ -261,7 +261,10 @@ mod tests {
                     .unwrap()
             };
             let flaresolverr_s = value("flaresolverr_proxy_timeout:") / 1000;
-            assert!(value("connect_timeout:") > flaresolverr_s, "{ini}");
+            assert!(
+                value("connect_timeout:") > flaresolverr_s,
+                "FanFicFare must wait longer than FlareSolverr ({flaresolverr_s} s)"
+            );
         }
     }
 
@@ -290,7 +293,7 @@ mod tests {
         assert!(text.contains("username:alice\n"));
         assert!(
             !text.contains("always_login"),
-            "a valid login cookie must be enough: {text}"
+            "a valid login cookie must be enough (always_login is set)"
         );
         assert!(
             !text.contains("flaresolverr"),
