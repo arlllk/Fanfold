@@ -125,6 +125,10 @@ pub struct FlareSolverrConfig {
     /// Must be shorter than `downloader.timeout`.
     #[serde(default = "default_flaresolverr_timeout")]
     pub timeout: Dur,
+    /// Keep one browser per download (`FlareSolverr` sessions). Set to `false` for a server
+    /// without sessions, such as Byparr.
+    #[serde(default = "default_true")]
+    pub sessions: bool,
 }
 
 const fn default_flaresolverr_timeout() -> Dur {
@@ -138,6 +142,10 @@ pub struct DownloaderConfig {
     pub timeout: Dur,
     /// Optional. See [`FlareSolverrConfig`].
     pub flaresolverr: Option<FlareSolverrConfig>,
+    /// Optional HTTP proxy for FanFicFare's plain requests to AO3 (every try that does not go
+    /// through `FlareSolverr`), e.g. one that leaves from a home connection. A `FlareSolverr`
+    /// server's own browser is pointed at a proxy in its own settings.
+    pub proxy: Option<url::Url>,
     /// Where the rendered `personal.ini` is written. Point this at a memory-backed
     /// `emptyDir` so credentials never touch disk.
     pub personal_ini: PathBuf,
@@ -149,6 +157,7 @@ impl Default for DownloaderConfig {
             python: "python3".into(),
             timeout: Dur(Duration::from_secs(600)),
             flaresolverr: None,
+            proxy: None,
             personal_ini: PathBuf::from("/run/fanfold/personal.ini"),
         }
     }
@@ -518,6 +527,20 @@ impl Config {
                 require(false, &problem);
             }
         }
+        if let Some(proxy) = &self.downloader.proxy {
+            require(
+                matches!(proxy.scheme(), "http" | "https") && proxy.host_str().is_some(),
+                "downloader.proxy must be an http(s) URL with a host",
+            );
+            require(
+                matches!(proxy.path(), "" | "/") && proxy.query().is_none(),
+                "downloader.proxy must be just an origin (no path or query)",
+            );
+            require(
+                proxy.username().is_empty() && proxy.password().is_none(),
+                "downloader.proxy cannot carry credentials",
+            );
+        }
         if let Some(mail) = &self.mail {
             require(
                 matches!(mail.jmap_url.scheme(), "http" | "https")
@@ -694,6 +717,40 @@ password = { env = "AO3_PASSWORD" }
     }
 
     /// MINIMAL without its `[ao3]` table, plus `FlareSolverr`.
+    #[test]
+    fn byparr_through_a_home_proxy() {
+        let without_ao3 = MINIMAL.split("[ao3]").next().unwrap();
+        let text = format!(
+            "{without_ao3}\n[downloader]\nproxy = \"http://home-egress.egress:8080\"\n\
+             [downloader.flaresolverr]\nurl = \"http://byparr:8191\"\nsessions = false\n"
+        );
+        let c = parse(&text).unwrap();
+        assert!(!c.downloader.flaresolverr.as_ref().unwrap().sessions);
+        assert_eq!(
+            c.downloader.proxy.as_ref().map(url::Url::as_str),
+            Some("http://home-egress.egress:8080/")
+        );
+        let defaults = parse(&via_flaresolverr("")).unwrap();
+        assert!(defaults.downloader.flaresolverr.unwrap().sessions);
+        assert_eq!(defaults.downloader.proxy, None);
+    }
+
+    #[test]
+    fn a_proxy_must_be_a_plain_origin() {
+        for (proxy, problem) in [
+            ("socks5://home:1080", "http(s) URL"),
+            ("http://home:8080/path", "just an origin"),
+            ("http://user:pw@home:8080", "credentials"),
+        ] {
+            let text = format!("{MINIMAL}\n[downloader]\nproxy = \"{proxy}\"\n");
+            let problems = invalid(&text);
+            assert!(
+                problems.iter().any(|p| p.contains(problem)),
+                "{proxy}: {problems:?}"
+            );
+        }
+    }
+
     fn via_flaresolverr(extra: &str) -> String {
         let without_ao3 = MINIMAL.split("[ao3]").next().unwrap();
         format!(

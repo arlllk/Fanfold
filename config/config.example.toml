@@ -34,6 +34,9 @@ timeout = "10m"
 # Rendered at startup from the secrets above. Point at a memory-backed emptyDir
 # so credentials never touch disk.
 personal_ini = "/run/fanfold/personal.ini"
+# Optional HTTP proxy for every plain request to AO3 (all of them without FlareSolverr; with it,
+# the direct tries and the login fallback), e.g. one that leaves from a home connection.
+# proxy = "http://home-proxy:8080"
 
 # Optional. Fetch pages through a FlareSolverr server (a real browser that passes Cloudflare's
 # checks) instead of plain requests. Use it when AO3 answers the plain requests with Cloudflare
@@ -45,6 +48,7 @@ personal_ini = "/run/fanfold/personal.ini"
 # [downloader.flaresolverr]
 # url = "http://flaresolverr:8191"   # the origin only; FanFicFare appends /v1
 # timeout = "60s"                    # per request, challenge included; below downloader.timeout
+# sessions = false                   # for Byparr, which has no FlareSolverr sessions
 
 [retry]
 max_attempts = 5            # failures that count against a job (outages do not)

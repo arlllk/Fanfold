@@ -119,9 +119,8 @@ enum Attempt {
     /// With a login fallback configured, every other try skips `FlareSolverr` altogether and
     /// fetches exactly as `AutomatedFanfic` does: plain requests, FanFicFare's own
     /// `User-Agent`, no stored cookies, and a fresh login on every run when there are
-    /// credentials ([`LoginFallback::direct_ini`]). AO3 refuses a session it has flagged
-    /// (seen: the long-lived stored one refused for hours while a fresh login from the same
-    /// address passed), so this route shares nothing with the others.
+    /// credentials ([`LoginFallback::direct_ini`]). It shares no cookies with the other routes,
+    /// so a refusal tied to one route's session cannot follow it here.
     Direct,
     /// The login fallback: Cloudflare passed by `FlareSolverr`, then plain requests.
     Fallback,

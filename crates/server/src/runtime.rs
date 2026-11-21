@@ -28,7 +28,10 @@ use tokio::{sync::watch, task::JoinSet};
 use crate::{
     config::{Config, Secrets, SslMode},
     infra::{LogOnlyNotifier, SystemClock, SystemJitter},
-    ini::{FlareSolverr, IniError, render_login_fallback_ini, render_personal_ini, write_private},
+    ini::{
+        FlareSolverr, IniError, render_login_fallback_ini, render_personal_ini, with_proxy,
+        write_private,
+    },
 };
 
 #[derive(Debug, Error)]
@@ -116,15 +119,12 @@ fn build_notifier(config: &Config, secrets: &Secrets) -> Result<Arc<dyn Notifier
     ))
 }
 
-/// As [`build_worker`], with the story URL template (`{id}` is the work id)
-/// injectable so end-to-end tests can point at FanFicFare's offline test site.
-pub fn build_worker_with(
+/// Render and write FanFicFare's settings files; with `FlareSolverr`, also those of the routes
+/// that skip it, which the returned [`LoginFallback`] points at.
+fn write_fanficfare_settings(
     config: &Config,
-    secrets: &Secrets,
-    store: &Arc<PgStore>,
-    runner: Arc<dyn ProcessRunner>,
-    url_template: &str,
-) -> Result<Worker, StartupError> {
+    credentials: Option<(&SecretString, &SecretString)>,
+) -> Result<Option<LoginFallback>, StartupError> {
     let flaresolverr = config
         .downloader
         .flaresolverr
@@ -132,8 +132,9 @@ pub fn build_worker_with(
         .map(|fs| FlareSolverr {
             url: &fs.url,
             timeout: fs.timeout.0,
+            sessions: fs.sessions,
         });
-    let credentials = secrets.ao3.as_ref().map(|a| (&a.username, &a.password));
+    let proxy = config.downloader.proxy.as_ref();
     // Through FlareSolverr every download is tried anonymously first (that is what this ini is);
     // the credentials, if any, only go into the fallback's ini, used when AO3 asks for a login.
     let (ini, login_fallback) = if let Some(fs) = &flaresolverr {
@@ -141,7 +142,7 @@ pub fn build_worker_with(
             .downloader
             .personal_ini
             .with_file_name("personal-login.ini");
-        let fallback_ini = render_login_fallback_ini(credentials)?;
+        let fallback_ini = with_proxy(render_login_fallback_ini(credentials)?, proxy)?;
         write_private(&fallback_path, &fallback_ini).map_err(|e| {
             StartupError::Io(format!("cannot write {}: {e}", fallback_path.display()))
         })?;
@@ -151,9 +152,11 @@ pub fn build_worker_with(
             .downloader
             .personal_ini
             .with_file_name("personal-direct.ini");
-        write_private(&direct_path, &render_personal_ini(credentials, None)?).map_err(|e| {
-            StartupError::Io(format!("cannot write {}: {e}", direct_path.display()))
-        })?;
+        write_private(
+            &direct_path,
+            &with_proxy(render_personal_ini(credentials, None)?, proxy)?,
+        )
+        .map_err(|e| StartupError::Io(format!("cannot write {}: {e}", direct_path.display())))?;
         (
             render_personal_ini(None, Some(fs))?,
             Some(LoginFallback {
@@ -164,7 +167,10 @@ pub fn build_worker_with(
             }),
         )
     } else {
-        (render_personal_ini(credentials, None)?, None)
+        (
+            with_proxy(render_personal_ini(credentials, None)?, proxy)?,
+            None,
+        )
     };
     write_private(&config.downloader.personal_ini, &ini).map_err(|e| {
         StartupError::Io(format!(
@@ -172,6 +178,20 @@ pub fn build_worker_with(
             config.downloader.personal_ini.display()
         ))
     })?;
+    Ok(login_fallback)
+}
+
+/// As [`build_worker`], with the story URL template (`{id}` is the work id)
+/// injectable so end-to-end tests can point at FanFicFare's offline test site.
+pub fn build_worker_with(
+    config: &Config,
+    secrets: &Secrets,
+    store: &Arc<PgStore>,
+    runner: Arc<dyn ProcessRunner>,
+    url_template: &str,
+) -> Result<Worker, StartupError> {
+    let credentials = secrets.ao3.as_ref().map(|a| (&a.username, &a.password));
+    let login_fallback = write_fanficfare_settings(config, credentials)?;
 
     let swept = sweep_stale(&config.library.scratch, STALE_SCRATCH_AGE);
     if swept > 0 {
