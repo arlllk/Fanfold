@@ -378,6 +378,30 @@ def check_guard_saw_pages(url: str, pages: PageLog) -> None:
         raise incompatible("its pages no longer go through Fetcher.do_request, which the page guard hooks")
 
 
+def no_shell(command: object, *args: object, **kwargs: object) -> int:
+    """Stands in for subprocess.call in FanFicFare's CLI, which only uses it for the
+    pre_process_cmd and post_process_cmd hooks.
+
+    FanFicFare's update path runs pre_process_cmd through a shell even when none is set (its
+    fresh-download path checks first). An empty command is a no-op in a shell, so it is one
+    here too; the image has no shell to run it ("No such file or directory: '/bin/sh'" failed
+    every update that added chapters). Fanfold never sets either hook, so any real command is
+    refused, not run.
+    """
+    if isinstance(command, str) and not command.strip():
+        return 0
+    raise WorkerError(PERMANENT, "FanFicFare tried to run a shell command, which Fanfold never configures: %r" % (command,))
+
+
+def install_shell_guard() -> None:
+    """Route FanFicFare's CLI hook calls through no_shell (see there)."""
+    from fanficfare import cli
+
+    if not callable(getattr(cli, "call", None)):
+        raise incompatible("fanficfare.cli no longer imports subprocess.call for its hooks")
+    setattr(cli, "call", no_shell)
+
+
 def install_page_guard() -> None:
     """Check every page FanFicFare fetches, through any fetcher, before it is parsed.
 
@@ -955,6 +979,7 @@ def run(request: Request, buffer: io.StringIO) -> dict[str, object]:
     os.makedirs(request.workdir, exist_ok=True)
     os.chdir(request.workdir)
     install_page_guard()
+    install_shell_guard()
     if request.browser:
         install_browser_fetcher(request.browser)
     capture = AdapterCapture()

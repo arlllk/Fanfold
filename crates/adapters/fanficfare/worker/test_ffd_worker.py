@@ -340,6 +340,34 @@ class PageGuardTest(unittest.TestCase):
 
 
 
+
+@unittest.skipUnless(HAS_FANFICFARE, "needs FanFicFare")
+class ShellGuardTest(unittest.TestCase):
+    """Regression: every update that added chapters failed in the image with
+    "No such file or directory: '/bin/sh'": FanFicFare's update path runs its (empty)
+    pre_process_cmd through a shell, and the image has none."""
+
+    def test_an_empty_hook_runs_nothing_and_a_real_one_is_refused(self):
+        from fanficfare import cli
+
+        original = cli.call
+        self.addCleanup(setattr, cli, "call", original)
+        w.install_shell_guard()
+        with mock.patch("subprocess.Popen", side_effect=AssertionError("a process was started")):
+            self.assertEqual(cli.call("", shell=True), 0)
+            self.assertEqual(cli.call("   ", shell=True), 0)
+            with self.assertRaises(w.WorkerError) as caught:
+                cli.call("rm -rf /", shell=True)
+        self.assertEqual(caught.exception.kind, w.PERMANENT)
+
+    def test_fanficfare_still_calls_its_hooks_through_cli_call(self):
+        import inspect
+
+        from fanficfare import cli
+
+        source = inspect.getsource(cli)  # do_download itself is behind a profiling decorator
+        self.assertIn("call(string.Template(adapter.getConfig('pre_process_cmd'))", source)
+
 class FakeBrowserService:
     """A stand-in for fanfold-browser: answers /fetch from a script, records what it was asked."""
 
