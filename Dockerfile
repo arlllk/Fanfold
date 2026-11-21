@@ -57,7 +57,7 @@
 # binary links: glibc (Debian's, as the build stage), libm, libgcc_s. Keep the Python minor
 # version in step with ci.yml (uv sync --python), the justfile (venv) and
 # crates/adapters/fanficfare/worker/pyrefly.toml.
-FROM dhi.io/python:3.15.2-debian13@sha256:fc5c71d66de243d9026d7a2149f51221db8493ed49a391a0d5543622339de60e AS python-base
+FROM dhi.io/python:3.15.2-debian13@sha256:d865291cf12dd5984f92656eacdaabda6e6621872e49995fa0dbd0dbe4a87592 AS python-base
 
 # ----------------------------------------------------------------------------- chef
 FROM rust:1.100.0-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS chef
