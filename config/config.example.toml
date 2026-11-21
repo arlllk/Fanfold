@@ -38,6 +38,13 @@ personal_ini = "/run/fanfold/personal.ini"
 # the direct tries and the login fallback), e.g. one that leaves from a home connection.
 # proxy = "http://home-proxy:8080"
 
+# Optional, and the most reliable: send every request, logins included, through fanfold-browser
+# (one Camoufox browser that keeps the only cookies and paces the requests; see the README).
+# Replaces [downloader.flaresolverr] and downloader.proxy.
+# [downloader.browser]
+# url = "http://fanfold-browser:8191"   # the origin only
+# timeout = "180s"                      # per request, its queue included; below downloader.timeout
+
 # Optional. Fetch pages through a FlareSolverr server (a real browser that passes Cloudflare's
 # checks) instead of plain requests. Use it when AO3 answers the plain requests with Cloudflare
 # errors (525) or challenges. Tries then take turns: one through FlareSolverr, the next one

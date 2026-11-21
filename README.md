@@ -120,6 +120,7 @@ password = { file = "/run/secrets/x" } # a file (a trailing newline is ignored)
 | `[library]` | `path`, `scratch` (`/tmp/fanfold`) | `path` is the folder of finished books; `scratch` is temporary per-download space. |
 | `[ao3]` | `username`, `password` | Your AO3 login. Required unless you use FlareSolverr; with FlareSolverr it is optional and only used for works that need a login. |
 | `[downloader]` | `python`, `timeout` (`10m`), `personal_ini`, `proxy` | The Python with FanFicFare installed, the longest one download may take, where the generated FanFicFare settings are written, and optionally an HTTP proxy for every request that does not go through FlareSolverr. See [Fetching from another network](#fetching-from-another-network). |
+| `[downloader.browser]` | `url`, `timeout` (`180s`) | Optional. Send every request, logins included, through [fanfold-browser](#fanfold-browser-one-browser-for-every-request). Replaces `[downloader.flaresolverr]` and `downloader.proxy`. |
 | `[downloader.flaresolverr]` | `url`, `timeout` (`60s`), `sessions` (`true`) | Optional. Fetch through FlareSolverr, or a server with its API such as Byparr (then `sessions = false`). See [Getting past Cloudflare](#getting-past-cloudflare). |
 | `[retry]` | `max_attempts` (5), `base` (`1m`), `cap` (`1h`) | A failing job is retried with a doubling delay (with `1m`/`1h`: 1, 2, 4, 8... minutes, then hourly), AO3 outages and rate limits included, so a struggling AO3 is asked ever more rarely. Only failures that are the work's own fault use up attempts; AO3 being down does not. |
 | `[breaker]` | `failure_threshold` (3), `open_for` (`2m`), `max_open_for` (`1h`) | After this many site-wide failures in a row, Fanfold pauses downloads and probes now and then. |
@@ -224,12 +225,60 @@ Reaching AO3 takes two separate things, and it helps to keep them apart:
 - **Being logged in**, which AO3 only requires for works restricted to registered users. Most
   works, including everything an anonymous visitor can open, need no login.
 
-There are two setups.
+There are three setups.
 
 ### Plain requests with your AO3 login (the default)
 
 Fanfold logs in with the `[ao3]` username and password and fetches everything directly, so
 restricted works are available. Fine when Cloudflare lets your network through.
+
+### fanfold-browser: one browser for every request
+
+Cloudflare ties the clearance it gives a browser to that browser, so its cookies do not work
+when another program sends them. fanfold-browser is a small service, shipped as its own image
+(`ghcr.io/arlllk/fanfold-browser`, released with the same versions as Fanfold), that runs one
+[Camoufox](https://camoufox.com) browser and makes every request Fanfold sends to AO3: pages,
+the login token and the login form itself. The browser keeps all the cookies (Cloudflare's
+clearance, AO3's session and login) in its profile; FanFicFare keeps none, and nothing is
+imported.
+
+```sh
+docker volume create fanfold-browser
+docker run -d --name fanfold-browser --restart unless-stopped \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --tmpfs /tmp:rw,nosuid,nodev,uid=10001,gid=10001 -v fanfold-browser:/data \
+  ghcr.io/arlllk/fanfold-browser:latest
+```
+
+```toml
+[downloader.browser]
+url = "http://fanfold-browser:8191"   # the origin only
+timeout = "180s"                      # per request, waiting in its queue included
+```
+
+Keep `[ao3]` for restricted works: FanFicFare then logs in through the browser when a work asks
+for it, and the browser stays logged in (keep `/data` on a volume so a restart does too).
+
+It is built to be light on AO3, however many downloads run at once:
+
+- **One request at a time.** Concurrent downloads queue up and take turns, request by request;
+  AO3 never sees two at once from one instance.
+- **Paced.** Each request starts at least `MIN_INTERVAL_S` (6 s, plus up to half again at
+  random) after the previous one, on top of FanFicFare's own pause between pages.
+- **Cools down together.** When AO3 or Cloudflare refuses (HTTP 429, AO3's bot filter, a block,
+  or a challenge that does not clear), the service stops sending anything for a while (2
+  minutes, doubling with each refusal up to an hour) and answers every download with a rate
+  limit meanwhile, which Fanfold's retries back off from.
+- **Bounded.** At most `MAX_QUEUE` (16) requests wait; a request whose time runs out while
+  waiting is dropped, not sent late.
+
+Its settings are environment variables: `BROWSER_PROXY` (an HTTP proxy the browser goes
+through, for example to leave from a home connection), `MIN_INTERVAL_S`, `COOLDOWN_BASE_S`
+(120), `COOLDOWN_CAP_S` (3600), `CHALLENGE_TIMEOUT_S` (45), `MAX_QUEUE`, `ALLOWED_HOSTS`
+(`archiveofourown.org`; nothing else is fetched), `BROWSER_OS` (`linux`), `HEADLESS`, and
+`LISTEN_PORT` (8191). Give it memory to spare: a Firefox-based solver in a similar deployment was
+OOM-killed at 768 MiB, so start at 1.5 GiB. Run one instance (the queue is per instance), and let
+only Fanfold reach it.
 
 ### Fetching from another network
 
