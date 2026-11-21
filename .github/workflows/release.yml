@@ -55,7 +55,7 @@ jobs:
       SHA: ${{ inputs.sha || github.sha }}
       FORCE: ${{ inputs.force || false }}
       # What the image is built from (see the Dockerfile's COPY lines)...
-      IMAGE_INPUTS: '^(Dockerfile|\.dockerignore|Cargo\.toml|Cargo\.lock|crates/|python/(pyproject\.toml|uv\.lock)|licenses/|LICENSE-)'
+      IMAGE_INPUTS: '^(Dockerfile|\.dockerignore|Cargo\.toml|Cargo\.lock|crates/|python/(pyproject\.toml|uv\.lock)|licenses/|LICENSE-|browser/(Dockerfile|fanfold_browser\.py|pyproject\.toml|uv\.lock))'
       # ...minus what never reaches the binary.
       # (testdata/ is only ever include_str!'d by #[cfg(test)] code.)
       NOT_IMAGE: '^crates/(.+/)?(tests|testdata|examples|benches)/|^crates/testkit/|\.md$'
@@ -141,6 +141,17 @@ jobs:
     secrets:
       DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
       DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+    with:
+      version: ${{ needs.tag.outputs.version }}
+
+  # fanfold-browser, released with the same version as Fanfold (they are used together).
+  browser-image:
+    needs: tag
+    if: needs.tag.outputs.version != ''
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/browser-image.yml
     with:
       version: ${{ needs.tag.outputs.version }}
 

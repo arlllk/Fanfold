@@ -219,6 +219,13 @@ class RequestTest(unittest.TestCase):
         self.refused(dict(self.MINIMAL, clearance=dict(clearance, timeout_ms=True)), "timeout_ms")
         self.refused(dict(self.MINIMAL, clearance=dict(clearance, timeout_ms=0)), "timeout_ms")
         self.refused(dict(self.MINIMAL, clearance={"url": WORK}), "'flaresolverr'")
+        self.refused(dict(self.MINIMAL, browser="yes"), "'browser'")
+        self.refused(dict(self.MINIMAL, browser={"timeout_ms": 5}), "'url'")
+        self.refused(dict(self.MINIMAL, browser={"url": "http://b", "timeout_ms": -1}), "timeout_ms")
+
+    def test_the_browser_service(self):
+        request = w.parse_request(dict(self.MINIMAL, browser={"url": "http://browser:8191", "timeout_ms": 9000}))
+        self.assertEqual(request.browser, w.BrowserService("http://browser:8191", 9000))
 
 
 class DefenceTest(unittest.TestCase):
@@ -339,6 +346,116 @@ class PageGuardTest(unittest.TestCase):
     def test_images_are_not_judged(self):
         self.pages = [b"\x89PNG not a page"]
         self.fetcher.do_request("GET", WORK, image=True)
+
+
+
+class FakeBrowserService:
+    """A stand-in for fanfold-browser: answers /fetch from a script, records what it was asked."""
+
+    def __init__(self, answers):
+        import http.server
+        import threading
+
+        self.answers = list(answers)
+        self.asked = []
+        fake = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                fake.asked.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                status, body = fake.answers.pop(0)
+                data = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, format, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def site(status, url, body):
+    import base64
+
+    return 200, {"status": status, "url": url, "content_type": "text/html", "body_b64": base64.b64encode(body).decode()}
+
+
+@unittest.skipUnless(HAS_FANFICFARE, "needs FanFicFare")
+class BrowserFetcherTest(unittest.TestCase):
+    """FanFicFare's browser fetcher, pointed at fanfold-browser, with the page guard on."""
+
+    def fetcher_for(self, *answers):
+        from fanficfare.fetchers import fetcher_camoufox
+
+        service = FakeBrowserService(answers)
+        self.addCleanup(service.close)
+        original = fetcher_camoufox.CamoufoxFetcher
+        self.addCleanup(setattr, fetcher_camoufox, "CamoufoxFetcher", original)
+        w.install_page_guard()
+        w.install_browser_fetcher(w.BrowserService(service.url, 5000))
+        fetcher = fetcher_camoufox.CamoufoxFetcher(lambda key, default=None: default, lambda key: [])
+        return fetcher, service
+
+    def test_pages_and_redirects_come_from_the_service(self):
+        page = b'<html><div id="main">the work</div></html>'
+        fetcher, service = self.fetcher_for(site(200, WORK + "&final", page))
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = fetcher.do_request("GET", WORK)
+        self.assertEqual((response.content, response.redirecturl), (page, WORK + "&final"))
+        self.assertEqual(service.asked, [{"method": "GET", "url": WORK, "form": [], "timeout_ms": 5000}])
+        self.assertEqual(len(fetcher.get_cookiejar()), 0, "no cookies are kept outside the browser")
+
+    def test_a_login_form_goes_to_the_service_whole(self):
+        login = "https://archiveofourown.org/users/login"
+        fetcher, service = self.fetcher_for(site(200, login, b'<div id="main">Log Out</div>'))
+        params = {"user[login]": "u", "authenticity_token": "a+b/c="}
+        with contextlib.redirect_stdout(io.StringIO()):
+            fetcher.do_request("POST", login, parameters=params)
+        self.assertEqual(service.asked[0]["method"], "POST")
+        self.assertEqual(service.asked[0]["form"], [["user[login]", "u"], ["authenticity_token", "a+b/c="]])
+
+    def test_the_site_s_errors_and_the_service_s_refusals_are_classified(self):
+        from fanficfare import exceptions
+
+        cases = [
+            (site(404, WORK, b'<div id="main">Error 404</div>'), w.NOT_FOUND),
+            ((429, {"error": "cooling_down", "retry_after_s": 300, "message": "not asking the site anything"}), w.RATE_LIMITED),
+            ((503, {"error": "busy", "message": "16 requests are already waiting"}), w.SITE_UNAVAILABLE),
+        ]
+        for answer, kind in cases:
+            fetcher, _ = self.fetcher_for(answer)
+            with self.assertRaises(exceptions.HTTPErrorFFF) as caught, contextlib.redirect_stdout(io.StringIO()):
+                fetcher.do_request("GET", WORK)
+            self.assertEqual(w.classify_exception(caught.exception), kind, answer)
+
+    def test_an_unreachable_service_is_an_outage(self):
+        from fanficfare import exceptions
+        from fanficfare.fetchers import fetcher_camoufox
+
+        original = fetcher_camoufox.CamoufoxFetcher
+        self.addCleanup(setattr, fetcher_camoufox, "CamoufoxFetcher", original)
+        w.install_browser_fetcher(w.BrowserService("http://127.0.0.1:9", 1000))
+        fetcher = fetcher_camoufox.CamoufoxFetcher(lambda key, default=None: default, lambda key: [])
+        with self.assertRaises(exceptions.HTTPErrorFFF) as caught:
+            fetcher.request("GET", WORK)
+        self.assertEqual(w.classify_exception(caught.exception), w.SITE_UNAVAILABLE)
+        self.assertIn("cannot reach fanfold-browser", str(caught.exception))
+
+    def test_use_camoufox_is_switched_on_only_with_the_service(self):
+        plain = w.build_options(w.Request("download", WORK, "/tmp/w"), None, WORK)
+        through = w.build_options(
+            w.Request("download", WORK, "/tmp/w", browser=w.BrowserService("http://b", 1)), None, WORK
+        )
+        self.assertNotIn("use_camoufox=true", plain.options or [])
+        self.assertIn("use_camoufox=true", through.options)
 
 
 if __name__ == "__main__":

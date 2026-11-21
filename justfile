@@ -36,6 +36,14 @@ lint-python:
 
 # The real Python worker: its own unit tests, then through FanFicFare against its offline
 # test site and a fake FlareSolverr (no network).
+# fanfold-browser's queue, pacing and cool-down, with a fake browser (no Camoufox needed).
+test-browser:
+    python3 -I -B -m unittest discover -s browser
+
+# The fanfold-browser image (Camoufox inside; large).
+browser-image:
+    docker build -f browser/Dockerfile -t fanfold-browser .
+
 test-worker:
     {{ffd_python}} -I -B -m unittest discover -s crates/adapters/fanficfare/worker
     {{ffd_python}} -I -B -m unittest discover -s scripts
@@ -76,7 +84,7 @@ fuzz-all seconds="30":
 
 # --- everything -------------------------------------------------------------------
 
-ci: fmt-check lint lint-python test integration
+ci: fmt-check lint lint-python test test-browser integration
 
 fmt-check:
     cargo fmt --all -- --check

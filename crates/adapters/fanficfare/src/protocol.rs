@@ -33,6 +33,15 @@ pub struct WorkerRequest<'a> {
     pub user_agent: Option<&'a str>,
     /// Have `FlareSolverr` pass Cloudflare first, then fetch without it (the login fallback).
     pub clearance: Option<Clearance<'a>>,
+    /// Send every request through fanfold-browser instead of fetching in the worker.
+    pub browser: Option<BrowserRef<'a>>,
+}
+
+/// Where fanfold-browser is, and how long one request may take there (its queue included).
+#[derive(Debug, Serialize)]
+pub struct BrowserRef<'a> {
+    pub url: &'a str,
+    pub timeout_ms: u64,
 }
 
 /// Where `FlareSolverr` is, and which page to ask it to open to earn the clearance.

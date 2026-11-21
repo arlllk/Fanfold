@@ -1,0 +1,20 @@
+# fanfold-browser: Camoufox (an anti-detect Firefox driven through Playwright), pinned. Not a
+# package (fanfold_browser.py is one file run as a script); uv.lock pins everything under it,
+# with hashes. Renovate keeps both current.
+#
+#   uv sync --project browser --locked     # what `just browser-venv`, CI and the image do
+#   uv lock --project browser              # after editing this file
+#
+# Python 3.13: Camoufox's fingerprint generator (fpgen) fails to decode its model on 3.15
+# ("Incomplete Base85 group"). Keep in step with browser/Dockerfile and the justfile.
+[project]
+name = "fanfold-browser"
+version = "0"
+description = "One Camoufox browser that makes every request Fanfold sends to AO3"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "camoufox[geoip]==0.5.9",
+]
+
+[tool.uv]
+package = false

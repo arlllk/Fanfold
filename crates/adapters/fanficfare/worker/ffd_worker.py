@@ -2,12 +2,15 @@
 
 Protocol (one story or series per process):
   stdin : a JSON object  {"op", "url", "existing", "workdir", "personal_ini",
-                          "cookies", "user_agent", "clearance"}   (the last three are optional)
+                          "cookies", "user_agent", "clearance", "browser"}
+          (the last four are optional)
           `op` is "download" (the default) or "list_series".
           `cookies` is a Netscape cookies.txt that FanFicFare loads, and the worker writes
           it back (cookies rotate during a run) so the caller can keep them.
           `clearance` {"flaresolverr", "timeout_ms", "url"} asks the worker to have FlareSolverr
           pass Cloudflare once first (see apply_clearance); FanFicFare then fetches by itself.
+          `browser` {"url", "timeout_ms"} sends every request FanFicFare makes through
+          fanfold-browser instead (see install_browser_fetcher); no cookies are kept here then.
   stdout: FanFicFare's own chatter is captured; the LAST line printed is a JSON
           object, either
             {"status": "ok", "path", "title", "changed", "metadata", "log"}
@@ -488,6 +491,12 @@ class Clearance:
 
 
 @dataclasses.dataclass(frozen=True)
+class BrowserService:
+    url: str
+    timeout_ms: int
+
+
+@dataclasses.dataclass(frozen=True)
 class Request:
     """What the Rust side asks for (protocol.rs, WorkerRequest), checked field by field."""
 
@@ -499,6 +508,7 @@ class Request:
     cookies: str | None = None
     user_agent: str | None = None
     clearance: Clearance | None = None
+    browser: BrowserService | None = None
 
 
 OPS = ("download", "list_series")
@@ -537,6 +547,15 @@ def parse_request(raw: object) -> Request:
             url=str(string(spec, "url", required=True)),
             timeout_ms=timeout_ms,
         )
+    browser = None
+    spec = raw.get("browser")
+    if spec is not None:
+        if not isinstance(spec, dict):
+            raise bad("'browser' must be an object")
+        timeout_ms = spec.get("timeout_ms", 120000)
+        if not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool) or timeout_ms <= 0:
+            raise bad("'browser.timeout_ms' must be a positive integer")
+        browser = BrowserService(url=str(string(spec, "url", required=True)), timeout_ms=timeout_ms)
     return Request(
         op=str(op),
         url=str(string(raw, "url", required=True)),
@@ -546,6 +565,7 @@ def parse_request(raw: object) -> Request:
         cookies=string(raw, "cookies"),
         user_agent=string(raw, "user_agent"),
         clearance=clearance,
+        browser=browser,
     )
 
 
@@ -734,6 +754,10 @@ def build_options(request: Request, existing: str | None, target: str) -> Values
         argv += ["--mozilla-cookies", request.cookies]
     if request.user_agent:
         argv += ["-o", "user_agent=" + request.user_agent]
+    if request.browser:
+        # FanFicFare's own switch for its browser fetcher, which install_browser_fetcher
+        # points at fanfold-browser.
+        argv += ["-o", "use_camoufox=true"]
     if existing:
         argv += ["-u"]
     else:
@@ -817,6 +841,88 @@ def apply_clearance(request: Request, clearance: Clearance, cookies: str) -> Req
     with open(os.path.join(request.workdir, "user_agent.txt"), "w") as handle:
         handle.write(user_agent)
     return dataclasses.replace(request, user_agent=user_agent)
+
+
+# ------------------------------------------------------------------------ browser service
+
+
+def browser_fetch(service: BrowserService, method: str, url: str, form: list[list[str]]) -> tuple[int, str, bytes]:
+    """The site's answer (status, final URL, body) to one request made by fanfold-browser.
+
+    The service's own refusals come back as BrowserRefused: it is cooling down after the site
+    refused it (429), or it is busy, timed out or unreachable (503).
+    """
+    import base64
+    import urllib.error
+    import urllib.request
+
+    body = json.dumps({"method": method, "url": url, "form": form, "timeout_ms": service.timeout_ms}).encode()
+    http_request = urllib.request.Request(
+        service.url.rstrip("/") + "/fetch", body, {"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(http_request, timeout=service.timeout_ms / 1000 + 30) as response:
+            answer = json.load(response)
+    except urllib.error.HTTPError as exc:
+        with exc:
+            try:
+                detail = json.load(exc)
+            except ValueError:
+                detail = {}
+        message = detail.get("message") if isinstance(detail, dict) else None
+        status = 429 if exc.code == 429 else 503
+        raise BrowserRefused(status, "fanfold-browser: %s" % (message or "HTTP %d" % exc.code)) from exc
+    except Exception as exc:  # noqa: BLE001 - any failure to talk to the service
+        raise BrowserRefused(503, "cannot reach fanfold-browser: %s" % exc) from exc
+    if not isinstance(answer, dict):
+        raise BrowserRefused(503, "fanfold-browser sent no JSON object")
+    status, final_url, encoded = answer.get("status"), answer.get("url"), answer.get("body_b64")
+    if not (isinstance(status, int) and isinstance(final_url, str) and isinstance(encoded, str)):
+        raise BrowserRefused(503, "fanfold-browser sent an answer without status, url and body")
+    return status, final_url, base64.b64decode(encoded)
+
+
+class BrowserRefused(Exception):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def install_browser_fetcher(service: BrowserService) -> None:
+    """Make FanFicFare's browser fetcher (chosen by use_camoufox, which build_options sets)
+    send every request through fanfold-browser.
+
+    FanFicFare's own CamoufoxFetcher drives a browser inside Calibre; ours asks the service,
+    which holds the only cookies. FanFicFare's in-memory cookie jar stays empty. Requests still
+    pass through Fetcher.do_request, so the page guard judges every page as before.
+    """
+    from fanficfare import exceptions
+    from fanficfare.fetchers import base_fetcher, fetcher_camoufox
+
+    class BrowserFetcher(base_fetcher.Fetcher):
+        def request(
+            self,
+            method: str,
+            url: str,
+            headers: dict[str, str] | None = None,
+            parameters: object = None,
+        ) -> base_fetcher.FetcherResponse:
+            if method not in ("GET", "POST"):
+                raise NotImplementedError()
+            form: list[list[str]] = []
+            if isinstance(parameters, dict):
+                form = [[str(k), str(v)] for k, v in parameters.items()]
+            try:
+                status, final_url, body = browser_fetch(service, method, url, form)
+            except BrowserRefused as exc:
+                raise exceptions.HTTPErrorFFF(url, exc.status, exc.message, None) from exc
+            if status >= 400:
+                raise exceptions.HTTPErrorFFF(url, status, "HTTP %d through fanfold-browser" % status, body)
+            return base_fetcher.FetcherResponse(body, final_url)
+
+    # setattr: the module attribute is what Configuration.get_fetcher instantiates.
+    setattr(fetcher_camoufox, "CamoufoxFetcher", BrowserFetcher)
 
 
 def save_cookies(options: Values, request: Request) -> None:
@@ -976,6 +1082,8 @@ def run(request: Request, buffer: io.StringIO) -> dict[str, object]:
     os.makedirs(request.workdir, exist_ok=True)
     os.chdir(request.workdir)
     install_page_guard()
+    if request.browser:
+        install_browser_fetcher(request.browser)
     capture = AdapterCapture()
     capture.install()
     if request.clearance and request.cookies:

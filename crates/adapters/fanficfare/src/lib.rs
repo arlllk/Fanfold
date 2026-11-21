@@ -30,7 +30,8 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::{
     protocol::{
-        Clearance, WorkerRequest, WorkerResponse, into_listing, into_result, parse_response,
+        BrowserRef, Clearance, WorkerRequest, WorkerResponse, into_listing, into_result,
+        parse_response,
     },
     runner::{ProcessOutput, ProcessRunner, ProcessSpec, RunError},
 };
@@ -62,6 +63,16 @@ pub struct LoginFallback {
     pub flaresolverr_timeout: Duration,
 }
 
+/// fanfold-browser: one browser that makes every request, logins included, and keeps the only
+/// cookies. With it, no session is staged and there is no login fallback.
+#[derive(Debug, Clone)]
+pub struct BrowserService {
+    /// Origin of the service.
+    pub url: url::Url,
+    /// How long one request may take there, waiting in its queue included.
+    pub timeout: Duration,
+}
+
 pub struct FanFicFareConfig {
     /// Python interpreter that can `import fanficfare` (for example a venv's).
     pub python: String,
@@ -76,6 +87,8 @@ pub struct FanFicFareConfig {
     pub redactions: Vec<SecretString>,
     /// Set when downloads go through `FlareSolverr`; see [`LoginFallback`].
     pub login_fallback: Option<LoginFallback>,
+    /// Set when every request goes through fanfold-browser; see [`BrowserService`].
+    pub browser: Option<BrowserService>,
 }
 
 impl std::fmt::Debug for FanFicFareConfig {
@@ -198,6 +211,10 @@ impl FanFicFareDownloader {
     /// never fails the download: it just runs without the session, as before.
     async fn prepare_session(&self, workdir: &Path, attempt: Attempt) -> Option<PreparedSession> {
         let support = self.session.as_ref()?;
+        if self.config.browser.is_some() {
+            // The browser keeps the only cookies; nothing is staged for the worker.
+            return None;
+        }
         // With a fallback configured, only the fallback carries the stored session: the other
         // routes start every run with no cookies at all.
         if attempt != Attempt::Fallback && self.config.login_fallback.is_some() {
@@ -342,6 +359,15 @@ impl FanFicFareDownloader {
                 Err(failed)
             }
         }
+    }
+
+    /// What the worker is told about fanfold-browser, when every request goes through it.
+    fn browser_ref<'a>(&self, url: Option<&'a str>) -> Option<BrowserRef<'a>> {
+        let timeout = self.config.browser.as_ref()?.timeout;
+        Some(BrowserRef {
+            url: url?,
+            timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        })
     }
 
     /// The page `FlareSolverr` opens to pass Cloudflare for the fallback: the site's login page.
@@ -518,6 +544,8 @@ impl FanFicFareDownloader {
             (Attempt::First, Some(p)) => p.session.as_ref().map(|s| s.user_agent.as_str()),
             _ => None,
         };
+        let browser_url = self.config.browser.as_ref().map(|b| b.url.to_string());
+        let browser = self.browser_ref(browser_url.as_deref());
         let payload = serde_json::to_vec(&WorkerRequest {
             op: task.op(),
             url: &url,
@@ -527,6 +555,7 @@ impl FanFicFareDownloader {
             cookies: cookies_str.as_deref(),
             user_agent,
             clearance,
+            browser,
         })
         .map_err(|e| {
             self.error(
@@ -818,6 +847,7 @@ mod tests {
                 url_template: "https://archiveofourown.org/works/{id}".into(),
                 redactions: vec![SecretString::from("hunter2")],
                 login_fallback: None,
+                browser: None,
             },
         )
     }
@@ -1000,6 +1030,7 @@ mod tests {
                 url_template: "https://archiveofourown.org/works/{id}".into(),
                 redactions: vec![],
                 login_fallback: None,
+                browser: None,
             },
         )
         .with_session(Arc::clone(store) as Arc<dyn SessionStore>, clock)
@@ -1086,6 +1117,7 @@ mod tests {
                 timeout: Duration::from_secs(30),
                 url_template: "https://archiveofourown.org/works/{id}".into(),
                 redactions: vec![],
+                browser: None,
                 login_fallback: Some(LoginFallback {
                     personal_ini: PathBuf::from(LOGIN_INI),
                     direct_ini: PathBuf::from(DIRECT_INI),
@@ -1236,6 +1268,7 @@ mod tests {
                 timeout: Duration::from_secs(30),
                 url_template: "https://archiveofourown.org/works/{id}".into(),
                 redactions: vec![],
+                browser: None,
                 login_fallback: Some(LoginFallback {
                     personal_ini: PathBuf::from(LOGIN_INI),
                     direct_ini: PathBuf::from(DIRECT_INI),
@@ -1430,6 +1463,48 @@ mod tests {
             "cookies the run did not mention are kept"
         );
         assert_eq!(after.user_agent, "FlareSolverrUA/9");
+    }
+
+    /// Cloudflare ties its clearance to the client that earned it: through fanfold-browser no
+    /// cookie or User-Agent may be handed to the worker, whatever is stored.
+    #[tokio::test]
+    async fn through_the_browser_service_the_worker_gets_only_its_address() {
+        let scratch = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySession::new());
+        store.save(&stored_session(NOW - 100)).await.unwrap();
+        let runner = Arc::new(CookieRunner::new(None, "refused"));
+        let mut dl = with_session(Arc::clone(&runner), scratch.path(), &store);
+        dl.config.browser = Some(BrowserService {
+            url: "http://fanfold-browser:8191".parse().unwrap(),
+            timeout: Duration::from_secs(180),
+        });
+        for tries in 0..2 {
+            let _ = dl
+                .download(&DownloadRequest {
+                    tries,
+                    ..request(None)
+                })
+                .await;
+            let req = runner.request.lock().unwrap().clone().unwrap();
+            assert_eq!(
+                req["browser"],
+                serde_json::json!({"url": "http://fanfold-browser:8191/", "timeout_ms": 180_000})
+            );
+            assert_eq!(
+                (&req["cookies"], &req["user_agent"], &req["clearance"]),
+                (
+                    &serde_json::Value::Null,
+                    &serde_json::Value::Null,
+                    &serde_json::Value::Null
+                ),
+                "try {tries}"
+            );
+        }
+        assert_eq!(
+            store.load().await.unwrap(),
+            Some(stored_session(NOW - 100)),
+            "nothing written back"
+        );
     }
 
     #[tokio::test]
@@ -1845,6 +1920,7 @@ mod tests {
                 // FanFicFare's offline site, so the download itself needs no network.
                 url_template: "http://test1.com?sid={id}".into(),
                 redactions: vec![],
+                browser: None,
                 login_fallback: Some(LoginFallback {
                     personal_ini: login_ini.clone(),
                     direct_ini: login_ini,
@@ -1926,6 +2002,7 @@ mod tests {
                     url_template: "http://test1.com?sid=668".into(),
                     redactions: vec![],
                     login_fallback: None,
+                    browser: None,
                 },
             )
         };
@@ -1958,6 +2035,7 @@ mod tests {
                 url_template: url_template.into(),
                 redactions: vec![],
                 login_fallback: None,
+                browser: None,
             },
         )
     }
@@ -2429,6 +2507,7 @@ mod tests {
                 url_template: "http://test1.com?sid={id}".into(),
                 redactions: vec![],
                 login_fallback: None,
+                browser: None,
             },
         );
 
@@ -2457,6 +2536,7 @@ mod tests {
                 url_template: "http://nosuchsite.invalid/{id}".into(),
                 redactions: vec![],
                 login_fallback: None,
+                browser: None,
             },
         );
         assert_eq!(

@@ -131,6 +131,23 @@ pub struct FlareSolverrConfig {
     pub sessions: bool,
 }
 
+/// Send every request to AO3 through fanfold-browser (one browser that keeps the only cookies
+/// and paces the requests). Replaces `[downloader.flaresolverr]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserConfig {
+    /// Origin of the service, e.g. `http://fanfold-browser:8191`.
+    pub url: url::Url,
+    /// How long one request may take there, waiting in its queue included. Must be shorter than
+    /// `downloader.timeout`.
+    #[serde(default = "default_browser_timeout")]
+    pub timeout: Dur,
+}
+
+const fn default_browser_timeout() -> Dur {
+    Dur(Duration::from_secs(180))
+}
+
 const fn default_flaresolverr_timeout() -> Dur {
     Dur(Duration::from_secs(60))
 }
@@ -142,6 +159,8 @@ pub struct DownloaderConfig {
     pub timeout: Dur,
     /// Optional. See [`FlareSolverrConfig`].
     pub flaresolverr: Option<FlareSolverrConfig>,
+    /// Optional. See [`BrowserConfig`].
+    pub browser: Option<BrowserConfig>,
     /// Optional HTTP proxy for FanFicFare's plain requests to AO3 (every try that does not go
     /// through `FlareSolverr`), e.g. one that leaves from a home connection. A `FlareSolverr`
     /// server's own browser is pointed at a proxy in its own settings.
@@ -157,6 +176,7 @@ impl Default for DownloaderConfig {
             python: "python3".into(),
             timeout: Dur(Duration::from_secs(600)),
             flaresolverr: None,
+            browser: None,
             proxy: None,
             personal_ini: PathBuf::from("/run/fanfold/personal.ini"),
         }
@@ -519,9 +539,40 @@ impl Config {
             "web.page_size must be 5-100",
         );
         require(
-            self.ao3.is_some() || self.downloader.flaresolverr.is_some(),
-            "[ao3] is required unless downloader.flaresolverr is set",
+            self.ao3.is_some()
+                || self.downloader.flaresolverr.is_some()
+                || self.downloader.browser.is_some(),
+            "[ao3] is required unless downloader.flaresolverr or downloader.browser is set",
         );
+        if let Some(browser) = &self.downloader.browser {
+            let url = &browser.url;
+            require(
+                matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
+                "downloader.browser.url must be an http(s) URL with a host",
+            );
+            require(
+                matches!(url.path(), "" | "/") && url.query().is_none(),
+                "downloader.browser.url must be just an origin (no path or query)",
+            );
+            require(
+                url.username().is_empty() && url.password().is_none(),
+                "downloader.browser.url cannot carry credentials",
+            );
+            require(
+                !browser.timeout.0.is_zero() && browser.timeout.0 < self.downloader.timeout.0,
+                "downloader.browser.timeout must be greater than 0 and shorter than downloader.timeout",
+            );
+            require(
+                self.downloader.flaresolverr.is_none(),
+                "downloader.browser and downloader.flaresolverr cannot both be set: \
+                 the browser makes every request",
+            );
+            require(
+                self.downloader.proxy.is_none(),
+                "downloader.proxy has no effect with downloader.browser: \
+                 set the browser's own proxy (fanfold-browser's BROWSER_PROXY)",
+            );
+        }
         if let Some(fs) = &self.downloader.flaresolverr {
             for problem in fs.problems(self.downloader.timeout.0) {
                 require(false, &problem);
@@ -717,6 +768,58 @@ password = { env = "AO3_PASSWORD" }
     }
 
     /// MINIMAL without its `[ao3]` table, plus `FlareSolverr`.
+    fn via_browser(extra: &str) -> String {
+        let without_ao3 = MINIMAL.split("[ao3]").next().unwrap();
+        format!(
+            "{without_ao3}\n[downloader.browser]\nurl = \"http://fanfold-browser:8191\"\n{extra}"
+        )
+    }
+
+    #[test]
+    fn the_browser_service_needs_no_login_and_defaults_its_timeout() {
+        let c = parse(&via_browser("")).unwrap();
+        let browser = c.downloader.browser.unwrap();
+        assert_eq!(browser.url.as_str(), "http://fanfold-browser:8191/");
+        assert_eq!(browser.timeout.0, Duration::from_secs(180));
+        assert!(c.ao3.is_none());
+    }
+
+    #[test]
+    fn the_browser_service_is_checked_and_replaces_flaresolverr_and_the_proxy() {
+        for (text, problem) in [
+            (
+                via_browser("timeout = \"20m\""),
+                "shorter than downloader.timeout",
+            ),
+            (
+                via_browser("").replace("http://fanfold-browser:8191", "http://u:p@b:8191"),
+                "credentials",
+            ),
+            (
+                via_browser("").replace("http://fanfold-browser:8191", "http://b:8191/v1"),
+                "just an origin",
+            ),
+            (
+                format!(
+                    "{}\n[downloader.flaresolverr]\nurl = \"http://fs:8191\"\n",
+                    via_browser("")
+                ),
+                "cannot both be set",
+            ),
+        ] {
+            let problems = invalid(&text);
+            assert!(
+                problems.iter().any(|p| p.contains(problem)),
+                "{problem}: {problems:?}"
+            );
+        }
+        let with_proxy = via_browser("").replace(
+            "[downloader.browser]",
+            "[downloader]\nproxy = \"http://home:8080\"\n[downloader.browser]",
+        );
+        assert!(invalid(&with_proxy).iter().any(|p| p.contains("no effect")));
+    }
+
     #[test]
     fn byparr_through_a_home_proxy() {
         let without_ao3 = MINIMAL.split("[ao3]").next().unwrap();
@@ -775,7 +878,7 @@ password = { env = "AO3_PASSWORD" }
         let problems = invalid(without_ao3);
         assert_eq!(
             problems,
-            ["[ao3] is required unless downloader.flaresolverr is set"]
+            ["[ao3] is required unless downloader.flaresolverr or downloader.browser is set"]
         );
     }
 

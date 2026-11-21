@@ -40,6 +40,7 @@ jobs:
       contents: read
     outputs:
       code: ${{ steps.diff.outputs.code }}
+      browser: ${{ steps.diff.outputs.browser }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -51,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$GITHUB_REF" = refs/heads/main ]; then
-            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+            echo "code=true" >> "$GITHUB_OUTPUT"; echo "browser=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
           if [ "$EVENT" = pull_request ]; then
             base=HEAD^1   # the checkout is the PR merged into its base
@@ -62,6 +63,9 @@ jobs:
           printf 'changed:\n%s\n' "$changed"
           if grep -qvE '^docs/|\.md$' <<<"$changed"; then code=true; else code=false; fi
           echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+          if grep -qE '^(browser/|\.github/workflows/browser-image\.yml$)' <<<"$changed"; then
+            browser=true; else browser=false; fi
+          echo "browser=$browser" | tee -a "$GITHUB_OUTPUT"
 
   rust:
     needs: changes
@@ -129,6 +133,14 @@ jobs:
           "$FFD_PYTHON" -I -B -m unittest discover -s scripts
           cargo test --locked -p fanfold-adapter-fanficfare -- --ignored
 
+      # fanfold-browser's queue, pacing and cool-down, with a fake browser (no Camoufox, no
+      # network); and its lock must match its pyproject.toml.
+      - name: Browser service
+        run: |
+          set -euo pipefail
+          python3 -I -B -m unittest discover -s browser
+          uv lock --project browser --check
+
       - name: Integration, end to end
         run: scripts/with-postgres.sh cargo test --locked -p fanfold-server --test e2e -- --ignored
 
@@ -144,9 +156,17 @@ jobs:
       DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
       DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
 
+  browser-image:
+    needs: changes
+    if: needs.changes.outputs.browser == 'true' && format('{0}', inputs.image) != 'false'
+    permissions:
+      contents: read
+      packages: write # not used without a version; required by the called workflow
+    uses: ./.github/workflows/browser-image.yml
+
   ci-ok:
     if: always()
-    needs: [changes, rust, image]
+    needs: [changes, rust, image, browser-image]
     runs-on: ubuntu-26.04
     timeout-minutes: 2
     permissions: {}

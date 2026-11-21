@@ -4,7 +4,8 @@ use std::{sync::Arc, time::Duration};
 
 use fanfold_adapter_discord::DiscordNotifier;
 use fanfold_adapter_fanficfare::{
-    FanFicFareConfig, FanFicFareDownloader, LoginFallback, runner::ProcessRunner, sweep_stale,
+    BrowserService, FanFicFareConfig, FanFicFareDownloader, LoginFallback, runner::ProcessRunner,
+    sweep_stale,
 };
 use fanfold_adapter_fs::FsLibrary;
 use fanfold_adapter_jmap::{JmapSettings, PushConfig, PushWatcher, ResilientMailSource};
@@ -125,6 +126,18 @@ fn write_fanficfare_settings(
     config: &Config,
     credentials: Option<(&SecretString, &SecretString)>,
 ) -> Result<Option<LoginFallback>, StartupError> {
+    if config.downloader.browser.is_some() {
+        // Through fanfold-browser FanFicFare logs in only when a page asks for it: the browser
+        // keeps the login (and every other cookie) between downloads.
+        let ini = render_login_fallback_ini(credentials)?;
+        write_private(&config.downloader.personal_ini, &ini).map_err(|e| {
+            StartupError::Io(format!(
+                "cannot write {}: {e}",
+                config.downloader.personal_ini.display()
+            ))
+        })?;
+        return Ok(None);
+    }
     let flaresolverr = config
         .downloader
         .flaresolverr
@@ -219,10 +232,19 @@ pub fn build_worker_with(
             url_template: url_template.to_owned(),
             redactions,
             login_fallback,
+            browser: config.downloader.browser.as_ref().map(|b| BrowserService {
+                url: b.url.clone(),
+                timeout: b.timeout.0,
+            }),
         },
-    )
-    // The browser session (cookies + User-Agent) is imported from the web UI.
-    .with_session(Arc::<PgStore>::clone(store), Arc::new(SystemClock));
+    );
+    // The browser session (cookies + User-Agent) is imported from the web UI. Through
+    // fanfold-browser there is none to stage: the browser keeps its own cookies.
+    let downloader = if config.downloader.browser.is_some() {
+        downloader
+    } else {
+        downloader.with_session(Arc::<PgStore>::clone(store), Arc::new(SystemClock))
+    };
 
     let notifier = build_notifier(config, secrets)?;
 
