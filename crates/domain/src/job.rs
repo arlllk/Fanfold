@@ -210,6 +210,11 @@ pub struct Job {
     pub state: JobState,
     /// Failures that consumed retry budget so far.
     pub attempt: u32,
+    /// Failed tries since the job was last queued by hand, whether they spent budget or not.
+    /// Paces the back-off (so a long AO3 outage is probed ever more rarely, not every minute)
+    /// and lets the downloader vary how each try fetches.
+    #[serde(default)]
+    pub tries: u32,
     /// Earliest time a queued job may be claimed.
     pub next_attempt_at: Timestamp,
     pub created_at: Timestamp,
@@ -229,6 +234,7 @@ impl Job {
             source,
             state: JobState::Queued,
             attempt: 0,
+            tries: 0,
             next_attempt_at: now,
             created_at: now,
             updated_at: now,
@@ -278,6 +284,7 @@ impl Job {
         self.expect(&[JobState::Running], "fail")?;
         self.updated_at = now;
         self.last_error = Some(message);
+        self.tries = self.tries.saturating_add(1);
         if kind.consumes_attempt() {
             self.attempt = self.attempt.saturating_add(1);
         }
@@ -286,7 +293,7 @@ impl Job {
             self.state = JobState::Failed;
             return Ok(Resolution::GaveUp);
         }
-        let delay = policy.delay(self.attempt.saturating_sub(1), jitter);
+        let delay = policy.delay(self.tries.saturating_sub(1), jitter);
         let at = timestamp::add(now, delay);
         self.state = JobState::Queued;
         self.next_attempt_at = at;
@@ -298,6 +305,7 @@ impl Job {
         self.expect(&[JobState::Failed, JobState::Cancelled], "retry")?;
         self.state = JobState::Queued;
         self.attempt = 0;
+        self.tries = 0;
         self.next_attempt_at = now;
         self.updated_at = now;
         Ok(())
@@ -312,6 +320,7 @@ impl Job {
         )?;
         self.state = JobState::Queued;
         self.attempt = 0;
+        self.tries = 0;
         self.next_attempt_at = now;
         self.updated_at = now;
         self.force = true;
@@ -455,6 +464,41 @@ mod tests {
             assert_eq!(job.attempt, 0);
             job.start(t(11 + round)).unwrap();
         }
+    }
+
+    /// AO3's bot filter answers every try the same way: retrying each minute only keeps the
+    /// client flagged, so tries that spend no budget still back off.
+    #[test]
+    fn site_wide_failures_back_off_exponentially() {
+        let mut job = running();
+        let mut retry_ats = Vec::new();
+        for round in 0..4 {
+            let res = job
+                .fail(
+                    t(10_000 * round),
+                    FailureKind::RateLimited,
+                    "429".into(),
+                    &POLICY,
+                    0.5,
+                )
+                .unwrap();
+            retry_ats.push(res);
+            job.start(t(10_000 * round + 1)).unwrap();
+        }
+        assert_eq!(
+            retry_ats,
+            [
+                Resolution::Retrying { at: t(60) },
+                Resolution::Retrying { at: t(10_120) },
+                Resolution::Retrying { at: t(20_240) },
+                Resolution::Retrying { at: t(30_480) },
+            ]
+        );
+        assert_eq!((job.attempt, job.tries), (0, 4));
+        job.fail(t(90_000), FailureKind::Permanent, "x".into(), &POLICY, 0.5)
+            .unwrap();
+        job.retry(t(90_001)).unwrap();
+        assert_eq!(job.tries, 0, "a manual retry starts the pacing over");
     }
 
     #[test]

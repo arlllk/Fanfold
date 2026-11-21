@@ -121,7 +121,7 @@ password = { file = "/run/secrets/x" } # a file (a trailing newline is ignored)
 | `[ao3]` | `username`, `password` | Your AO3 login. Required unless you use FlareSolverr; with FlareSolverr it is optional and only used for works that need a login. |
 | `[downloader]` | `python`, `timeout` (`10m`), `personal_ini` | The Python with FanFicFare installed, the longest one download may take, and where the generated FanFicFare settings are written. |
 | `[downloader.flaresolverr]` | `url`, `timeout` (`60s`) | Optional. Fetch through FlareSolverr. See [Getting past Cloudflare](#getting-past-cloudflare). |
-| `[retry]` | `max_attempts` (5), `base` (`1m`), `cap` (`1h`) | A failing job is retried with a doubling delay. Only failures that are the work's own fault use up attempts; AO3 being down does not. |
+| `[retry]` | `max_attempts` (5), `base` (`1m`), `cap` (`1h`) | A failing job is retried with a doubling delay (with `1m`/`1h`: 1, 2, 4, 8... minutes, then hourly), AO3 outages and rate limits included, so a struggling AO3 is asked ever more rarely. Only failures that are the work's own fault use up attempts; AO3 being down does not. |
 | `[breaker]` | `failure_threshold` (3), `open_for` (`2m`), `max_open_for` (`1h`) | After this many site-wide failures in a row, Fanfold pauses downloads and probes now and then. |
 | `[worker]` | `poll_interval` (`5s`), `concurrency` (1) | Keep concurrency at 1: AO3 rate-limits. |
 | `[web]` | `listen` (`0.0.0.0:8080`), `ops_listen` (`0.0.0.0:9090`), `page_size` (20) | The interface, and the health and metrics port. |
@@ -249,20 +249,26 @@ url = "http://flaresolverr:8191"    # the origin only
 timeout = "60s"                     # per request; must be below downloader.timeout
 ```
 
-Every download is then tried like this:
+Each try of a download goes one of two ways, taking turns: the first try, the third, and so
+on go through FlareSolverr; the second, the fourth, and so on fetch directly. AO3's bot filter
+and Cloudflare judge the two apart, so when one is being refused, the next try (after the
+back-off) can still get through the other. The job log says which way each try went.
 
-1. **Anonymously, through FlareSolverr.** This is the normal path and it covers public works.
-   In testing, full downloads took 15-30 seconds. If FlareSolverr is down, jobs wait and retry
-   without using up their attempts, and finish once it is back.
-2. **Only if AO3 says the work needs a login**, a **login fallback** runs. AO3 rejects a login
+1. **Anonymously, through FlareSolverr** (odd tries). This is usually the better route, and it
+   covers public works. In testing, full downloads took 15-30 seconds. If FlareSolverr is down,
+   jobs wait and retry without using up their attempts, and finish once it is back.
+2. **Directly, without FlareSolverr** (even tries): plain requests, the way FanFicFare fetches on
+   its own, with the stored login cookie, logging in with the `[ao3]` credentials only if AO3
+   asks for it.
+3. **Only if AO3 says the work needs a login**, a **login fallback** runs. AO3 rejects a login
    form submitted *through* FlareSolverr (it answers "Auth Error"), so FlareSolverr is used
    only to pass Cloudflare. Fanfold then fetches over plain HTTP carrying that clearance, using
    the login cookie it has stored, and if there is no valid one, it logs in with the `[ao3]`
    credentials and stores the new cookie.
 
 So keep `[ao3]` if you want restricted works, and leave it out if you only want public ones
-(nothing then ever sends a password anywhere). Your credentials are never used for anything
-but the fallback.
+(nothing then ever sends a password anywhere). Your credentials are only ever sent when AO3
+asks for a login.
 
 **The login lasts about 3 months and renews itself.** AO3's "remember me" cookie
 (`remember_user_token`) is valid for 92 days from a real login, and the fallback stores it, so

@@ -1091,7 +1091,11 @@ impl Downloader for ScriptedDownloader {
             })
     }
 
-    async fn list_series(&self, series: SeriesId) -> Result<SeriesMetadata, DownloadError> {
+    async fn list_series(
+        &self,
+        series: SeriesId,
+        _tries: u32,
+    ) -> Result<SeriesMetadata, DownloadError> {
         let mut state = lock(&self.state);
         state.listed.push(series);
         state

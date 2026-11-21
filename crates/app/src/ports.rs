@@ -460,6 +460,9 @@ pub struct DownloadRequest {
     pub work: WorkId,
     /// Existing library file to update incrementally, when there is one.
     pub existing: Option<PathBuf>,
+    /// Tries of this job that already failed ([`fanfold_domain::job::Job::tries`]): a
+    /// downloader with more than one way to fetch varies it by this.
+    pub tries: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -490,7 +493,12 @@ pub trait Downloader: Send + Sync {
     async fn download(&self, request: &DownloadRequest) -> Result<DownloadedBook, DownloadError>;
 
     /// List a series: its facts and its works in order. Fails like a download does.
-    async fn list_series(&self, series: SeriesId) -> Result<SeriesMetadata, DownloadError>;
+    /// `tries` is as in [`DownloadRequest::tries`].
+    async fn list_series(
+        &self,
+        series: SeriesId,
+        tries: u32,
+    ) -> Result<SeriesMetadata, DownloadError>;
 
     /// Discard whatever scratch space backs `book`. Called exactly once for every
     /// book `download` returned, after it was published or abandoned. Best effort:

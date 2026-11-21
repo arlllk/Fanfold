@@ -253,7 +253,11 @@ impl Worker {
         let book = self
             .ports
             .downloader
-            .download(&DownloadRequest { work, existing })
+            .download(&DownloadRequest {
+                work,
+                existing,
+                tries: job.tries,
+            })
             .await?;
 
         // The chapters recorded before this download tell what an update added.
@@ -386,7 +390,7 @@ impl Worker {
 
     /// List a series, follow it, and queue every work in it.
     async fn list_and_queue(&self, job: &Job, series: SeriesId) -> Result<Listed, DownloadError> {
-        let listing = self.ports.downloader.list_series(series).await?;
+        let listing = self.ports.downloader.list_series(series, job.tries).await?;
         if listing.facts.works.is_empty() {
             // An error page in place of the series page lists nothing; never "succeed" on it.
             return Err(DownloadError {
