@@ -145,9 +145,19 @@ pub fn build_worker_with(
         write_private(&fallback_path, &fallback_ini).map_err(|e| {
             StartupError::Io(format!("cannot write {}: {e}", fallback_path.display()))
         })?;
+        // The tries that skip FlareSolverr fetch exactly as without it: plain requests, and a
+        // fresh login on every run when there are credentials (what AutomatedFanfic does).
+        let direct_path = config
+            .downloader
+            .personal_ini
+            .with_file_name("personal-direct.ini");
+        write_private(&direct_path, &render_personal_ini(credentials, None)?).map_err(|e| {
+            StartupError::Io(format!("cannot write {}: {e}", direct_path.display()))
+        })?;
         (
             render_personal_ini(None, Some(fs))?,
             Some(LoginFallback {
+                direct_ini: direct_path,
                 personal_ini: fallback_path,
                 flaresolverr: fs.url.clone(),
                 flaresolverr_timeout: fs.timeout,
