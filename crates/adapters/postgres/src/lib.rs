@@ -65,7 +65,7 @@ fn backend(e: &sqlx::Error) -> RepoError {
 
 macro_rules! job_columns {
     () => {
-        "id, target_kind, target_id, source, state, attempt, next_attempt_at_ms, created_at_ms, updated_at_ms, last_error, force"
+        "id, target_kind, target_id, source, state, attempt, next_attempt_at_ms, created_at_ms, updated_at_ms, last_error, force, tries"
     };
 }
 
@@ -78,6 +78,7 @@ fn job_from_row(row: &PgRow) -> Result<Job, RepoError> {
     let source: String = row.try_get("source").map_err(|e| backend(&e))?;
     let state: String = row.try_get("state").map_err(|e| backend(&e))?;
     let attempt: i32 = row.try_get("attempt").map_err(|e| backend(&e))?;
+    let tries: i32 = row.try_get("tries").map_err(|e| backend(&e))?;
     let kind: String = row.try_get("target_kind").map_err(|e| backend(&e))?;
     let kind = kind
         .parse::<TargetKind>()
@@ -89,6 +90,7 @@ fn job_from_row(row: &PgRow) -> Result<Job, RepoError> {
         source: source.parse::<JobSource>().map_err(|_| corrupt("source"))?,
         state: state.parse::<JobState>().map_err(|_| corrupt("state"))?,
         attempt: u32::try_from(attempt).map_err(|_| corrupt("attempt"))?,
+        tries: u32::try_from(tries).map_err(|_| corrupt("tries"))?,
         next_attempt_at: ts(row.try_get("next_attempt_at_ms").map_err(|e| backend(&e))?)?,
         created_at: ts(row.try_get("created_at_ms").map_err(|e| backend(&e))?)?,
         updated_at: ts(row.try_get("updated_at_ms").map_err(|e| backend(&e))?)?,
@@ -213,7 +215,7 @@ impl JobRepository for PgStore {
     async fn save(&self, job: &Job) -> Result<(), RepoError> {
         let result = sqlx::query(
             "UPDATE jobs SET state = $2, attempt = $3, next_attempt_at_ms = $4, updated_at_ms = $5, last_error = $6,
-                 force = $7
+                 force = $7, tries = $8
              WHERE id = $1",
         )
         .bind(job.id.get())
@@ -223,6 +225,7 @@ impl JobRepository for PgStore {
         .bind(to_millis(job.updated_at))
         .bind(job.last_error.as_deref())
         .bind(job.force)
+        .bind(i32::try_from(job.tries).unwrap_or(i32::MAX))
         .execute(&self.pool)
         .await
         .map_err(|e| match &e {

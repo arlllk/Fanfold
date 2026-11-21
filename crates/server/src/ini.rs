@@ -94,8 +94,10 @@ pub fn render_personal_ini(
             "always_login:true\nusername:{username}\npassword:{password}\n"
         );
     }
-    // Retries per request, on top of FanFicFare's own backoff.
-    ini.push_str("max_request_retries:6\n");
+    // Re-sends of one page (2, 4, 8 s apart). Few on purpose: a refused try is retried by
+    // the job, with a back-off that grows to an hour, and a burst of re-sends is exactly
+    // what keeps AO3's bot filter refusing.
+    ini.push_str("max_request_retries:3\n");
     Ok(SecretString::from(ini))
 }
 
@@ -114,7 +116,7 @@ pub fn render_login_fallback_ini(
         let password = check("AO3 password", password.expose_secret())?;
         let _ = write!(ini, "username:{username}\npassword:{password}\n");
     }
-    ini.push_str("max_request_retries:6\n");
+    ini.push_str("max_request_retries:3\n");
     Ok(SecretString::from(ini))
 }
 
@@ -150,7 +152,7 @@ mod tests {
         let ini = render_personal_ini(Some((&secret("alice"), &secret("hunter2"))), None).unwrap();
         assert_eq!(
             ini.expose_secret(),
-            "[archiveofourown.org]\nis_adult:true\nalways_login:true\nusername:alice\npassword:hunter2\nmax_request_retries:6\n"
+            "[archiveofourown.org]\nis_adult:true\nalways_login:true\nusername:alice\npassword:hunter2\nmax_request_retries:3\n"
         );
     }
 
@@ -243,7 +245,7 @@ mod tests {
              flaresolverr_proxy_protocol:http\nflaresolverr_proxy_address:flaresolverr\n\
              flaresolverr_proxy_port:8191\nflaresolverr_proxy_timeout:60000\n\
              connect_timeout:90\n\n\
-             [archiveofourown.org]\nis_adult:true\nmax_request_retries:6\n"
+             [archiveofourown.org]\nis_adult:true\nmax_request_retries:3\n"
         );
         assert!(!ini.contains("always_login") && !ini.contains("username"));
     }
@@ -282,7 +284,7 @@ mod tests {
         let ini = render_personal_ini(None, None).unwrap();
         assert_eq!(
             ini.expose_secret(),
-            "[archiveofourown.org]\nis_adult:true\nmax_request_retries:6\n"
+            "[archiveofourown.org]\nis_adult:true\nmax_request_retries:3\n"
         );
     }
 

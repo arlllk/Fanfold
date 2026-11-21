@@ -217,7 +217,7 @@ async fn save_and_get_roundtrip(repo: &dyn JobRepository) {
     let stored = repo.get(job.id).await.unwrap().unwrap();
     assert_eq!(stored, job);
     assert_eq!(stored.state, JobState::Queued);
-    assert_eq!(stored.attempt, 1);
+    assert_eq!((stored.attempt, stored.tries), (1, 1));
     assert_eq!(
         stored.last_error.as_deref(),
         Some("boom: \"quoted\" \u{1F4A5}\nline2")

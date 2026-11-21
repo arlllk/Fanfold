@@ -37,7 +37,9 @@ personal_ini = "/run/fanfold/personal.ini"
 
 # Optional. Fetch pages through a FlareSolverr server (a real browser that passes Cloudflare's
 # checks) instead of plain requests. Use it when AO3 answers the plain requests with Cloudflare
-# errors (525) or challenges. Works that need a login are fetched by a fallback that uses
+# errors (525) or challenges. Tries then take turns: one through FlareSolverr, the next one
+# directly (plain requests), so a route AO3 is refusing never fails a job. Works that need a
+# login are fetched by a fallback that uses
 # FlareSolverr only to pass Cloudflare (AO3 rejects logins sent through it), so keep [ao3]
 # above if you want those; remove it if you only want public works.
 # [downloader.flaresolverr]
@@ -46,7 +48,7 @@ personal_ini = "/run/fanfold/personal.ini"
 
 [retry]
 max_attempts = 5            # failures that count against a job (outages do not)
-base = "1m"                 # first retry delay; doubles each time
+base = "1m"                 # first retry delay; doubles each try, outages included
 cap = "1h"
 
 [breaker]

@@ -113,8 +113,20 @@ enum Attempt {
     /// anonymously, so no cookies are sent along (they would mix with its own browser's);
     /// otherwise it is plain requests with the stored session.
     First,
+    /// With a login fallback configured, every other try skips `FlareSolverr` altogether:
+    /// plain requests, as `AutomatedFanfic` fetches, with the stored login cookie (none of
+    /// Cloudflare's: those belong to `FlareSolverr`'s browser) and FanFicFare's own
+    /// `User-Agent`, logging in with the account when AO3 asks. AO3's bot filter and
+    /// Cloudflare judge the two routes apart, so when one is refused the next try may pass.
+    Direct,
     /// The login fallback: Cloudflare passed by `FlareSolverr`, then plain requests.
     Fallback,
+}
+
+/// Cookies Cloudflare sets for the browser that passed its check. Sent from anywhere else
+/// they do not help, and may mark the request as a replay.
+fn is_cloudflare_cookie(name: &str) -> bool {
+    name == "cf_clearance" || name.starts_with("__cf") || name == "_cfuvid"
 }
 
 /// Cookie values shorter than this are not scrubbed from logs: a value like `true`
@@ -202,9 +214,19 @@ impl FanFicFareDownloader {
                 None
             }
         };
+        let now = support.clock.now();
         let text = match &stored {
-            Some(session) => to_netscape(&session.live_cookies(support.clock.now())),
-            None if attempt == Attempt::Fallback => to_netscape(&[]),
+            Some(session) if attempt == Attempt::Direct => {
+                let cookies: Vec<_> = session
+                    .live_cookies(now)
+                    .into_iter()
+                    .filter(|c| !is_cloudflare_cookie(&c.name))
+                    .collect();
+                to_netscape(&cookies)
+            }
+            Some(session) => to_netscape(&session.live_cookies(now)),
+            // Start from nothing, so a login FanFicFare does is kept for next time.
+            None if attempt != Attempt::First => to_netscape(&[]),
             None => return None,
         };
         let cookies_file = workdir.join("cookies.txt");
@@ -274,6 +296,62 @@ impl FanFicFareDownloader {
                 tracing::info!("a browser session was imported meanwhile; not overwriting it");
             }
             Err(e) => tracing::warn!(error = %e, "cannot save the new session"),
+        }
+    }
+
+    /// How a job's next try fetches, after `tries` failed ones. With `FlareSolverr` configured
+    /// the tries alternate: through it first (usually the better route), then directly, and so
+    /// on, so that one route being refused never fails a job the other could fetch.
+    const fn route(&self, tries: u32) -> Attempt {
+        if self.config.login_fallback.is_some() && tries % 2 == 1 {
+            Attempt::Direct
+        } else {
+            Attempt::First
+        }
+    }
+
+    const fn route_name(&self, route: Attempt) -> &'static str {
+        match (route, &self.config.login_fallback) {
+            (Attempt::First, Some(_)) => "through FlareSolverr",
+            (Attempt::Direct, _) => "directly, without FlareSolverr",
+            (Attempt::Fallback, _) => "the login fallback",
+            (Attempt::First, None) => "directly",
+        }
+    }
+
+    /// The job-log line telling which route a try took.
+    fn route_line(&self, route: Attempt, tries: u32) -> String {
+        let other = match route {
+            Attempt::Direct => "through FlareSolverr",
+            _ => "directly",
+        };
+        format!(
+            "Try {} fetched {}; the next try goes {other}.",
+            u64::from(tries) + 1,
+            self.route_name(route)
+        )
+    }
+
+    /// Prefix the outcome's log with [`Self::route_line`] when routes alternate.
+    fn note_route(
+        &self,
+        route: Attempt,
+        tries: u32,
+        result: Result<DownloadedBook, DownloadError>,
+    ) -> Result<DownloadedBook, DownloadError> {
+        if self.config.login_fallback.is_none() {
+            return result;
+        }
+        let line = self.route_line(route, tries);
+        match result {
+            Ok(mut book) => {
+                book.log = format!("{line}\n{}", book.log);
+                Ok(book)
+            }
+            Err(mut failed) => {
+                failed.log = format!("{line}\n{}", failed.log);
+                Err(failed)
+            }
         }
     }
 
@@ -422,7 +500,8 @@ impl FanFicFareDownloader {
             .map(|p| p.to_string_lossy().into_owned());
         let fallback = self.config.login_fallback.as_ref();
         let ini_path = match (attempt, fallback) {
-            (Attempt::Fallback, Some(fallback)) => Some(&fallback.personal_ini),
+            // Plain requests, logging in only when a page asks for it.
+            (Attempt::Direct | Attempt::Fallback, Some(fallback)) => Some(&fallback.personal_ini),
             _ => self.config.personal_ini.as_ref(),
         };
         let ini_str = ini_path.map(|p| p.to_string_lossy().into_owned());
@@ -596,7 +675,8 @@ async fn remove_dir(dir: &Path) {
 impl Downloader for FanFicFareDownloader {
     async fn download(&self, request: &DownloadRequest) -> Result<DownloadedBook, DownloadError> {
         let workdir = self.make_workdir(request).await?;
-        let first = self.run_worker(request, &workdir, Attempt::First).await;
+        let route = self.route(request.tries);
+        let first = self.run_worker(request, &workdir, route).await;
         let result = match first {
             // AO3 says the work needs a login: try again the way that can log in.
             Err(refused)
@@ -614,9 +694,12 @@ impl Downloader for FanFicFareDownloader {
                     }
                     Err(mut failed) => {
                         failed.log = format!(
-                            "The anonymous attempt through FlareSolverr failed: {}\n\n\
+                            "The first attempt ({}) failed: {}\n\n\
                              The login fallback then failed: {}\n{}",
-                            refused.message, failed.message, failed.log
+                            self.route_name(route),
+                            refused.message,
+                            failed.message,
+                            failed.log
                         );
                         Err(failed)
                     }
@@ -624,6 +707,7 @@ impl Downloader for FanFicFareDownloader {
             }
             other => other,
         };
+        let result = self.note_route(route, request.tries, result);
         if result.is_err() {
             // No book will be handed out, so nobody would call `release`.
             remove_dir(&workdir).await;
@@ -631,9 +715,14 @@ impl Downloader for FanFicFareDownloader {
         result
     }
 
-    async fn list_series(&self, series: SeriesId) -> Result<SeriesMetadata, DownloadError> {
+    async fn list_series(
+        &self,
+        series: SeriesId,
+        tries: u32,
+    ) -> Result<SeriesMetadata, DownloadError> {
         let workdir = self.make_dir(&format!("series-{series}")).await?;
-        let result = match self.run_listing(series, &workdir, Attempt::First).await {
+        let route = self.route(tries);
+        let result = match self.run_listing(series, &workdir, route).await {
             // A series of restricted works may need a login, like a work.
             Err(refused)
                 if refused.kind == FailureKind::AuthFailed
@@ -644,13 +733,23 @@ impl Downloader for FanFicFareDownloader {
                     .await
                     .map_err(|mut failed| {
                         failed.log = format!(
-                            "The anonymous attempt failed: {}\n\nThe login fallback then failed: {}\n{}",
-                            refused.message, failed.message, failed.log
+                            "The first attempt ({}) failed: {}\n\nThe login fallback then failed: {}\n{}",
+                            self.route_name(route),
+                            refused.message,
+                            failed.message,
+                            failed.log
                         );
                         failed
                     })
             }
             other => other,
+        };
+        let result = match self.config.login_fallback {
+            Some(_) => result.map_err(|mut failed| {
+                failed.log = format!("{}\n{}", self.route_line(route, tries), failed.log);
+                failed
+            }),
+            None => result,
         };
         // A listing hands nothing out: its scratch space goes now.
         remove_dir(&workdir).await;
@@ -737,6 +836,7 @@ mod tests {
         DownloadRequest {
             work: WorkId::new(42).unwrap(),
             existing,
+            tries: 0,
         }
     }
 
@@ -1127,6 +1227,146 @@ mod tests {
             0,
             "a failed download cleans up"
         );
+    }
+
+    /// [`fallback_downloader`]'s configuration, around any runner.
+    fn alternating_downloader(
+        runner: Arc<dyn ProcessRunner>,
+        scratch: &Path,
+        store: &Arc<InMemorySession>,
+    ) -> FanFicFareDownloader {
+        FanFicFareDownloader::new(
+            runner,
+            FanFicFareConfig {
+                python: "python3".into(),
+                scratch_dir: scratch.to_path_buf(),
+                personal_ini: Some(PathBuf::from(FIRST_INI)),
+                timeout: Duration::from_secs(30),
+                url_template: "https://archiveofourown.org/works/{id}".into(),
+                redactions: vec![],
+                login_fallback: Some(LoginFallback {
+                    personal_ini: PathBuf::from(LOGIN_INI),
+                    flaresolverr: "http://flaresolverr:8191".parse().unwrap(),
+                    flaresolverr_timeout: Duration::from_secs(45),
+                }),
+            },
+        )
+        .with_session(
+            Arc::clone(store) as Arc<dyn SessionStore>,
+            Arc::new(FakeClock::at_secs(NOW)),
+        )
+    }
+
+    /// One route refused (AO3's bot filter flags `FlareSolverr`, Cloudflare flags plain
+    /// requests) must not fail a job the other could fetch: the tries take turns.
+    #[tokio::test]
+    async fn tries_alternate_between_flaresolverr_and_fetching_directly() {
+        let scratch = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySession::new());
+        let mut session = stored_session(NOW - 100);
+        session.cookies.push(cookie(
+            "remember_user_token",
+            "login-token-0123456789",
+            Some(NOW + 30 * 86_400),
+        ));
+        session.cookies.push(cookie(
+            "__cf_bm",
+            "bot-management-0123456789",
+            Some(NOW + 600),
+        ));
+        store.save(&session).await.unwrap();
+
+        for tries in 0..4 {
+            let runner = Arc::new(CookieRunner::new(None, "refused"));
+            let dl = alternating_downloader(
+                Arc::clone(&runner) as Arc<dyn ProcessRunner>,
+                scratch.path(),
+                &store,
+            );
+            let err = dl
+                .download(&DownloadRequest {
+                    tries,
+                    ..request(None)
+                })
+                .await
+                .unwrap_err();
+            let req = runner.request.lock().unwrap().clone().unwrap();
+            assert_eq!(req["clearance"], serde_json::Value::Null, "try {tries}");
+            assert_eq!(req["user_agent"], serde_json::Value::Null, "try {tries}");
+            if tries % 2 == 0 {
+                assert_eq!(req["personal_ini"], FIRST_INI, "try {tries}");
+                assert_eq!(req["cookies"], serde_json::Value::Null);
+                assert!(
+                    err.log
+                        .contains("through FlareSolverr; the next try goes directly")
+                );
+            } else {
+                assert_eq!(req["personal_ini"], LOGIN_INI, "try {tries}: can log in");
+                let (file, _) = runner.seen.lock().unwrap().clone().unwrap();
+                assert!(file.contains("login-token-0123456789"), "{file}");
+                assert!(file.contains("view_adult"), "{file}");
+                assert!(
+                    !file.contains("cf_clearance") && !file.contains("__cf_bm"),
+                    "Cloudflare's cookies belong to FlareSolverr's browser: {file}"
+                );
+                assert!(
+                    err.log
+                        .contains("without FlareSolverr; the next try goes through"),
+                    "{}",
+                    err.log
+                );
+            }
+            assert!(
+                err.log.contains(&format!("Try {} fetched", tries + 1)),
+                "{}",
+                err.log
+            );
+        }
+        let kept = store.load().await.unwrap().unwrap();
+        assert!(
+            kept.cookies.iter().any(|c| c.name == "cf_clearance"),
+            "a direct try leaves the stored clearance alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_flaresolverr_every_try_fetches_the_same_way() {
+        let scratch = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySession::new());
+        store.save(&stored_session(NOW - 100)).await.unwrap();
+        for tries in 0..2 {
+            let runner = Arc::new(CookieRunner::new(None, "refused"));
+            let dl = with_session(Arc::clone(&runner), scratch.path(), &store);
+            let err = dl
+                .download(&DownloadRequest {
+                    tries,
+                    ..request(None)
+                })
+                .await
+                .unwrap_err();
+            let req = runner.request.lock().unwrap().clone().unwrap();
+            assert_eq!(req["user_agent"], UA, "try {tries}");
+            assert!(!err.log.contains("next try"), "{}", err.log);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_login_demand_on_a_direct_try_also_gets_the_login_fallback() {
+        let scratch = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemorySession::new());
+        let runner = two_try_runner("auth_failed", Some((String::new(), "EarnedUA/1".into())));
+        let dl = fallback_downloader(Arc::clone(&runner), scratch.path(), &store);
+        let book = dl
+            .download(&DownloadRequest {
+                tries: 1,
+                ..request(None)
+            })
+            .await
+            .unwrap();
+        assert!(book.log.contains("login fallback"), "{}", book.log);
+        let seen = runner.requests.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0]["clearance"].is_null() && seen[1]["clearance"].is_object());
     }
 
     #[tokio::test]
@@ -1958,7 +2198,7 @@ mod tests {
             &ini,
             "https://archiveofourown.org/works/{id}",
         )
-        .list_series(fanfold_domain::work::SeriesId::new(77).unwrap())
+        .list_series(fanfold_domain::work::SeriesId::new(77).unwrap(), 0)
         .await
         .expect_err("an error page lists nothing");
         assert_eq!(err.kind, FailureKind::RateLimited, "{}", err.message);
@@ -1995,7 +2235,7 @@ mod tests {
             &ini,
             "https://archiveofourown.org/works/{id}",
         )
-        .list_series(series)
+        .list_series(series, 0)
         .await
         .unwrap();
         assert_eq!(listing.series, series);
@@ -2031,7 +2271,7 @@ mod tests {
             &ini,
             "https://archiveofourown.org/works/{id}",
         )
-        .list_series(fanfold_domain::work::SeriesId::new(77).unwrap())
+        .list_series(fanfold_domain::work::SeriesId::new(77).unwrap(), 0)
         .await
         .expect_err("an error page lists nothing");
         assert_eq!(err.kind, FailureKind::SiteUnavailable, "{}", err.message);
@@ -2171,7 +2411,7 @@ mod tests {
             &ini,
             "https://archiveofourown.org/works/{id}",
         )
-        .list_series(fanfold_domain::work::SeriesId::new(77).unwrap())
+        .list_series(fanfold_domain::work::SeriesId::new(77).unwrap(), 0)
         .await
         .expect("two 525s are retried through");
         assert_eq!(listing.facts.works.len(), 2);
