@@ -15,9 +15,7 @@ use std::{
 };
 
 use fanfold_adapter_postgres::{PgStore, events::PgEvents};
-use fanfold_app::ports::{
-    BookCatalog, CursorStore, EventSource, JobRepository, MetadataStore, SessionStore,
-};
+use fanfold_app::ports::{BookCatalog, CursorStore, EventSource, JobRepository, MetadataStore};
 use sqlx::{
     ConnectOptions, Connection,
     postgres::{PgConnectOptions, PgPoolOptions},
@@ -102,15 +100,6 @@ async fn event_source_contract() {
 async fn cursor_store_contract() {
     fanfold_testkit::contracts::cursor_store(|| async {
         Arc::new(fresh_store().await) as Arc<dyn CursorStore>
-    })
-    .await;
-}
-
-#[tokio::test]
-#[ignore = "needs PostgreSQL (TEST_DATABASE_URL)"]
-async fn session_store_contract() {
-    fanfold_testkit::contracts::session_store(|| async {
-        Arc::new(fresh_store().await) as Arc<dyn SessionStore>
     })
     .await;
 }

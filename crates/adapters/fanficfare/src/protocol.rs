@@ -27,12 +27,6 @@ pub struct WorkerRequest<'a> {
     pub existing: Option<&'a str>,
     pub workdir: &'a str,
     pub personal_ini: Option<&'a str>,
-    /// A Netscape `cookies.txt` the worker loads and writes back.
-    pub cookies: Option<&'a str>,
-    /// `User-Agent` to send; Cloudflare ties its clearance cookie to it.
-    pub user_agent: Option<&'a str>,
-    /// Have `FlareSolverr` pass Cloudflare first, then fetch without it (the login fallback).
-    pub clearance: Option<Clearance<'a>>,
     /// Send every request through fanfold-browser instead of fetching in the worker.
     pub browser: Option<BrowserRef<'a>>,
 }
@@ -42,14 +36,6 @@ pub struct WorkerRequest<'a> {
 pub struct BrowserRef<'a> {
     pub url: &'a str,
     pub timeout_ms: u64,
-}
-
-/// Where `FlareSolverr` is, and which page to ask it to open to earn the clearance.
-#[derive(Debug, Serialize)]
-pub struct Clearance<'a> {
-    pub flaresolverr: &'a str,
-    pub timeout_ms: u64,
-    pub url: &'a str,
 }
 
 const fn default_changed() -> bool {

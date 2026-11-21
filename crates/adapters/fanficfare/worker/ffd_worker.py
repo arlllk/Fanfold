@@ -1,16 +1,11 @@
 """One-shot FanFicFare worker.
 
 Protocol (one story or series per process):
-  stdin : a JSON object  {"op", "url", "existing", "workdir", "personal_ini",
-                          "cookies", "user_agent", "clearance", "browser"}
-          (the last four are optional)
+  stdin : a JSON object  {"op", "url", "existing", "workdir", "personal_ini", "browser"}
+          (the last one is optional)
           `op` is "download" (the default) or "list_series".
-          `cookies` is a Netscape cookies.txt that FanFicFare loads, and the worker writes
-          it back (cookies rotate during a run) so the caller can keep them.
-          `clearance` {"flaresolverr", "timeout_ms", "url"} asks the worker to have FlareSolverr
-          pass Cloudflare once first (see apply_clearance); FanFicFare then fetches by itself.
           `browser` {"url", "timeout_ms"} sends every request FanFicFare makes through
-          fanfold-browser instead (see install_browser_fetcher); no cookies are kept here then.
+          fanfold-browser (see install_browser_fetcher), which keeps the only cookies.
   stdout: FanFicFare's own chatter is captured; the LAST line printed is a JSON
           object, either
             {"status": "ok", "path", "title", "changed", "metadata", "log"}
@@ -26,8 +21,8 @@ The Rust side never parses FanFicFare's text; this script is the only place that
 knows how FanFicFare reports problems.
 
 Every page FanFicFare fetches passes the page guard (install_page_guard) first: an error
-page that arrives looking like a successful response (FlareSolverr reports HTTP 200 for
-whatever its browser ended up showing) is turned into the HTTP error it stands for, before
+page that arrives looking like a successful response (a browser shows whatever it ended
+up on, an error page included) is turned into the HTTP error it stands for, before
 FanFicFare can parse it as the work, the chapter list or the series it asked for.
 
 Runs as `python -I -c <this file>`, so it is one file that imports only the standard library
@@ -247,7 +242,7 @@ class KnownPage:
 
 KNOWN_PAGES = (
     # AO3's bot filter, in front of the Archive since the autumn 2026 incident. It answers
-    # 429 with a few lines of plain text; FlareSolverr turns that into a 200.
+    # 429 with a few lines of plain text; a browser can show it as a 200 page.
     KnownPage(
         "ao3_bot_filter",
         429,
@@ -306,7 +301,7 @@ def page_text(content: object) -> str | None:
     else:
         return None
     if text.lstrip().startswith(("{", "[")):
-        return None  # JSON (the login token, FlareSolverr's own answers)
+        return None  # JSON (the login token)
     return text
 
 
@@ -392,7 +387,7 @@ def install_page_guard() -> None:
     the same); everything else becomes FanFicFare's own HTTPErrorFFF with the status the page
     stands for, which classify_exception turns into the right kind.
 
-    Why: FlareSolverr reports HTTP 200 for whatever its browser shows, so Cloudflare's "525"
+    Why: a browser (FlareSolverr's, then) reports HTTP 200 for whatever it shows, so Cloudflare's "525"
     once became a book with only a title page, and AO3's bot filter became
     "AttributeError: 'NoneType' object has no attribute 'get_text'".
 
@@ -400,14 +395,16 @@ def install_page_guard() -> None:
     download() also refuses an AO3 download the guard saw no page of.
     """
     from fanficfare import exceptions
-    from fanficfare.fetchers import base_fetcher, fetcher_flaresolverr_proxy, fetcher_requests
+    from fanficfare.fetchers import base_fetcher, fetcher_camoufox, fetcher_requests
 
     fetcher = base_fetcher.Fetcher
     original = fetcher.do_request
     if getattr(original, HOOK_MARK, False):
         return
-    # Fanfold's two fetchers are imported above; any other that is loaded is checked too.
-    assert issubclass(fetcher_flaresolverr_proxy.FlareSolverr_ProxyFetcher, fetcher_requests.RequestsFetcher)
+    # The two fetchers Fanfold uses (plain requests, and the browser one install_browser_fetcher
+    # replaces) are imported above; any other that is loaded is checked too.
+    assert issubclass(fetcher_requests.RequestsFetcher, base_fetcher.Fetcher)
+    assert issubclass(fetcher_camoufox.CamoufoxFetcher, base_fetcher.Fetcher)
     overriding = overriding_fetchers(fetcher)
     if overriding:
         raise incompatible("%s override Fetcher.do_request, which the page guard hooks" % ", ".join(overriding))
@@ -484,13 +481,6 @@ def unreadable_page(exc: BaseException, pages: PageLog = PAGES) -> WorkerError |
 
 
 @dataclasses.dataclass(frozen=True)
-class Clearance:
-    flaresolverr: str
-    url: str
-    timeout_ms: int
-
-
-@dataclasses.dataclass(frozen=True)
 class BrowserService:
     url: str
     timeout_ms: int
@@ -505,9 +495,6 @@ class Request:
     workdir: str
     existing: str | None = None
     personal_ini: str | None = None
-    cookies: str | None = None
-    user_agent: str | None = None
-    clearance: Clearance | None = None
     browser: BrowserService | None = None
 
 
@@ -534,19 +521,6 @@ def parse_request(raw: object) -> Request:
     op = raw.get("op", "download")
     if op not in OPS:
         raise bad("unknown op %r" % (op,))
-    clearance = None
-    spec = raw.get("clearance")
-    if spec is not None:
-        if not isinstance(spec, dict):
-            raise bad("'clearance' must be an object")
-        timeout_ms = spec.get("timeout_ms", 60000)
-        if not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool) or timeout_ms <= 0:
-            raise bad("'clearance.timeout_ms' must be a positive integer")
-        clearance = Clearance(
-            flaresolverr=str(string(spec, "flaresolverr", required=True)),
-            url=str(string(spec, "url", required=True)),
-            timeout_ms=timeout_ms,
-        )
     browser = None
     spec = raw.get("browser")
     if spec is not None:
@@ -562,9 +536,6 @@ def parse_request(raw: object) -> Request:
         workdir=str(string(raw, "workdir", required=True)),
         existing=string(raw, "existing"),
         personal_ini=string(raw, "personal_ini"),
-        cookies=string(raw, "cookies"),
-        user_agent=string(raw, "user_agent"),
-        clearance=clearance,
         browser=browser,
     )
 
@@ -750,10 +721,6 @@ def build_options(request: Request, existing: str | None, target: str) -> Values
     argv = ["--non-interactive", "-f", "epub"]
     if request.personal_ini:
         argv += ["-c", request.personal_ini]
-    if request.cookies:
-        argv += ["--mozilla-cookies", request.cookies]
-    if request.user_agent:
-        argv += ["-o", "user_agent=" + request.user_agent]
     if request.browser:
         # FanFicFare's own switch for its browser fetcher, which install_browser_fetcher
         # points at fanfold-browser.
@@ -768,79 +735,6 @@ def build_options(request: Request, existing: str | None, target: str) -> Values
     cli.expandOptions(options)
     cli.validateOptions(parser, options, args)
     return options
-
-
-def apply_clearance(request: Request, clearance: Clearance, cookies: str) -> Request:
-    """Have FlareSolverr pass Cloudflare once; leave its cookies and User-Agent for FanFicFare.
-
-    Used for the login fallback. AO3 refuses a login submitted *through* FlareSolverr (its
-    form post carries no session cookie), but plain HTTP works once Cloudflare has been
-    passed: the clearance cookie is bound to the browser's User-Agent, so FanFicFare then
-    sends exactly that. FlareSolverr's fresh cookies replace the stored ones of the same
-    name, except the long-lived login cookie, which only a real login can issue.
-    Returns the request with FlareSolverr's User-Agent.
-    """
-    import http.cookiejar
-    import urllib.request
-
-    body = json.dumps({"cmd": "request.get", "url": clearance.url, "maxTimeout": clearance.timeout_ms}).encode()
-    http_request = urllib.request.Request(
-        clearance.flaresolverr.rstrip("/") + "/v1", body, {"Content-Type": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(http_request, timeout=clearance.timeout_ms / 1000 + 30) as response:
-            answer = json.load(response)
-    except Exception as exc:  # noqa: BLE001 - any failure to talk to FlareSolverr
-        raise WorkerError(SITE_UNAVAILABLE, "cannot reach FlareSolverr: %s" % exc) from exc
-    if not isinstance(answer, dict):
-        raise WorkerError(SITE_UNAVAILABLE, "FlareSolverr sent no JSON object")
-    solution = answer.get("solution") if answer.get("status") == "ok" else None
-    if not isinstance(solution, dict):
-        raise WorkerError(SITE_UNAVAILABLE, "FlareSolverr failed: %s" % answer.get("message"))
-    # Clearance earned on an error page is no clearance: say what the site really sent.
-    rejection = judge(clearance.url, solution.get("response"))
-    if rejection is not None:
-        raise WorkerError(classify_status(rejection.status), rejection.message)
-
-    earned = []
-    for cookie in solution.get("cookies") or []:
-        if not isinstance(cookie, dict):
-            continue
-        name, value, domain = cookie.get("name"), cookie.get("value"), cookie.get("domain")
-        if not (isinstance(name, str) and isinstance(value, str) and isinstance(domain, str) and name and domain):
-            print("FlareSolverr sent a cookie without a name, value or domain; skipped")
-            continue
-        expires = cookie.get("expires") or cookie.get("expiry")
-        expires = int(expires) if isinstance(expires, (int, float)) and expires > 0 else None
-        path = cookie.get("path")
-        earned.append(
-            http.cookiejar.Cookie(
-                0, name, value, None, False, domain, True, domain.startswith("."),
-                path if isinstance(path, str) and path else "/", True,
-                bool(cookie.get("secure")), expires, expires is None, None, None, {},
-            )
-        )
-
-    jar = http.cookiejar.MozillaCookieJar(cookies)
-    try:
-        jar.load(ignore_discard=True, ignore_expires=True)
-    except OSError:  # includes http.cookiejar.LoadError
-        pass  # nothing stored yet, or nothing usable: start from FlareSolverr's
-    fresh = {cookie.name for cookie in earned}
-    for cookie in list(jar):
-        if cookie.name in fresh and cookie.name != "remember_user_token":
-            jar.clear(cookie.domain, cookie.path, cookie.name)
-    for cookie in earned:
-        jar.set_cookie(cookie)
-    jar.save(ignore_discard=True, ignore_expires=True)
-
-    user_agent = solution.get("userAgent")
-    if not isinstance(user_agent, str) or not user_agent:
-        return request
-    # The caller keeps the User-Agent next to the cookies it earned.
-    with open(os.path.join(request.workdir, "user_agent.txt"), "w") as handle:
-        handle.write(user_agent)
-    return dataclasses.replace(request, user_agent=user_agent)
 
 
 # ------------------------------------------------------------------------ browser service
@@ -925,21 +819,6 @@ def install_browser_fetcher(service: BrowserService) -> None:
     setattr(fetcher_camoufox, "CamoufoxFetcher", BrowserFetcher)
 
 
-def save_cookies(options: Values, request: Request) -> None:
-    """Write the cookie jar back to the file it was loaded from, success or not.
-
-    A run that Cloudflare refused may still have rotated cookies, and the caller decides
-    what to keep. Never fails the download.
-    """
-    jar = getattr(options, "cookiejar", None)
-    if not request.cookies or jar is None:
-        return
-    try:
-        jar.save_cookiejar(request.cookies)
-    except Exception as exc:  # noqa: BLE001
-        print("could not save the rotated cookies: %s" % exc)
-
-
 # ------------------------------------------------------------------------------ operations
 
 
@@ -949,12 +828,9 @@ def list_series(request: Request, buffer: io.StringIO) -> dict[str, object]:
     from fanficfare.geturls import GetURLs
 
     options = build_options(request, None, request.url)
-    try:
-        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
-            configuration = cli.get_configuration(request.url, None, None, options)
-            page = GetURLs(configuration).get_urls_from_page(request.url)
-    finally:
-        save_cookies(options, request)
+    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+        configuration = cli.get_configuration(request.url, None, None, options)
+        page = GetURLs(configuration).get_urls_from_page(request.url)
     if not isinstance(page, dict):
         raise incompatible("GetURLs.get_urls_from_page returned %s, not a dict" % type(page).__name__)
     works: list[int] = []
@@ -993,11 +869,8 @@ def run_fanficfare(request: Request, existing: str | None, buffer: io.StringIO) 
     target = existing or request.url
     options = build_options(request, existing, target)
     out_path = existing or os.path.join(request.workdir, "story.epub")
-    try:
-        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
-            cli.do_download(target, options, None, None, warn, fail)
-    finally:
-        save_cookies(options, request)
+    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+        cli.do_download(target, options, None, None, warn, fail)
     return out_path, failures
 
 
@@ -1086,8 +959,6 @@ def run(request: Request, buffer: io.StringIO) -> dict[str, object]:
         install_browser_fetcher(request.browser)
     capture = AdapterCapture()
     capture.install()
-    if request.clearance and request.cookies:
-        request = apply_clearance(request, request.clearance, request.cookies)
     if request.op == "list_series":
         return list_series(request, buffer)
     return download(request, buffer, capture)

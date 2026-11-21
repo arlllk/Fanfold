@@ -416,12 +416,6 @@ async fn main() {
         listing: repo.clone(),
         admin: Arc::new(JobAdmin::new(repo.clone(), clock.clone())),
         library: library_admin(&repo, &clock),
-        session: Arc::new(fanfold_app::session::SessionAdmin::new(
-            Arc::new(fanfold_testkit::memory::InMemorySession::new()),
-            clock.clone(),
-            "archiveofourown.org",
-            std::time::Duration::from_hours(24),
-        )),
         events: repo.clone(),
         site: Arc::new(Site(Mutex::new(status))),
         clock,

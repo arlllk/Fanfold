@@ -18,7 +18,7 @@ use fanfold_app::{
         DownloadedBook, Downloader, EnqueueOutcome, Event, EventSource, Jitter, JobCounts,
         JobFilter, JobRepository, LibraryCatalog, LibraryEntry, LibraryPage, LibraryQuery,
         LibrarySort, LibraryStatus, LibraryStore, LibraryTotals, LogEntry, MailBatch, MailSource,
-        MetadataStore, Notifier, NotifyEvent, Readiness, Recorded, SessionStore,
+        MetadataStore, Notifier, NotifyEvent, Readiness, Recorded,
     },
 };
 use fanfold_domain::{
@@ -29,7 +29,6 @@ use fanfold_domain::{
         Author, FollowSource, SeriesFacts, SeriesMetadata, SeriesPart, Tag, TagKind, WorkFacts,
         WorkMetadata, WorkState, WorkStats, plan_work_update,
     },
-    session::BrowserSession,
     timestamp,
     work::{SeriesId, WorkId},
 };
@@ -812,63 +811,6 @@ impl CursorStore for InMemoryCursors {
     }
 }
 
-// --------------------------------------------------------------------- session
-
-/// In-memory [`SessionStore`].
-#[derive(Debug, Default)]
-pub struct InMemorySession {
-    session: Mutex<Option<BrowserSession>>,
-    broken: Mutex<Option<RepoError>>,
-}
-
-impl InMemorySession {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn break_with(&self, error: Option<RepoError>) {
-        *lock(&self.broken) = error;
-    }
-
-    fn check(&self) -> Result<(), RepoError> {
-        lock(&self.broken).clone().map_or(Ok(()), Err)
-    }
-}
-
-#[async_trait]
-impl SessionStore for InMemorySession {
-    async fn load(&self) -> Result<Option<BrowserSession>, RepoError> {
-        self.check()?;
-        Ok(lock(&self.session).clone())
-    }
-
-    async fn save(&self, session: &BrowserSession) -> Result<(), RepoError> {
-        self.check()?;
-        *lock(&self.session) = Some(session.clone());
-        Ok(())
-    }
-
-    async fn refresh(
-        &self,
-        session: &BrowserSession,
-        based_on: Timestamp,
-    ) -> Result<bool, RepoError> {
-        self.check()?;
-        let mut stored = lock(&self.session);
-        if stored.as_ref().is_some_and(|s| s.updated_at == based_on) {
-            *stored = Some(session.clone());
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    async fn clear(&self) -> Result<bool, RepoError> {
-        self.check()?;
-        Ok(lock(&self.session).take().is_some())
-    }
-}
-
 // --------------------------------------------------------------------- library
 
 #[derive(Debug, Default)]
@@ -1091,11 +1033,7 @@ impl Downloader for ScriptedDownloader {
             })
     }
 
-    async fn list_series(
-        &self,
-        series: SeriesId,
-        _tries: u32,
-    ) -> Result<SeriesMetadata, DownloadError> {
+    async fn list_series(&self, series: SeriesId) -> Result<SeriesMetadata, DownloadError> {
         let mut state = lock(&self.state);
         state.listed.push(series);
         state

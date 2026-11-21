@@ -17,21 +17,13 @@ use std::{
 };
 
 use async_trait::async_trait;
-use fanfold_app::ports::{
-    Clock, DownloadError, DownloadRequest, DownloadedBook, Downloader, SessionStore,
-};
-use fanfold_domain::{
-    failure::FailureKind,
-    metadata::SeriesMetadata,
-    session::{BrowserSession, parse_netscape, to_netscape},
-    work::SeriesId,
-};
+use fanfold_app::ports::{DownloadError, DownloadRequest, DownloadedBook, Downloader};
+use fanfold_domain::{failure::FailureKind, metadata::SeriesMetadata, work::SeriesId};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::{
     protocol::{
-        BrowserRef, Clearance, WorkerRequest, WorkerResponse, into_listing, into_result,
-        parse_response,
+        BrowserRef, WorkerRequest, WorkerResponse, into_listing, into_result, parse_response,
     },
     runner::{ProcessOutput, ProcessRunner, ProcessSpec, RunError},
 };
@@ -41,30 +33,8 @@ const WORKER_SCRIPT: &str = include_str!("../worker/ffd_worker.py");
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// What to do when AO3 says a work needs a login, while downloads go through `FlareSolverr`.
-///
-/// Downloads are tried anonymously through `FlareSolverr` first (what
-/// [`FanFicFareConfig::personal_ini`] sets up). The fallback then uses `FlareSolverr` only to pass
-/// Cloudflare, and FanFicFare fetches over plain HTTP with that clearance, the stored login
-/// cookie and, when there is no valid cookie, the account's credentials.
-///
-/// AO3 refuses a login submitted through `FlareSolverr`, which is why the login cannot simply
-/// happen there.
-#[derive(Debug, Clone)]
-pub struct LoginFallback {
-    /// FanFicFare settings for the fallback: plain requests, with the login if there is one.
-    pub personal_ini: PathBuf,
-    /// FanFicFare settings for the tries that skip `FlareSolverr`: plain requests, logging in
-    /// on every run when there is a login (`always_login`).
-    pub direct_ini: PathBuf,
-    /// Origin of the `FlareSolverr` server.
-    pub flaresolverr: url::Url,
-    /// How long `FlareSolverr` may take to pass Cloudflare.
-    pub flaresolverr_timeout: Duration,
-}
-
 /// fanfold-browser: one browser that makes every request, logins included, and keeps the only
-/// cookies. With it, no session is staged and there is no login fallback.
+/// cookies (Cloudflare's clearance and the site's login): FanFicFare keeps none.
 #[derive(Debug, Clone)]
 pub struct BrowserService {
     /// Origin of the service.
@@ -85,8 +55,6 @@ pub struct FanFicFareConfig {
     pub url_template: String,
     /// Secret values scrubbed from everything this adapter reports.
     pub redactions: Vec<SecretString>,
-    /// Set when downloads go through `FlareSolverr`; see [`LoginFallback`].
-    pub login_fallback: Option<LoginFallback>,
     /// Set when every request goes through fanfold-browser; see [`BrowserService`].
     pub browser: Option<BrowserService>,
 }
@@ -101,47 +69,10 @@ impl std::fmt::Debug for FanFicFareConfig {
     }
 }
 
-/// Where the browser session lives and how to date changes to it.
-struct SessionSupport {
-    store: Arc<dyn SessionStore>,
-    clock: Arc<dyn Clock>,
-    /// The site the cookies belong to, taken from the story URL.
-    site: String,
-}
-
 pub struct FanFicFareDownloader {
     runner: Arc<dyn ProcessRunner>,
     config: FanFicFareConfig,
-    session: Option<SessionSupport>,
 }
-
-/// The session as handed to one worker run. `session` is `None` when nothing is stored yet
-/// (the login fallback then starts from an empty cookie file and keeps what it earns).
-struct PreparedSession {
-    session: Option<BrowserSession>,
-    cookies_file: PathBuf,
-}
-
-/// Which try of a download this is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Attempt {
-    /// The normal fetch. With a login fallback configured it goes through `FlareSolverr`,
-    /// anonymously, so no cookies are sent along (they would mix with its own browser's);
-    /// otherwise it is plain requests with the stored session.
-    First,
-    /// With a login fallback configured, every other try skips `FlareSolverr` altogether and
-    /// fetches exactly as `AutomatedFanfic` does: plain requests, FanFicFare's own
-    /// `User-Agent`, no stored cookies, and a fresh login on every run when there are
-    /// credentials ([`LoginFallback::direct_ini`]). It shares no cookies with the other routes,
-    /// so a refusal tied to one route's session cannot follow it here.
-    Direct,
-    /// The login fallback: Cloudflare passed by `FlareSolverr`, then plain requests.
-    Fallback,
-}
-
-/// Cookie values shorter than this are not scrubbed from logs: a value like `true`
-/// would otherwise be blanked out of every sentence.
-const MIN_REDACTED_COOKIE: usize = 16;
 
 impl std::fmt::Debug for FanFicFareDownloader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -188,177 +119,7 @@ pub fn sweep_stale(scratch_dir: &Path, max_age: Duration) -> usize {
 impl FanFicFareDownloader {
     #[must_use]
     pub fn new(runner: Arc<dyn ProcessRunner>, config: FanFicFareConfig) -> Self {
-        Self {
-            runner,
-            config,
-            session: None,
-        }
-    }
-
-    /// Present the stored browser session (cookies and `User-Agent`) on every download,
-    /// and keep the cookies the site rotates.
-    #[must_use]
-    pub fn with_session(mut self, store: Arc<dyn SessionStore>, clock: Arc<dyn Clock>) -> Self {
-        let site = url::Url::parse(&self.config.url_template.replace("{id}", "1"))
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_owned))
-            .unwrap_or_default();
-        self.session = Some(SessionSupport { store, clock, site });
-        self
-    }
-
-    /// Write the session's live cookies where the worker will read them. Trouble here
-    /// never fails the download: it just runs without the session, as before.
-    async fn prepare_session(&self, workdir: &Path, attempt: Attempt) -> Option<PreparedSession> {
-        let support = self.session.as_ref()?;
-        if self.config.browser.is_some() {
-            // The browser keeps the only cookies; nothing is staged for the worker.
-            return None;
-        }
-        // With a fallback configured, only the fallback carries the stored session: the other
-        // routes start every run with no cookies at all.
-        if attempt != Attempt::Fallback && self.config.login_fallback.is_some() {
-            return None;
-        }
-        let stored = match support.store.load().await {
-            Ok(stored) => stored,
-            Err(e) => {
-                tracing::warn!(error = %e, "cannot read the browser session; downloading without it");
-                if attempt == Attempt::First {
-                    return None;
-                }
-                None
-            }
-        };
-        let text = match &stored {
-            Some(session) => to_netscape(&session.live_cookies(support.clock.now())),
-            None if attempt == Attempt::Fallback => to_netscape(&[]),
-            None => return None,
-        };
-        let cookies_file = workdir.join("cookies.txt");
-        if let Err(e) = write_private(&cookies_file, &text).await {
-            tracing::warn!(error = %e, "cannot stage the browser session; downloading without it");
-            return None;
-        }
-        Some(PreparedSession {
-            session: stored,
-            cookies_file,
-        })
-    }
-
-    /// Fold the cookies the run left behind into the stored session, unless someone
-    /// imported a newer one meanwhile. With nothing stored yet (the first login the fallback
-    /// ever did) they become the session, so the login cookie is there next time.
-    async fn keep_rotated_cookies(&self, prepared: PreparedSession, workdir: &Path) {
-        let Some(support) = &self.session else { return };
-        let Ok(text) = tokio::fs::read_to_string(&prepared.cookies_file).await else {
-            return;
-        };
-        let Ok(seen) = parse_netscape(&text, &support.site) else {
-            return;
-        };
-        let now = support.clock.now();
-        // The User-Agent the fallback's clearance was earned with, when it ran.
-        let earned_with = tokio::fs::read_to_string(workdir.join("user_agent.txt"))
-            .await
-            .ok()
-            .map(|ua| ua.trim().to_owned())
-            .filter(|ua| fanfold_domain::session::valid_user_agent(ua));
-        if let Some(mut session) = prepared.session {
-            let based_on = session.updated_at;
-            let absorbed = session.absorb(seen.cookies, now);
-            let new_ua = earned_with.filter(|ua| *ua != session.user_agent);
-            if !(absorbed || new_ua.is_some()) {
-                return;
-            }
-            if let Some(ua) = new_ua {
-                session.user_agent = ua;
-            }
-            session.updated_at = now;
-            match support.store.refresh(&session, based_on).await {
-                Ok(true) => tracing::info!("kept the cookies the site refreshed"),
-                Ok(false) => {
-                    tracing::info!("a newer browser session was imported; not overwriting it");
-                }
-                Err(e) => tracing::warn!(error = %e, "cannot save refreshed cookies"),
-            }
-            return;
-        }
-        let mut session = BrowserSession {
-            user_agent: earned_with.unwrap_or_else(|| "fanfold".to_owned()),
-            cookies: Vec::new(),
-            updated_at: now,
-        };
-        session.absorb(seen.cookies, now);
-        if session.cookies.is_empty() {
-            return;
-        }
-        match support.store.load().await {
-            Ok(None) => match support.store.save(&session).await {
-                Ok(()) => tracing::info!("stored the login the fallback earned"),
-                Err(e) => tracing::warn!(error = %e, "cannot save the new session"),
-            },
-            Ok(Some(_)) => {
-                tracing::info!("a browser session was imported meanwhile; not overwriting it");
-            }
-            Err(e) => tracing::warn!(error = %e, "cannot save the new session"),
-        }
-    }
-
-    /// How a job's next try fetches, after `tries` failed ones. With `FlareSolverr` configured
-    /// the tries alternate: through it first (usually the better route), then directly, and so
-    /// on, so that one route being refused never fails a job the other could fetch.
-    const fn route(&self, tries: u32) -> Attempt {
-        if self.config.login_fallback.is_some() && tries % 2 == 1 {
-            Attempt::Direct
-        } else {
-            Attempt::First
-        }
-    }
-
-    const fn route_name(&self, route: Attempt) -> &'static str {
-        match (route, &self.config.login_fallback) {
-            (Attempt::First, Some(_)) => "through FlareSolverr",
-            (Attempt::Direct, _) => "directly, without FlareSolverr",
-            (Attempt::Fallback, _) => "the login fallback",
-            (Attempt::First, None) => "directly",
-        }
-    }
-
-    /// The job-log line telling which route a try took.
-    fn route_line(&self, route: Attempt, tries: u32) -> String {
-        let other = match route {
-            Attempt::Direct => "through FlareSolverr",
-            _ => "directly",
-        };
-        format!(
-            "Try {} fetched {}; the next try goes {other}.",
-            u64::from(tries) + 1,
-            self.route_name(route)
-        )
-    }
-
-    /// Prefix the outcome's log with [`Self::route_line`] when routes alternate.
-    fn note_route(
-        &self,
-        route: Attempt,
-        tries: u32,
-        result: Result<DownloadedBook, DownloadError>,
-    ) -> Result<DownloadedBook, DownloadError> {
-        if self.config.login_fallback.is_none() {
-            return result;
-        }
-        let line = self.route_line(route, tries);
-        match result {
-            Ok(mut book) => {
-                book.log = format!("{line}\n{}", book.log);
-                Ok(book)
-            }
-            Err(mut failed) => {
-                failed.log = format!("{line}\n{}", failed.log);
-                Err(failed)
-            }
-        }
+        Self { runner, config }
     }
 
     /// What the worker is told about fanfold-browser, when every request goes through it.
@@ -368,14 +129,6 @@ impl FanFicFareDownloader {
             url: url?,
             timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
         })
-    }
-
-    /// The page `FlareSolverr` opens to pass Cloudflare for the fallback: the site's login page.
-    fn login_page(&self) -> String {
-        url::Url::parse(&self.config.url_template.replace("{id}", "1"))
-            .ok()
-            .and_then(|u| u.join("/users/login").ok())
-            .map_or_else(String::new, Into::into)
     }
 
     fn error(&self, kind: FailureKind, message: impl AsRef<str>, log: &str) -> DownloadError {
@@ -463,11 +216,8 @@ impl FanFicFareDownloader {
         &self,
         request: &DownloadRequest,
         workdir: &Path,
-        attempt: Attempt,
     ) -> Result<DownloadedBook, DownloadError> {
-        let response = self
-            .run_task(Task::Download(request), workdir, attempt)
-            .await?;
+        let response = self.run_task(Task::Download(request), workdir).await?;
         into_result(response, workdir, request.work)
     }
 
@@ -475,11 +225,8 @@ impl FanFicFareDownloader {
         &self,
         series: SeriesId,
         workdir: &Path,
-        attempt: Attempt,
     ) -> Result<SeriesMetadata, DownloadError> {
-        let response = self
-            .run_task(Task::ListSeries(series), workdir, attempt)
-            .await?;
+        let response = self.run_task(Task::ListSeries(series), workdir).await?;
         into_listing(response, series)
     }
 
@@ -487,7 +234,6 @@ impl FanFicFareDownloader {
         &self,
         task: Task<'_>,
         workdir: &Path,
-        attempt: Attempt,
     ) -> Result<WorkerResponse, DownloadError> {
         let existing = match task {
             Task::Download(request) => request.existing.as_ref(),
@@ -513,37 +259,11 @@ impl FanFicFareDownloader {
         let existing_str = existing_copy
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned());
-        let fallback = self.config.login_fallback.as_ref();
-        let ini_path = match (attempt, fallback) {
-            (Attempt::Direct, Some(fallback)) => Some(&fallback.direct_ini),
-            // Plain requests, logging in only when a page asks for it.
-            (Attempt::Fallback, Some(fallback)) => Some(&fallback.personal_ini),
-            _ => self.config.personal_ini.as_ref(),
-        };
-        let ini_str = ini_path.map(|p| p.to_string_lossy().into_owned());
-        let prepared = self.prepare_session(workdir, attempt).await;
-        let cookies_str = prepared
+        let ini_str = self
+            .config
+            .personal_ini
             .as_ref()
-            .map(|p| p.cookies_file.to_string_lossy().into_owned());
-        let flaresolverr = fallback.map(|f| f.flaresolverr.as_str().to_owned());
-        let login_page = self.login_page();
-        let clearance = match (attempt, fallback, &flaresolverr) {
-            (Attempt::Fallback, Some(fallback), Some(origin)) if prepared.is_some() => {
-                Some(Clearance {
-                    flaresolverr: origin,
-                    timeout_ms: u64::try_from(fallback.flaresolverr_timeout.as_millis())
-                        .unwrap_or(u64::MAX),
-                    url: &login_page,
-                })
-            }
-            _ => None,
-        };
-        // The fallback's User-Agent is the one FlareSolverr's browser earned its clearance with,
-        // which the worker sets itself.
-        let user_agent = match (attempt, &prepared) {
-            (Attempt::First, Some(p)) => p.session.as_ref().map(|s| s.user_agent.as_str()),
-            _ => None,
-        };
+            .map(|p| p.to_string_lossy().into_owned());
         let browser_url = self.config.browser.as_ref().map(|b| b.url.to_string());
         let browser = self.browser_ref(browser_url.as_deref());
         let payload = serde_json::to_vec(&WorkerRequest {
@@ -552,9 +272,6 @@ impl FanFicFareDownloader {
             existing: existing_str.as_deref(),
             workdir: &workdir_str,
             personal_ini: ini_str.as_deref(),
-            cookies: cookies_str.as_deref(),
-            user_agent,
-            clearance,
             browser,
         })
         .map_err(|e| {
@@ -567,21 +284,8 @@ impl FanFicFareDownloader {
 
         let spec = self.process_spec(payload, workdir);
         let ran = self.runner.run(&spec).await;
-        // Redact what we handed the worker, so a cookie value echoed in its log (or a
-        // traceback) never reaches the job log.
-        let mut secrets = self.config.redactions.clone();
-        if let Some(prepared) = prepared {
-            if let Some(session) = &prepared.session {
-                secrets.extend(
-                    session
-                        .cookies
-                        .iter()
-                        .filter(|c| c.value.len() >= MIN_REDACTED_COOKIE)
-                        .map(|c| SecretString::from(c.value.clone())),
-                );
-            }
-            self.keep_rotated_cookies(prepared, workdir).await;
-        }
+        // Redact the secrets we know of from what the worker printed.
+        let secrets = self.config.redactions.clone();
         let output = ran.map_err(|e| match e {
             // A missing interpreter is a deployment problem, not a flaky site.
             RunError::Spawn { .. } => self.error(FailureKind::Permanent, e.to_string(), ""),
@@ -668,20 +372,6 @@ impl Task<'_> {
     }
 }
 
-/// Write `text` to a new file only its owner can read: it holds credentials.
-async fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt as _;
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .await?;
-    file.write_all(text.as_bytes()).await?;
-    file.flush().await
-}
-
 async fn remove_dir(dir: &Path) {
     if let Err(e) = tokio::fs::remove_dir_all(dir).await
         && e.kind() != std::io::ErrorKind::NotFound
@@ -694,39 +384,7 @@ async fn remove_dir(dir: &Path) {
 impl Downloader for FanFicFareDownloader {
     async fn download(&self, request: &DownloadRequest) -> Result<DownloadedBook, DownloadError> {
         let workdir = self.make_workdir(request).await?;
-        let route = self.route(request.tries);
-        let first = self.run_worker(request, &workdir, route).await;
-        let result = match first {
-            // AO3 says the work needs a login: try again the way that can log in.
-            Err(refused)
-                if refused.kind == FailureKind::AuthFailed
-                    && self.config.login_fallback.is_some() =>
-            {
-                tracing::info!(work = %request.work, "AO3 asked for a login; trying the login fallback");
-                match self.run_worker(request, &workdir, Attempt::Fallback).await {
-                    Ok(mut book) => {
-                        book.log = format!(
-                            "AO3 asked for a login, so this was fetched through the login fallback.\n{}",
-                            book.log
-                        );
-                        Ok(book)
-                    }
-                    Err(mut failed) => {
-                        failed.log = format!(
-                            "The first attempt ({}) failed: {}\n\n\
-                             The login fallback then failed: {}\n{}",
-                            self.route_name(route),
-                            refused.message,
-                            failed.message,
-                            failed.log
-                        );
-                        Err(failed)
-                    }
-                }
-            }
-            other => other,
-        };
-        let result = self.note_route(route, request.tries, result);
+        let result = self.run_worker(request, &workdir).await;
         if result.is_err() {
             // No book will be handed out, so nobody would call `release`.
             remove_dir(&workdir).await;
@@ -734,42 +392,9 @@ impl Downloader for FanFicFareDownloader {
         result
     }
 
-    async fn list_series(
-        &self,
-        series: SeriesId,
-        tries: u32,
-    ) -> Result<SeriesMetadata, DownloadError> {
+    async fn list_series(&self, series: SeriesId) -> Result<SeriesMetadata, DownloadError> {
         let workdir = self.make_dir(&format!("series-{series}")).await?;
-        let route = self.route(tries);
-        let result = match self.run_listing(series, &workdir, route).await {
-            // A series of restricted works may need a login, like a work.
-            Err(refused)
-                if refused.kind == FailureKind::AuthFailed
-                    && self.config.login_fallback.is_some() =>
-            {
-                tracing::info!(%series, "AO3 asked for a login; trying the login fallback");
-                self.run_listing(series, &workdir, Attempt::Fallback)
-                    .await
-                    .map_err(|mut failed| {
-                        failed.log = format!(
-                            "The first attempt ({}) failed: {}\n\nThe login fallback then failed: {}\n{}",
-                            self.route_name(route),
-                            refused.message,
-                            failed.message,
-                            failed.log
-                        );
-                        failed
-                    })
-            }
-            other => other,
-        };
-        let result = match self.config.login_fallback {
-            Some(_) => result.map_err(|mut failed| {
-                failed.log = format!("{}\n{}", self.route_line(route, tries), failed.log);
-                failed
-            }),
-            None => result,
-        };
+        let result = self.run_listing(series, &workdir).await;
         // A listing hands nothing out: its scratch space goes now.
         remove_dir(&workdir).await;
         result
@@ -846,7 +471,6 @@ mod tests {
                 timeout: Duration::from_secs(30),
                 url_template: "https://archiveofourown.org/works/{id}".into(),
                 redactions: vec![SecretString::from("hunter2")],
-                login_fallback: None,
                 browser: None,
             },
         )
@@ -856,7 +480,6 @@ mod tests {
         DownloadRequest {
             work: WorkId::new(42).unwrap(),
             existing,
-            tries: 0,
         }
     }
 
@@ -929,700 +552,6 @@ mod tests {
             0,
             "failed downloads clean up after themselves"
         );
-    }
-
-    // ------------------------------------------------------------ browser session
-
-    use fanfold_domain::{
-        Timestamp,
-        session::{BrowserSession, Cookie},
-    };
-    use fanfold_testkit::memory::{FakeClock, InMemorySession};
-
-    const NOW: i64 = 1_800_000_000;
-    const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:160.0) Gecko/20100101 Firefox/160.0";
-    const CF_VALUE: &str = "cf-clearance-value-1234567890";
-
-    fn cookie(name: &str, value: &str, expires: Option<i64>) -> Cookie {
-        Cookie {
-            name: name.into(),
-            value: value.into(),
-            domain: ".archiveofourown.org".into(),
-            path: "/".into(),
-            expires: expires.map(|s| Timestamp::from_second(s).unwrap()),
-            secure: true,
-            http_only: false,
-        }
-    }
-
-    fn stored_session(updated: i64) -> BrowserSession {
-        BrowserSession {
-            user_agent: UA.into(),
-            cookies: vec![
-                cookie("cf_clearance", CF_VALUE, Some(NOW + 86_400)),
-                cookie("view_adult", "true", None),
-                cookie("expired", "old", Some(NOW - 10)),
-            ],
-            updated_at: Timestamp::from_second(updated).unwrap(),
-        }
-    }
-
-    /// A runner that plays the worker: records the cookie file it was given, optionally
-    /// lets a hook change the world mid-run, rewrites the file like a rotating site, and
-    /// fails with `message`.
-    struct CookieRunner {
-        seen: Mutex<Option<(String, u32)>>,
-        request: Mutex<Option<serde_json::Value>>,
-        rewrite: Option<String>,
-        during: Option<Box<dyn Fn() + Send + Sync>>,
-        message: String,
-    }
-
-    impl CookieRunner {
-        fn new(rewrite: Option<&str>, message: &str) -> Self {
-            Self {
-                seen: Mutex::new(None),
-                request: Mutex::new(None),
-                rewrite: rewrite.map(str::to_owned),
-                during: None,
-                message: message.into(),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl ProcessRunner for CookieRunner {
-        async fn run(&self, spec: &ProcessSpec) -> Result<ProcessOutput, RunError> {
-            use std::os::unix::fs::PermissionsExt as _;
-            let req: serde_json::Value = serde_json::from_slice(&spec.stdin).unwrap();
-            *self.request.lock().unwrap() = Some(req.clone());
-            if let Some(path) = req["cookies"].as_str() {
-                let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-                *self.seen.lock().unwrap() = Some((std::fs::read_to_string(path).unwrap(), mode));
-                if let Some(text) = &self.rewrite {
-                    std::fs::write(path, text).unwrap();
-                }
-            }
-            if let Some(hook) = &self.during {
-                hook();
-            }
-            out(&format!(
-                r#"{{"status":"error","kind":"blocked","message":{},"log":{}}}"#,
-                serde_json::to_string(&self.message).unwrap(),
-                serde_json::to_string(&self.message).unwrap()
-            ))
-        }
-    }
-
-    fn with_session(
-        runner: Arc<CookieRunner>,
-        scratch: &Path,
-        store: &Arc<InMemorySession>,
-    ) -> FanFicFareDownloader {
-        let clock = Arc::new(FakeClock::at_secs(NOW));
-        FanFicFareDownloader::new(
-            runner,
-            FanFicFareConfig {
-                python: "python3".into(),
-                scratch_dir: scratch.to_path_buf(),
-                personal_ini: None,
-                timeout: Duration::from_secs(30),
-                url_template: "https://archiveofourown.org/works/{id}".into(),
-                redactions: vec![],
-                login_fallback: None,
-                browser: None,
-            },
-        )
-        .with_session(Arc::clone(store) as Arc<dyn SessionStore>, clock)
-    }
-
-    #[tokio::test]
-    async fn the_stored_session_reaches_the_worker_privately_and_without_expired_cookies() {
-        let scratch = tempfile::tempdir().unwrap();
-        let store = Arc::new(InMemorySession::new());
-        store.save(&stored_session(NOW - 100)).await.unwrap();
-        let runner = Arc::new(CookieRunner::new(None, "refused"));
-        let dl = with_session(Arc::clone(&runner), scratch.path(), &store);
-        let _ = dl.download(&request(None)).await;
-
-        let req = runner.request.lock().unwrap().clone().unwrap();
-        assert_eq!(req["user_agent"], UA);
-        let (file, mode) = runner.seen.lock().unwrap().clone().unwrap();
-        assert_eq!(mode, 0o600, "the cookie file is private to us");
-        assert!(
-            file.contains("cf_clearance") && file.contains(CF_VALUE),
-            "{file}"
-        );
-        assert!(file.contains("view_adult"));
-        assert!(!file.contains("expired"), "an expired cookie is not sent");
-    }
-
-    // ------------------------------------------------------------------ login fallback
-
-    const FIRST_INI: &str = "/run/fanfold/personal.ini";
-    const LOGIN_INI: &str = "/run/fanfold/personal-login.ini";
-    const DIRECT_INI: &str = "/run/fanfold/personal-direct.ini";
-
-    /// Plays the worker for the two tries of a download and records what it was asked.
-    struct TwoTryRunner {
-        requests: Mutex<Vec<serde_json::Value>>,
-        /// How the anonymous try ends (a `FailureKind` name).
-        first_fails_with: &'static str,
-        /// `None`: the fallback also asks for a login. `Some(cookies)`: it works, leaving this
-        /// cookies.txt behind, and `ua` as the User-Agent its clearance was earned with.
-        fallback_succeeds_with: Option<(String, String)>,
-    }
-
-    #[async_trait]
-    impl ProcessRunner for TwoTryRunner {
-        async fn run(&self, spec: &ProcessSpec) -> Result<ProcessOutput, RunError> {
-            let req: serde_json::Value = serde_json::from_slice(&spec.stdin).unwrap();
-            let call = {
-                let mut seen = self.requests.lock().unwrap();
-                seen.push(req.clone());
-                seen.len()
-            };
-            let workdir = req["workdir"].as_str().unwrap().to_owned();
-            if call == 1 || self.fallback_succeeds_with.is_none() {
-                let kind = if call == 1 {
-                    self.first_fails_with
-                } else {
-                    "auth_failed"
-                };
-                return out(&format!(
-                    r#"{{"status":"error","kind":"{kind}","message":"try {call} said {kind}","log":"log of try {call}"}}"#
-                ));
-            }
-            let (cookies, ua) = self.fallback_succeeds_with.clone().unwrap();
-            std::fs::write(req["cookies"].as_str().unwrap(), cookies).unwrap();
-            std::fs::write(format!("{workdir}/user_agent.txt"), ua).unwrap();
-            std::fs::write(format!("{workdir}/story.epub"), "epub").unwrap();
-            out(&format!(
-                r#"{{"status":"ok","path":"{workdir}/story.epub","title":"T","changed":true,"log":"worker log"}}"#
-            ))
-        }
-    }
-
-    fn fallback_downloader(
-        runner: Arc<TwoTryRunner>,
-        scratch: &Path,
-        store: &Arc<InMemorySession>,
-    ) -> FanFicFareDownloader {
-        FanFicFareDownloader::new(
-            runner,
-            FanFicFareConfig {
-                python: "python3".into(),
-                scratch_dir: scratch.to_path_buf(),
-                personal_ini: Some(PathBuf::from(FIRST_INI)),
-                timeout: Duration::from_secs(30),
-                url_template: "https://archiveofourown.org/works/{id}".into(),
-                redactions: vec![],
-                browser: None,
-                login_fallback: Some(LoginFallback {
-                    personal_ini: PathBuf::from(LOGIN_INI),
-                    direct_ini: PathBuf::from(DIRECT_INI),
-                    flaresolverr: "http://flaresolverr:8191".parse().unwrap(),
-                    flaresolverr_timeout: Duration::from_secs(45),
-                }),
-            },
-        )
-        .with_session(
-            Arc::clone(store) as Arc<dyn SessionStore>,
-            Arc::new(FakeClock::at_secs(NOW)),
-        )
-    }
-
-    fn two_try_runner(
-        first: &'static str,
-        fallback: Option<(String, String)>,
-    ) -> Arc<TwoTryRunner> {
-        Arc::new(TwoTryRunner {
-            requests: Mutex::new(Vec::new()),
-            first_fails_with: first,
-            fallback_succeeds_with: fallback,
-        })
-    }
-
-    #[tokio::test]
-    async fn a_login_demand_through_flaresolverr_falls_back_to_the_login_path() {
-        let scratch = tempfile::tempdir().unwrap();
-        let store = Arc::new(InMemorySession::new());
-        store.save(&stored_session(NOW - 100)).await.unwrap();
-        let runner = two_try_runner(
-            "auth_failed",
-            Some(("# Netscape HTTP Cookie File\n".into(), "EarnedUA/1".into())),
-        );
-        let dl = fallback_downloader(Arc::clone(&runner), scratch.path(), &store);
-        let book = dl.download(&request(None)).await.unwrap();
-        assert!(book.log.contains("login fallback"), "{}", book.log);
-        assert!(book.log.contains("worker log"));
-
-        let seen = runner.requests.lock().unwrap().clone();
-        assert_eq!(seen.len(), 2);
-        let (first, second) = (&seen[0], &seen[1]);
-        assert_eq!(first["personal_ini"], FIRST_INI);
-        assert_eq!(
-            (&first["cookies"], &first["user_agent"], &first["clearance"]),
-            (
-                &serde_json::Value::Null,
-                &serde_json::Value::Null,
-                &serde_json::Value::Null
-            ),
-            "the anonymous try sends nothing of the stored session through FlareSolverr"
-        );
-        assert_eq!(second["personal_ini"], LOGIN_INI);
-        assert!(
-            second["cookies"].is_string(),
-            "the stored session goes to the fallback"
-        );
-        assert_eq!(
-            second["clearance"]["flaresolverr"],
-            "http://flaresolverr:8191/"
-        );
-        assert_eq!(second["clearance"]["timeout_ms"], 45_000);
-        assert_eq!(
-            second["clearance"]["url"],
-            "https://archiveofourown.org/users/login"
-        );
-        assert_eq!(
-            second["user_agent"],
-            serde_json::Value::Null,
-            "the worker sets it"
-        );
-    }
-
-    #[tokio::test]
-    async fn only_a_login_demand_triggers_the_fallback() {
-        for kind in [
-            "site_unavailable",
-            "rate_limited",
-            "blocked",
-            "not_found",
-            "transient",
-            "permanent",
-        ] {
-            let scratch = tempfile::tempdir().unwrap();
-            let store = Arc::new(InMemorySession::new());
-            let runner = two_try_runner(kind, Some((String::new(), "ua".into())));
-            let dl = fallback_downloader(Arc::clone(&runner), scratch.path(), &store);
-            let err = dl.download(&request(None)).await.unwrap_err();
-            assert_eq!(err.kind.as_str(), kind);
-            assert_eq!(
-                runner.requests.lock().unwrap().len(),
-                1,
-                "{kind} must not retry"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn without_a_fallback_a_login_demand_is_final() {
-        let scratch = tempfile::tempdir().unwrap();
-        let runner = ScriptedRunner::new(vec![out(
-            r#"{"status":"error","kind":"auth_failed","message":"needs login"}"#,
-        )]);
-        let dl = downloader(Arc::clone(&runner), scratch.path());
-        let err = dl.download(&request(None)).await.unwrap_err();
-        assert_eq!(err.kind, FailureKind::AuthFailed);
-        assert_eq!(runner.specs().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_failed_fallback_reports_both_tries() {
-        let scratch = tempfile::tempdir().unwrap();
-        let store = Arc::new(InMemorySession::new());
-        let runner = two_try_runner("auth_failed", None);
-        let dl = fallback_downloader(Arc::clone(&runner), scratch.path(), &store);
-        let err = dl.download(&request(None)).await.unwrap_err();
-        assert_eq!(
-            err.kind,
-            FailureKind::AuthFailed,
-            "still a login problem: not retried"
-        );
-        assert!(err.log.contains("try 1 said auth_failed"), "{}", err.log);
-        assert!(
-            err.log.contains("login fallback then failed"),
-            "{}",
-            err.log
-        );
-        assert_eq!(runner.requests.lock().unwrap().len(), 2);
-        assert_eq!(
-            std::fs::read_dir(scratch.path()).unwrap().count(),
-            0,
-            "a failed download cleans up"
-        );
-    }
-
-    /// [`fallback_downloader`]'s configuration, around any runner.
-    fn alternating_downloader(
-        runner: Arc<dyn ProcessRunner>,
-        scratch: &Path,
-        store: &Arc<InMemorySession>,
-    ) -> FanFicFareDownloader {
-        FanFicFareDownloader::new(
-            runner,
-            FanFicFareConfig {
-                python: "python3".into(),
-                scratch_dir: scratch.to_path_buf(),
-                personal_ini: Some(PathBuf::from(FIRST_INI)),
-                timeout: Duration::from_secs(30),
-                url_template: "https://archiveofourown.org/works/{id}".into(),
-                redactions: vec![],
-                browser: None,
-                login_fallback: Some(LoginFallback {
-                    personal_ini: PathBuf::from(LOGIN_INI),
-                    direct_ini: PathBuf::from(DIRECT_INI),
-                    flaresolverr: "http://flaresolverr:8191".parse().unwrap(),
-                    flaresolverr_timeout: Duration::from_secs(45),
-                }),
-            },
-        )
-        .with_session(
-            Arc::clone(store) as Arc<dyn SessionStore>,
-            Arc::new(FakeClock::at_secs(NOW)),
-        )
-    }
-
-    /// One route refused (AO3's bot filter flags `FlareSolverr`, Cloudflare flags plain
-    /// requests) must not fail a job the other could fetch: the tries take turns.
-    #[tokio::test]
-    async fn tries_alternate_between_flaresolverr_and_fetching_directly() {
-        let scratch = tempfile::tempdir().unwrap();
-        let store = Arc::new(InMemorySession::new());
-        let mut session = stored_session(NOW - 100);
-        session.cookies.push(cookie(
-            "remember_user_token",
-            "login-token-0123456789",
-            Some(NOW + 30 * 86_400),
-        ));
-        session.cookies.push(cookie(
-            "__cf_bm",
-            "bot-management-0123456789",
-            Some(NOW + 600),
-        ));
-        store.save(&session).await.unwrap();
-
-        for tries in 0..4 {
-            let runner = Arc::new(CookieRunner::new(None, "refused"));
-            let dl = alternating_downloader(
-                Arc::clone(&runner) as Arc<dyn ProcessRunner>,
-                scratch.path(),
-                &store,
-            );
-            let err = dl
-                .download(&DownloadRequest {
-                    tries,
-                    ..request(None)
-                })
-                .await
-                .unwrap_err();
-            let req = runner.request.lock().unwrap().clone().unwrap();
-            assert_eq!(req["clearance"], serde_json::Value::Null, "try {tries}");
-            assert_eq!(req["user_agent"], serde_json::Value::Null, "try {tries}");
-            assert_eq!(
-                req["cookies"],
-                serde_json::Value::Null,
-                "try {tries}: only the login fallback carries the stored session"
-            );
-            if tries % 2 == 0 {
-                assert_eq!(req["personal_ini"], FIRST_INI, "try {tries}");
-                assert!(
-                    err.log
-                        .contains("through FlareSolverr; the next try goes directly")
-                );
-            } else {
-                assert_eq!(
-                    req["personal_ini"], DIRECT_INI,
-                    "try {tries}: logs in afresh, as AutomatedFanfic does"
-                );
-                assert!(
-                    err.log
-                        .contains("without FlareSolverr; the next try goes through"),
-                    "{}",
-                    err.log
-                );
-            }
-            assert!(
-                err.log.contains(&format!("Try {} fetched", tries + 1)),
-                "{}",
-                err.log
-            );
-        }
-        assert_eq!(
-            store.load().await.unwrap(),
-            Some(session),
-            "the stored session is left alone"
-        );
-    }
-
-    #[tokio::test]
-    async fn without_flaresolverr_every_try_fetches_the_same_way() {
-        let scratch = tempfile::tempdir().unwrap();
-        let store = Arc::new(InMemorySession::new());
-        store.save(&stored_session(NOW - 100)).await.unwrap();
-        for tries in 0..2 {
-            let runner = Arc::new(CookieRunner::new(None, "refused"));
-            let dl = with_session(Arc::clone(&runner), scratch.path(), &store);
-            let err = dl
-                .download(&DownloadRequest {
-                    tries,
-                    ..request(None)
-                })
-                .await
-                .unwrap_err();
-            let req = runner.request.lock().unwrap().clone().unwrap();
-            assert_eq!(req["user_agent"], UA, "try {tries}");
-            assert!(!err.log.contains("next try"), "{}", err.log);
-        }
-    }
-
-    #[tokio::test]
-    async fn a_login_demand_on_a_direct_try_also_gets_the_login_fallback() {
-        let scratch = tempfile::tempdir().unwrap();
-        let store = Arc::new(InMemorySession::new());
-        let runner = two_try_runner("auth_failed", Some((String::new(), "EarnedUA/1".into())));
-        let dl = fallback_downloader(Arc::clone(&runner), scratch.path(), &store);
-        let book = dl
-            .download(&DownloadRequest {
-                tries: 1,
-                ..request(None)
-            })
-            .await
-            .unwrap();
-        assert!(book.log.contains("login fallback"), "{}", book.log);
-        let seen = runner.requests.lock().unwrap().clone();
-        assert_eq!(seen.len(), 2);
-        assert!(seen[0]["clearance"].is_null() && seen[1]["clearance"].is_object());
-    }
-
-    #[tokio::test]
-    async fn the_login_the_fallback_earns_is_kept_when_nothing_was_stored() {
-        let scratch = tempfile::tempdir().unwrap();
-        let store = Arc::new(InMemorySession::new());
-        let cookies = format!(
-            "# Netscape HTTP Cookie File\n\
-             .archiveofourown.org\tTRUE\t/\tTRUE\t{}\tremember_user_token\tlogin-token-0123456789\n\
-             .archiveofourown.org\tTRUE\t/\tTRUE\t{}\tcf_clearance\tclearance-0123456789abcdef\n",
-            NOW + 92 * 86_400,
-            NOW + 365 * 86_400
-        );
-        let runner = two_try_runner("auth_failed", Some((cookies, "FlareSolverrUA/9".into())));
-        let dl = fallback_downloader(Arc::clone(&runner), scratch.path(), &store);
-        dl.download(&request(None)).await.unwrap();
-
-        let kept = store
-            .load()
-            .await
-            .unwrap()
-            .expect("the earned login is stored");
-        assert_eq!(kept.user_agent, "FlareSolverrUA/9");
-        let remember = kept
-            .cookies
-            .iter()
-            .find(|c| c.name == "remember_user_token")
-            .unwrap();
-        assert_eq!(
-            remember.expires,
-            Some(Timestamp::from_second(NOW + 92 * 86_400).unwrap()),
-            "its expiry is known, so the Session page can warn before it lapses"
-        );
-        assert!(kept.cookies.iter().any(|c| c.name == "cf_clearance"));
-    }
-
-    #[tokio::test]
-    async fn the_fallback_starts_from_the_stored_login_and_updates_it() {
-        let scratch = tempfile::tempdir().unwrap();
-        let store = Arc::new(InMemorySession::new());
-        let mut session = stored_session(NOW - 100);
-        session.cookies.push(cookie(
-            "remember_user_token",
-            "old-login-token-0123456789",
-            Some(NOW + 30 * 86_400),
-        ));
-        store.save(&session).await.unwrap();
-        let renewed = format!(
-            ".archiveofourown.org\tTRUE\t/\tTRUE\t{}\tremember_user_token\tnew-login-token-0123456789\n",
-            NOW + 92 * 86_400
-        );
-        let runner = two_try_runner("auth_failed", Some((renewed, "FlareSolverrUA/9".into())));
-        let dl = fallback_downloader(Arc::clone(&runner), scratch.path(), &store);
-        dl.download(&request(None)).await.unwrap();
-
-        let after = store.load().await.unwrap().unwrap();
-        let remember = after
-            .cookies
-            .iter()
-            .find(|c| c.name == "remember_user_token")
-            .unwrap();
-        assert_eq!(
-            remember.value, "new-login-token-0123456789",
-            "the renewed token replaces the old"
-        );
-        assert!(
-            after.cookies.iter().any(|c| c.name == "view_adult"),
-            "cookies the run did not mention are kept"
-        );
-        assert_eq!(after.user_agent, "FlareSolverrUA/9");
-    }
-
-    /// Cloudflare ties its clearance to the client that earned it: through fanfold-browser no
-    /// cookie or User-Agent may be handed to the worker, whatever is stored.
-    #[tokio::test]
-    async fn through_the_browser_service_the_worker_gets_only_its_address() {
-        let scratch = tempfile::tempdir().unwrap();
-        let store = Arc::new(InMemorySession::new());
-        store.save(&stored_session(NOW - 100)).await.unwrap();
-        let runner = Arc::new(CookieRunner::new(None, "refused"));
-        let mut dl = with_session(Arc::clone(&runner), scratch.path(), &store);
-        dl.config.browser = Some(BrowserService {
-            url: "http://fanfold-browser:8191".parse().unwrap(),
-            timeout: Duration::from_secs(180),
-        });
-        for tries in 0..2 {
-            let _ = dl
-                .download(&DownloadRequest {
-                    tries,
-                    ..request(None)
-                })
-                .await;
-            let req = runner.request.lock().unwrap().clone().unwrap();
-            assert_eq!(
-                req["browser"],
-                serde_json::json!({"url": "http://fanfold-browser:8191/", "timeout_ms": 180_000})
-            );
-            assert_eq!(
-                (&req["cookies"], &req["user_agent"], &req["clearance"]),
-                (
-                    &serde_json::Value::Null,
-                    &serde_json::Value::Null,
-                    &serde_json::Value::Null
-                ),
-                "try {tries}"
-            );
-        }
-        assert_eq!(
-            store.load().await.unwrap(),
-            Some(stored_session(NOW - 100)),
-            "nothing written back"
-        );
-    }
-
-    #[tokio::test]
-    async fn without_a_session_nothing_changes() {
-        let scratch = tempfile::tempdir().unwrap();
-        let store = Arc::new(InMemorySession::new());
-        let runner = Arc::new(CookieRunner::new(None, "refused"));
-        let dl = with_session(Arc::clone(&runner), scratch.path(), &store);
-        let _ = dl.download(&request(None)).await;
-        let req = runner.request.lock().unwrap().clone().unwrap();
-        assert_eq!(req["cookies"], serde_json::Value::Null);
-        assert_eq!(req["user_agent"], serde_json::Value::Null);
-        assert_eq!(store.load().await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn cookies_the_site_rotated_are_kept_even_when_the_download_failed() {
-        let scratch = tempfile::tempdir().unwrap();
-        let store = Arc::new(InMemorySession::new());
-        store.save(&stored_session(NOW - 100)).await.unwrap();
-        let rotated = format!(
-            "# Netscape HTTP Cookie File\n\
-             .archiveofourown.org\tTRUE\t/\tTRUE\t{}\tcf_clearance\trotated-value\n\
-             .archiveofourown.org\tTRUE\t/\tTRUE\t{}\t__cf_bm\tnew-cookie\n",
-            NOW + 2 * 86_400,
-            NOW + 1_800
-        );
-        let runner = Arc::new(CookieRunner::new(Some(&rotated), "refused"));
-        let dl = with_session(runner, scratch.path(), &store);
-        let _ = dl.download(&request(None)).await;
-
-        let session = store.load().await.unwrap().unwrap();
-        let value = |n: &str| {
-            session
-                .cookies
-                .iter()
-                .find(|c| c.name == n)
-                .map(|c| c.value.clone())
-        };
-        assert_eq!(value("cf_clearance").as_deref(), Some("rotated-value"));
-        assert_eq!(value("__cf_bm").as_deref(), Some("new-cookie"));
-        assert_eq!(
-            value("view_adult").as_deref(),
-            Some("true"),
-            "unmentioned cookies stay"
-        );
-        assert_eq!(value("expired"), None, "expired cookies are dropped");
-        assert_eq!(session.user_agent, UA);
-        assert_eq!(session.updated_at, Timestamp::from_second(NOW).unwrap());
-    }
-
-    #[tokio::test]
-    async fn an_import_made_during_a_run_is_not_overwritten() {
-        let scratch = tempfile::tempdir().unwrap();
-        let store = Arc::new(InMemorySession::new());
-        store.save(&stored_session(NOW - 100)).await.unwrap();
-        let rotated = format!(
-            ".archiveofourown.org\tTRUE\t/\tTRUE\t{}\tcf_clearance\tfrom-the-run\n",
-            NOW + 86_400
-        );
-        let mut runner = CookieRunner::new(Some(&rotated), "refused");
-        let imported = BrowserSession {
-            user_agent: "imported".into(),
-            cookies: vec![cookie(
-                "cf_clearance",
-                "fresh-import",
-                Some(NOW + 9_999_999),
-            )],
-            updated_at: Timestamp::from_second(NOW - 1).unwrap(),
-        };
-        let store_for_hook = Arc::clone(&store);
-        let handle = tokio::runtime::Handle::current();
-        runner.during = Some(Box::new(move || {
-            let (store, session) = (Arc::clone(&store_for_hook), imported.clone());
-            std::thread::spawn({
-                let handle = handle.clone();
-                move || handle.block_on(async move { store.save(&session).await.unwrap() })
-            })
-            .join()
-            .unwrap();
-        }));
-        let dl = with_session(Arc::new(runner), scratch.path(), &store);
-        let _ = dl.download(&request(None)).await;
-
-        let session = store.load().await.unwrap().unwrap();
-        assert_eq!(session.user_agent, "imported");
-        assert_eq!(session.cookies[0].value, "fresh-import");
-    }
-
-    #[tokio::test]
-    async fn cookie_values_never_reach_the_job_log() {
-        let scratch = tempfile::tempdir().unwrap();
-        let store = Arc::new(InMemorySession::new());
-        store.save(&stored_session(NOW - 100)).await.unwrap();
-        let echo = format!("403 with Cookie: cf_clearance={CF_VALUE}; view_adult=true");
-        let runner = Arc::new(CookieRunner::new(None, &echo));
-        let dl = with_session(runner, scratch.path(), &store);
-        let err = dl.download(&request(None)).await.unwrap_err();
-        for text in [&err.message, &err.log] {
-            assert!(!text.contains(CF_VALUE), "{text}");
-            assert!(text.contains("[REDACTED]"));
-            assert!(
-                text.contains("view_adult=true"),
-                "short values are not blanked: {text}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_broken_session_store_does_not_stop_downloads() {
-        let scratch = tempfile::tempdir().unwrap();
-        let store = Arc::new(InMemorySession::new());
-        store.break_with(Some(fanfold_app::error::RepoError::Backend("down".into())));
-        let runner = Arc::new(CookieRunner::new(None, "refused"));
-        let dl = with_session(Arc::clone(&runner), scratch.path(), &store);
-        let err = dl.download(&request(None)).await.unwrap_err();
-        assert_eq!(err.kind, FailureKind::Blocked, "the worker still ran");
-        assert!(runner.seen.lock().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1775,35 +704,25 @@ mod tests {
         );
     }
 
-    /// A stand-in for `FlareSolverr`: answers every command with a fresh Cloudflare clearance and
-    /// session cookie, and records the request bodies.
-    async fn fake_flaresolverr() -> (u16, Arc<Mutex<Vec<serde_json::Value>>>) {
-        fake_flaresolverr_serving(
-            "<html><head><title>fake</title></head><body><div id=\"main\"></div></body></html>",
-        )
-        .await
+    /// A stand-in for fanfold-browser, answering every page with `page` and HTTP status 200 (what
+    /// a browser shows when an error page comes with a 200, or after a challenge), recording the
+    /// requests it was sent.
+    async fn fake_browser_serving(page: &'static str) -> (u16, Arc<Mutex<Vec<serde_json::Value>>>) {
+        fake_browser_routing(&[], page).await
     }
 
-    /// [`fake_flaresolverr`], answering every page with `page` and HTTP status 200, as the real
-    /// one does even for Cloudflare's own error pages.
-    async fn fake_flaresolverr_serving(
-        page: &'static str,
-    ) -> (u16, Arc<Mutex<Vec<serde_json::Value>>>) {
-        fake_flaresolverr_routing(&[], page).await
-    }
-
-    /// [`fake_flaresolverr_serving`], answering a URL containing a route's needle with that
+    /// [`fake_browser_serving`], answering a URL containing a route's needle with that
     /// route's page, and any other URL with `default`.
-    async fn fake_flaresolverr_routing(
+    async fn fake_browser_routing(
         routes: &'static [(&'static str, &'static str)],
         default: &'static str,
     ) -> (u16, Arc<Mutex<Vec<serde_json::Value>>>) {
-        fake_flaresolverr_flaky(0, routes, default).await
+        fake_browser_flaky(0, routes, default).await
     }
 
-    /// [`fake_flaresolverr_routing`], answering the first `failures` requests with Cloudflare's
+    /// [`fake_browser_routing`], answering the first `failures` requests with Cloudflare's
     /// 525 page, as AO3 does during a partial outage.
-    async fn fake_flaresolverr_flaky(
+    async fn fake_browser_flaky(
         failures: usize,
         routes: &'static [(&'static str, &'static str)],
         default: &'static str,
@@ -1860,18 +779,8 @@ mod tests {
                             .map_or(default, |(_, page)| *page)
                     };
                     let reply = serde_json::json!({
-                        "status": "ok", "message": "", "session": "fake",
-                        "solution": {
-                            "url": request["url"], "status": 200, "headers": {},
-                            "response": page,
-                            "userAgent": "FakeClearanceUA/1.0",
-                            "cookies": [
-                                {"name": "_otwarchive_session", "value": "fresh-session-value", "domain": ".archiveofourown.org",
-                                 "path": "/", "secure": true, "expires": -1},
-                                {"name": "cf_clearance", "value": "fresh-clearance-value", "domain": ".archiveofourown.org",
-                                 "path": "/", "secure": true, "expires": 1_900_000_000}
-                            ]
-                        }
+                        "status": 200, "url": request["url"], "content_type": "text/html",
+                        "body_b64": base64(page.as_bytes()),
                     })
                     .to_string();
                     log.lock().unwrap().push(request);
@@ -1884,98 +793,6 @@ mod tests {
             }
         });
         (port, seen)
-    }
-
-    /// The clearance step against the real worker: `FlareSolverr`'s cookies replace the stored
-    /// ones of the same name, the login cookie is kept, and the User-Agent is left for the caller.
-    /// `FFD_PYTHON=/path/to/venv/bin/python cargo test -p fanfold-adapter-fanficfare -- --ignored`
-    #[tokio::test]
-    #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
-    async fn the_worker_merges_flaresolverrs_clearance_with_the_stored_login() {
-        let python = std::env::var("FFD_PYTHON").expect("set FFD_PYTHON");
-        let scratch = tempfile::tempdir().unwrap();
-        let (port, seen) = fake_flaresolverr().await;
-        let login_ini = scratch.path().join("personal-login.ini");
-        std::fs::write(&login_ini, "[defaults]\nmax_request_retries:0\n").unwrap();
-        let store = Arc::new(InMemorySession::new());
-        let mut session = stored_session(NOW - 100);
-        session.cookies.push(cookie(
-            "_otwarchive_session",
-            "stale-session-value",
-            Some(NOW + 86_400),
-        ));
-        session.cookies.push(cookie(
-            "remember_user_token",
-            "login-token-0123456789",
-            Some(NOW + 86_400),
-        ));
-        store.save(&session).await.unwrap();
-        let dl = FanFicFareDownloader::new(
-            Arc::new(TokioProcessRunner),
-            FanFicFareConfig {
-                python,
-                scratch_dir: scratch.path().to_path_buf(),
-                personal_ini: None,
-                timeout: Duration::from_secs(60),
-                // FanFicFare's offline site, so the download itself needs no network.
-                url_template: "http://test1.com?sid={id}".into(),
-                redactions: vec![],
-                browser: None,
-                login_fallback: Some(LoginFallback {
-                    personal_ini: login_ini.clone(),
-                    direct_ini: login_ini,
-                    flaresolverr: format!("http://127.0.0.1:{port}").parse().unwrap(),
-                    flaresolverr_timeout: Duration::from_secs(10),
-                }),
-            },
-        )
-        .with_session(
-            Arc::clone(&store) as Arc<dyn SessionStore>,
-            Arc::new(FakeClock::at_secs(NOW)),
-        );
-        let workdir = dl.make_workdir(&request(None)).await.unwrap();
-        let book = dl
-            .run_worker(&request(None), &workdir, Attempt::Fallback)
-            .await
-            .unwrap();
-        assert_eq!(book.title, "Test Story Title 42");
-
-        let asked = seen.lock().unwrap().clone();
-        assert_eq!(asked.len(), 1, "one clearance request: {asked:?}");
-        assert_eq!(asked[0]["cmd"], "request.get");
-        assert_eq!(asked[0]["url"], "http://test1.com/users/login");
-
-        let saved = std::fs::read_to_string(workdir.join("cookies.txt")).unwrap();
-        let value_of = |name: &str| {
-            saved
-                .lines()
-                .map(|l| {
-                    l.trim_start_matches("#HttpOnly_")
-                        .split('\t')
-                        .collect::<Vec<_>>()
-                })
-                .find(|f| f.get(5) == Some(&name))
-                .and_then(|f| f.get(6).map(|v| (*v).to_owned()))
-        };
-        assert_eq!(
-            value_of("_otwarchive_session").as_deref(),
-            Some("fresh-session-value")
-        );
-        assert_eq!(
-            value_of("cf_clearance").as_deref(),
-            Some("fresh-clearance-value")
-        );
-        assert_eq!(
-            value_of("remember_user_token").as_deref(),
-            Some("login-token-0123456789"),
-            "only a real login can issue the login cookie, so the stored one stays"
-        );
-        assert_eq!(value_of("view_adult").as_deref(), Some("true"));
-        assert_eq!(
-            std::fs::read_to_string(workdir.join("user_agent.txt")).unwrap(),
-            "FakeClearanceUA/1.0"
-        );
-        dl.release(&book).await;
     }
 
     /// Regression: a failed *update* left the old book on disk, which the worker took for a
@@ -2001,7 +818,6 @@ mod tests {
                     timeout: Duration::from_secs(60),
                     url_template: "http://test1.com?sid=668".into(),
                     redactions: vec![],
-                    login_fallback: None,
                     browser: None,
                 },
             )
@@ -2023,8 +839,15 @@ mod tests {
         assert!(stored.exists(), "the stored book is left untouched");
     }
 
-    /// A downloader for one story, with `ini` as the personal.ini and no login fallback.
+    /// A downloader for one story, with `ini` as the personal.ini, and through the fake browser
+    /// when [`browser_ini`] set one up in `scratch`.
     fn real_downloader(scratch: &Path, ini: &Path, url_template: &str) -> FanFicFareDownloader {
+        let browser = std::fs::read_to_string(scratch.join("browser-port"))
+            .ok()
+            .map(|port| BrowserService {
+                url: format!("http://127.0.0.1:{}", port.trim()).parse().unwrap(),
+                timeout: Duration::from_secs(10),
+            });
         FanFicFareDownloader::new(
             Arc::new(TokioProcessRunner),
             FanFicFareConfig {
@@ -2034,8 +857,7 @@ mod tests {
                 timeout: Duration::from_secs(60),
                 url_template: url_template.into(),
                 redactions: vec![],
-                login_fallback: None,
-                browser: None,
+                browser,
             },
         )
     }
@@ -2149,29 +971,20 @@ mod tests {
         assert_eq!(chapters_in(&book.path), 2, "{}", book.log);
     }
 
-    /// Cloudflare's error page as `FlareSolverr` returned it for AO3 (trimmed): HTTP 200.
+    /// Cloudflare's error page for AO3 (trimmed), as a browser shows it.
     const CLOUDFLARE_525: &str = "<html><head><title>archiveofourown.org | 525: SSL handshake \
         failed</title></head><body><div id=\"cf-wrapper\"><div id=\"cf-error-details\" \
         class=\"cf-error-details-wrapper\"><h1>SSL handshake failed</h1>\
         <span class=\"cf-error-type\">Error code 525</span></div></div></body></html>";
 
-    /// The root of the bug above: `FlareSolverr` reports 200 for Cloudflare's error pages, so
-    /// FanFicFare parsed "525: SSL handshake failed" as the AO3 page it had asked for.
+    /// The root of the bug above: Cloudflare's error page came as a 200 (through `FlareSolverr`
+    /// then), so FanFicFare parsed "525: SSL handshake failed" as the AO3 page it had asked for.
     #[tokio::test]
     #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
-    async fn a_cloudflare_error_page_through_flaresolverr_is_an_unavailable_site() {
+    async fn a_cloudflare_error_page_through_the_browser_is_an_unavailable_site() {
         let scratch = tempfile::tempdir().unwrap();
-        let (port, seen) = fake_flaresolverr_serving(CLOUDFLARE_525).await;
-        let ini = scratch.path().join("personal.ini");
-        std::fs::write(
-            &ini,
-            format!(
-                "[defaults]\nuse_flaresolverr_proxy:true\nflaresolverr_proxy_protocol:http\n\
-                 flaresolverr_proxy_address:127.0.0.1\nflaresolverr_proxy_port:{port}\n\
-                 flaresolverr_proxy_timeout:10000\n\n[archiveofourown.org]\nis_adult:true\n"
-            ),
-        )
-        .unwrap();
+        let (port, seen) = fake_browser_serving(CLOUDFLARE_525).await;
+        let ini = browser_ini(scratch.path(), port);
         let err = real_downloader(
             scratch.path(),
             &ini,
@@ -2184,20 +997,20 @@ mod tests {
         assert!(err.message.contains("525"), "{}", err.message);
         assert!(
             !seen.lock().unwrap().is_empty(),
-            "it went through FlareSolverr"
+            "it went through the browser"
         );
     }
 
     /// What AO3's bot filter answered from a flagged address (November 2026, HTTP 429 as plain
-    /// text, which `FlareSolverr` reports as a 200).
+    /// text; through a browser it can arrive as a 200 page).
     const AO3_BOT_FILTER: &str = "The bot servers are currently overloaded, please try again \
         later. You are seeing this page because our systems think you may be a robot. If you are \
         not a robot, this could be due to using a VPN or privacy-focused browser.";
 
-    async fn download_through_flaresolverr_serving(page: &'static str) -> DownloadError {
+    async fn download_through_the_browser_serving(page: &'static str) -> DownloadError {
         let scratch = tempfile::tempdir().unwrap();
-        let (port, seen) = fake_flaresolverr_serving(page).await;
-        let ini = flaresolverr_ini(scratch.path(), port);
+        let (port, seen) = fake_browser_serving(page).await;
+        let ini = browser_ini(scratch.path(), port);
         let err = real_downloader(
             scratch.path(),
             &ini,
@@ -2208,7 +1021,7 @@ mod tests {
         .expect_err("that is not the work");
         assert!(
             !seen.lock().unwrap().is_empty(),
-            "it went through FlareSolverr"
+            "it went through the browser"
         );
         err
     }
@@ -2219,8 +1032,8 @@ mod tests {
     /// waits for the site, and the job's tries are not used up.
     #[tokio::test]
     #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
-    async fn ao3_s_bot_filter_through_flaresolverr_is_a_rate_limit() {
-        let err = download_through_flaresolverr_serving(AO3_BOT_FILTER).await;
+    async fn ao3_s_bot_filter_through_the_browser_is_a_rate_limit() {
+        let err = download_through_the_browser_serving(AO3_BOT_FILTER).await;
         assert_eq!(err.kind, FailureKind::RateLimited, "{}", err.message);
         assert!(err.message.contains("bot protection"), "{}", err.message);
         assert!(err.message.contains("may be a robot"), "{}", err.message);
@@ -2230,7 +1043,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
     async fn a_page_that_is_not_ao3_s_is_an_outage_that_shows_what_it_was() {
-        let err = download_through_flaresolverr_serving(
+        let err = download_through_the_browser_serving(
             "<html><body><h1>502 Bad Gateway</h1><hr>nginx</body></html>",
         )
         .await;
@@ -2243,7 +1056,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
     async fn an_ao3_page_fanficfare_cannot_read_is_named_in_the_failure() {
-        let err = download_through_flaresolverr_serving(
+        let err = download_through_the_browser_serving(
             "<html><body><div id=\"main\" class=\"works-show region\">\
              <p>A layout nobody has seen before</p></div></body></html>",
         )
@@ -2263,14 +1076,14 @@ mod tests {
     #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
     async fn ao3_s_bot_filter_is_not_an_empty_series() {
         let scratch = tempfile::tempdir().unwrap();
-        let (port, _seen) = fake_flaresolverr_serving(AO3_BOT_FILTER).await;
-        let ini = flaresolverr_ini(scratch.path(), port);
+        let (port, _seen) = fake_browser_serving(AO3_BOT_FILTER).await;
+        let ini = browser_ini(scratch.path(), port);
         let err = real_downloader(
             scratch.path(),
             &ini,
             "https://archiveofourown.org/works/{id}",
         )
-        .list_series(fanfold_domain::work::SeriesId::new(77).unwrap(), 0)
+        .list_series(fanfold_domain::work::SeriesId::new(77).unwrap())
         .await
         .expect_err("an error page lists nothing");
         assert_eq!(err.kind, FailureKind::RateLimited, "{}", err.message);
@@ -2279,35 +1092,53 @@ mod tests {
     /// A synthetic AO3 series page (the markup of a real one, every text made up).
     const AO3_SERIES_PAGE: &str = include_str!("../testdata/ao3_series.html");
 
-    fn flaresolverr_ini(dir: &Path, port: u16) -> PathBuf {
+    /// A plain personal.ini, and the fake fanfold-browser on `port` remembered for
+    /// [`real_downloader`] (which then sends every request through it).
+    fn browser_ini(dir: &Path, port: u16) -> PathBuf {
         let ini = dir.join("personal.ini");
-        std::fs::write(
-            &ini,
-            format!(
-                "[defaults]\nuse_flaresolverr_proxy:true\nflaresolverr_proxy_protocol:http\n\
-                 flaresolverr_proxy_address:127.0.0.1\nflaresolverr_proxy_port:{port}\n\
-                 flaresolverr_proxy_timeout:10000\n\n[archiveofourown.org]\nis_adult:true\n"
-            ),
-        )
-        .unwrap();
+        std::fs::write(&ini, "[archiveofourown.org]\nis_adult:true\n").unwrap();
+        std::fs::write(dir.join("browser-port"), port.to_string()).unwrap();
         ini
     }
 
-    /// A series page lists its works in series order, through `FlareSolverr` like any page.
+    /// Standard base64, for the fake browser's page bodies.
+    fn base64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    /// A series page lists its works in series order, through the browser like any page.
     /// `FFD_PYTHON=/path/to/venv/bin/python cargo test -p fanfold-adapter-fanficfare -- --ignored`
     #[tokio::test]
     #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
     async fn a_series_is_listed_in_series_order() {
         let scratch = tempfile::tempdir().unwrap();
-        let (port, seen) = fake_flaresolverr_serving(AO3_SERIES_PAGE).await;
-        let ini = flaresolverr_ini(scratch.path(), port);
+        let (port, seen) = fake_browser_serving(AO3_SERIES_PAGE).await;
+        let ini = browser_ini(scratch.path(), port);
         let series = fanfold_domain::work::SeriesId::new(77).unwrap();
         let listing = real_downloader(
             scratch.path(),
             &ini,
             "https://archiveofourown.org/works/{id}",
         )
-        .list_series(series, 0)
+        .list_series(series)
         .await
         .unwrap();
         assert_eq!(listing.series, series);
@@ -2336,14 +1167,14 @@ mod tests {
     #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
     async fn a_cloudflare_error_page_is_not_an_empty_series() {
         let scratch = tempfile::tempdir().unwrap();
-        let (port, _seen) = fake_flaresolverr_serving(CLOUDFLARE_525).await;
-        let ini = flaresolverr_ini(scratch.path(), port);
+        let (port, _seen) = fake_browser_serving(CLOUDFLARE_525).await;
+        let ini = browser_ini(scratch.path(), port);
         let err = real_downloader(
             scratch.path(),
             &ini,
             "https://archiveofourown.org/works/{id}",
         )
-        .list_series(fanfold_domain::work::SeriesId::new(77).unwrap(), 0)
+        .list_series(fanfold_domain::work::SeriesId::new(77).unwrap())
         .await
         .expect_err("an error page lists nothing");
         assert_eq!(err.kind, FailureKind::SiteUnavailable, "{}", err.message);
@@ -2416,16 +1247,16 @@ mod tests {
         <p class=\"notice\">This work is only available to registered users of the Archive.</p>\
         </div></body></html>";
 
-    /// Regression (work 10000001 in production): the login token request hit AO3's 525 through
-    /// `FlareSolverr`; `FanFicFare` reports that as "Failed getting login token", which was taken
-    /// for a transient error. The site was down: it is an outage, retried at no cost.
+    /// Regression (work 10000001 in production): the login token request hit AO3's 525;
+    /// `FanFicFare` reports that as "Failed getting login token", which was taken for a
+    /// transient error. The site was down: it is an outage, retried at no cost.
     #[tokio::test]
     #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
     async fn a_login_token_lost_to_an_outage_is_an_outage() {
         static ROUTES: [(&str, &str); 1] = [("token_dispenser", CLOUDFLARE_525)];
         let scratch = tempfile::tempdir().unwrap();
-        let (port, _seen) = fake_flaresolverr_routing(&ROUTES, AO3_LOGIN_REQUIRED).await;
-        let ini = flaresolverr_ini(scratch.path(), port);
+        let (port, _seen) = fake_browser_routing(&ROUTES, AO3_LOGIN_REQUIRED).await;
+        let ini = browser_ini(scratch.path(), port);
         let err = real_downloader(
             scratch.path(),
             &ini,
@@ -2443,16 +1274,15 @@ mod tests {
         );
     }
 
-    /// When the site does answer but the login cannot be done this way, it is a login problem:
-    /// the login fallback (plain HTTP after a `FlareSolverr` clearance) must get its turn.
+    /// When the site does answer but the login cannot be done, it is a login problem.
     #[tokio::test]
     #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
-    async fn a_login_token_that_cannot_be_read_asks_for_the_login_fallback() {
+    async fn a_login_token_that_cannot_be_read_is_a_login_failure() {
         static ROUTES: [(&str, &str); 1] =
             [("token_dispenser", "<html><body>not the token</body></html>")];
         let scratch = tempfile::tempdir().unwrap();
-        let (port, _seen) = fake_flaresolverr_routing(&ROUTES, AO3_LOGIN_REQUIRED).await;
-        let ini = flaresolverr_ini(scratch.path(), port);
+        let (port, _seen) = fake_browser_routing(&ROUTES, AO3_LOGIN_REQUIRED).await;
+        let ini = browser_ini(scratch.path(), port);
         let err = real_downloader(
             scratch.path(),
             &ini,
@@ -2476,14 +1306,14 @@ mod tests {
     #[ignore = "needs FFD_PYTHON pointing at a Python with fanficfare installed"]
     async fn a_few_cloudflare_525s_are_retried_through() {
         let scratch = tempfile::tempdir().unwrap();
-        let (port, seen) = fake_flaresolverr_flaky(2, &[], AO3_SERIES_PAGE).await;
-        let ini = flaresolverr_ini(scratch.path(), port);
+        let (port, seen) = fake_browser_flaky(2, &[], AO3_SERIES_PAGE).await;
+        let ini = browser_ini(scratch.path(), port);
         let listing = real_downloader(
             scratch.path(),
             &ini,
             "https://archiveofourown.org/works/{id}",
         )
-        .list_series(fanfold_domain::work::SeriesId::new(77).unwrap(), 0)
+        .list_series(fanfold_domain::work::SeriesId::new(77).unwrap())
         .await
         .expect("two 525s are retried through");
         assert_eq!(listing.facts.works.len(), 2);
@@ -2506,7 +1336,6 @@ mod tests {
                 timeout: Duration::from_secs(120),
                 url_template: "http://test1.com?sid={id}".into(),
                 redactions: vec![],
-                login_fallback: None,
                 browser: None,
             },
         );
@@ -2535,7 +1364,6 @@ mod tests {
                 timeout: Duration::from_secs(120),
                 url_template: "http://nosuchsite.invalid/{id}".into(),
                 redactions: vec![],
-                login_fallback: None,
                 browser: None,
             },
         );

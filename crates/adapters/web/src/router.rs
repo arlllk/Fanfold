@@ -31,7 +31,6 @@ use fanfold_app::{
         BookCatalog, Clock, Event, EventSource, JobFilter, JobRepository, LibraryCatalog,
         LibraryQuery, LibrarySort, LibraryStatus, MetadataStore, Readiness, SiteStatusSource,
     },
-    session::{SessionAdmin, SessionError},
     stats::{MailStats, WorkerStats},
 };
 use fanfold_domain::{
@@ -48,13 +47,11 @@ use crate::{
     forms, metrics,
     problem::ProblemDetails,
     security::{csrf_guard, security_headers},
-    views::{self, DashboardModel, HistoryModel, JobModel, JobRow, Notice, SessionModel},
+    views::{self, DashboardModel, HistoryModel, JobModel, JobRow, Notice},
 };
 
 /// Largest request body any route accepts.
 const MAX_BODY_BYTES: usize = 64 * 1024;
-/// A pasted HAR or `cookies.txt` is larger than any other form (form-encoding can triple it).
-const MAX_SESSION_BODY_BYTES: usize = 2 * 1024 * 1024;
 const SHELF_LEN: u32 = 30;
 const RECENT_LEN: u32 = 8;
 const ATTENTION_FAILED_LEN: u32 = 5;
@@ -71,7 +68,6 @@ pub struct WebDeps {
     pub library: Arc<fanfold_app::library::LibraryAdmin>,
     /// The library page: every book with its metadata.
     pub listing: Arc<dyn LibraryCatalog>,
-    pub session: Arc<SessionAdmin>,
     pub events: Arc<dyn EventSource>,
     pub site: Arc<dyn SiteStatusSource>,
     pub clock: Arc<dyn Clock>,
@@ -647,62 +643,6 @@ async fn retry_failed(State(deps): State<Deps>, headers: HeaderMap) -> Response 
     }
 }
 
-// ------------------------------------------------------------------- session
-
-fn session_problem(error: &SessionError) -> ProblemDetails {
-    if let SessionError::Repo(e) = error {
-        tracing::error!(error = %e, "session action failed");
-    }
-    ProblemDetails::from(error)
-}
-
-async fn session_page(
-    State(deps): State<Deps>,
-    headers: HeaderMap,
-    RawQuery(query): RawQuery,
-) -> Response {
-    let session = match deps.session.view().await {
-        Ok(session) => session,
-        Err(e) => return problem_response(&headers, session_problem(&e)),
-    };
-    let model = SessionModel {
-        now: deps.clock.now(),
-        site: deps.site.site_status(),
-        cookie_site: deps.session.site().to_owned(),
-        session,
-    };
-    let notice = Notice::from_query(&query_pairs(query));
-    page_or_fragment(
-        &headers,
-        &views::session_page(&model, notice),
-        &views::session_detail(&model),
-    )
-}
-
-async fn import_session(State(deps): State<Deps>, headers: HeaderMap, body: Bytes) -> Response {
-    let pairs = forms::pairs(&body);
-    let text = forms::first(&pairs, "cookies").unwrap_or_default();
-    let user_agent = forms::first(&pairs, "user_agent");
-    match deps.session.import(text, user_agent).await {
-        Ok(report) => {
-            tracing::info!(
-                cookies = report.cookies_in_import,
-                user_agent_changed = report.user_agent_changed,
-                "browser session imported"
-            );
-            Redirect::to(&format!("/session?imported={}", report.cookies_in_import)).into_response()
-        }
-        Err(e) => problem_response(&headers, session_problem(&e)),
-    }
-}
-
-async fn clear_session(State(deps): State<Deps>, headers: HeaderMap) -> Response {
-    match deps.session.clear().await {
-        Ok(_) => Redirect::to("/session?cleared=1").into_response(),
-        Err(e) => problem_response(&headers, session_problem(&e)),
-    }
-}
-
 // -------------------------------------------------------------------- events
 
 fn sse_data(
@@ -801,13 +741,6 @@ pub fn ui_router(deps: Deps) -> Router {
         .route("/jobs/{id}/cancel", post(cancel_job))
         .route("/works/{id}/delete", post(delete_work))
         .route("/series/{id}/delete", post(delete_series))
-        .route(
-            "/session",
-            get(session_page)
-                .post(import_session)
-                .layer(DefaultBodyLimit::max(MAX_SESSION_BODY_BYTES)),
-        )
-        .route("/session/clear", post(clear_session))
         .route("/events", get(events))
         .route("/static/app.css", get(css))
         .route("/static/app.js", get(js))

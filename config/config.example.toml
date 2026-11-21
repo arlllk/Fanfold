@@ -21,9 +21,8 @@ max_connections = 5
 path = "/library"
 scratch = "/tmp/fanfold"     # per-download scratch space
 
-# AO3 login. Required, unless downloads go through FlareSolverr (see [downloader.flaresolverr]).
-# With FlareSolverr it is optional: every download is tried anonymously first, and only a work
-# that AO3 says needs a login uses these credentials (and then keeps the login it earns).
+# AO3 login. Required, unless every request goes through fanfold-browser ([downloader.browser]);
+# with it, optional and used only for works that need a login.
 [ao3]
 username = { env = "AO3_USERNAME" }
 password = { env = "AO3_PASSWORD" }
@@ -34,28 +33,13 @@ timeout = "10m"
 # Rendered at startup from the secrets above. Point at a memory-backed emptyDir
 # so credentials never touch disk.
 personal_ini = "/run/fanfold/personal.ini"
-# Optional HTTP proxy for every plain request to AO3 (all of them without FlareSolverr; with it,
-# the direct tries and the login fallback), e.g. one that leaves from a home connection.
-# proxy = "http://home-proxy:8080"
 
-# Optional, and the most reliable: send every request, logins included, through fanfold-browser
-# (one Camoufox browser that keeps the only cookies and paces the requests; see the README).
-# Replaces [downloader.flaresolverr] and downloader.proxy.
+# Recommended: send every request, logins included, through fanfold-browser (one Camoufox
+# browser that keeps the only cookies and paces the requests; see the README). Without it,
+# FanFicFare fetches over plain HTTP.
 # [downloader.browser]
 # url = "http://fanfold-browser:8191"   # the origin only
 # timeout = "180s"                      # per request, its queue included; below downloader.timeout
-
-# Optional. Fetch pages through a FlareSolverr server (a real browser that passes Cloudflare's
-# checks) instead of plain requests. Use it when AO3 answers the plain requests with Cloudflare
-# errors (525) or challenges. Tries then take turns: one through FlareSolverr, the next one
-# directly (plain requests), so a route AO3 is refusing never fails a job. Works that need a
-# login are fetched by a fallback that uses
-# FlareSolverr only to pass Cloudflare (AO3 rejects logins sent through it), so keep [ao3]
-# above if you want those; remove it if you only want public works.
-# [downloader.flaresolverr]
-# url = "http://flaresolverr:8191"   # the origin only; FanFicFare appends /v1
-# timeout = "60s"                    # per request, challenge included; below downloader.timeout
-# sessions = false                   # for Byparr, which has no FlareSolverr sessions
 
 [retry]
 max_attempts = 5            # failures that count against a job (outages do not)

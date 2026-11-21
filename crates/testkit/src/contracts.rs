@@ -11,7 +11,7 @@ use fanfold_app::{
     ports::{
         BookCatalog, BookRecord, CursorStore, EnqueueOutcome, Event, EventSource, JobCounts,
         JobFilter, JobRepository, LibraryCatalog, LibraryPage, LibraryQuery, LibrarySort,
-        LibraryStatus, LibraryTotals, LogEntry, LogLevel, MetadataStore, SessionStore,
+        LibraryStatus, LibraryTotals, LogEntry, LogLevel, MetadataStore,
     },
 };
 use fanfold_domain::{
@@ -1023,86 +1023,6 @@ where
     );
 }
 
-/// Run the [`SessionStore`] contract against fresh instances from `make`.
-pub async fn session_store<F, Fut>(make: F)
-where
-    F: Fn() -> Fut,
-    Fut: Future<Output = Arc<dyn SessionStore>>,
-{
-    use fanfold_domain::session::{BrowserSession, Cookie};
-
-    let at = |s: i64| Timestamp::from_second(s).unwrap();
-    let cookie = |name: &str, value: &str, expires: Option<i64>| Cookie {
-        name: name.into(),
-        value: value.into(),
-        domain: ".archiveofourown.org".into(),
-        path: "/".into(),
-        expires: expires.map(at),
-        secure: true,
-        http_only: expires.is_some(),
-    };
-    let session = |ua: &str, cookies: Vec<Cookie>, updated: i64| BrowserSession {
-        user_agent: ua.into(),
-        cookies,
-        updated_at: at(updated),
-    };
-
-    let store = make().await;
-    assert_eq!(store.load().await.unwrap(), None, "no session at first");
-    assert!(!store.clear().await.unwrap(), "nothing to clear");
-    assert!(
-        !store
-            .refresh(&session("ua", vec![], 2), at(1))
-            .await
-            .unwrap(),
-        "refreshing a session that does not exist stores nothing"
-    );
-    assert_eq!(store.load().await.unwrap(), None);
-
-    let first = session(
-        "Mozilla/5.0 \u{1F98A}",
-        vec![
-            cookie("cf_clearance", "tok\"en'1", Some(2_000_000_000)),
-            cookie("_otwarchive_session", "s", None),
-        ],
-        1_000,
-    );
-    store.save(&first).await.unwrap();
-    assert_eq!(
-        store.load().await.unwrap(),
-        Some(first.clone()),
-        "everything round-trips: values, expiry, flags, unicode"
-    );
-
-    let rotated = session(
-        "Mozilla/5.0 \u{1F98A}",
-        vec![cookie("cf_clearance", "new", Some(2_100_000_000))],
-        2_000,
-    );
-    assert!(
-        !store.refresh(&rotated, at(999)).await.unwrap(),
-        "a refresh based on an out-of-date session is refused"
-    );
-    assert_eq!(store.load().await.unwrap(), Some(first.clone()));
-    assert!(store.refresh(&rotated, at(1_000)).await.unwrap());
-    assert_eq!(store.load().await.unwrap(), Some(rotated.clone()));
-    assert!(
-        !store.refresh(&rotated, at(1_000)).await.unwrap(),
-        "and the same base cannot be used twice"
-    );
-
-    let imported = session("other", vec![cookie("a", "b", None)], 3_000);
-    store.save(&imported).await.unwrap();
-    assert_eq!(
-        store.load().await.unwrap(),
-        Some(imported),
-        "an import replaces unconditionally"
-    );
-    assert!(store.clear().await.unwrap());
-    assert_eq!(store.load().await.unwrap(), None);
-    assert!(!store.clear().await.unwrap());
-}
-
 // -------------------------------------------------------------------- metadata
 
 fn series_id(n: u64) -> SeriesId {
@@ -1447,14 +1367,6 @@ async fn a_series_folder_is_chosen_once(store: &dyn MetadataStore) {
 mod tests {
     use super::*;
     use crate::memory::InMemoryJobs;
-
-    #[tokio::test]
-    async fn in_memory_session_store_honours_the_contract() {
-        session_store(|| async {
-            Arc::new(crate::memory::InMemorySession::new()) as Arc<dyn SessionStore>
-        })
-        .await;
-    }
 
     #[tokio::test]
     async fn in_memory_job_repository_honours_the_contract() {

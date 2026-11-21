@@ -16,13 +16,12 @@ use fanfold_app::{
     error::RepoError,
     ports::{
         BookCatalog, BookRecord, CursorStore, EnqueueOutcome, JobCounts, JobFilter, JobRepository,
-        LogEntry, LogLevel, Readiness, SessionStore,
+        LogEntry, LogLevel, Readiness,
     },
 };
 use fanfold_domain::{
     Timestamp,
     job::{Job, JobId, JobSource, JobState, Target, TargetKind},
-    session::BrowserSession,
     timestamp::{from_millis, to_millis},
     work::WorkId,
 };
@@ -459,71 +458,5 @@ impl CursorStore for PgStore {
         .await
         .map(|_| ())
         .map_err(|e| backend(&e))
-    }
-}
-
-fn session_from_row(row: &sqlx::postgres::PgRow) -> Result<BrowserSession, RepoError> {
-    let cookies: sqlx::types::Json<Vec<fanfold_domain::session::Cookie>> =
-        row.try_get("cookies").map_err(|e| backend(&e))?;
-    Ok(BrowserSession {
-        user_agent: row.try_get("user_agent").map_err(|e| backend(&e))?,
-        cookies: cookies.0,
-        updated_at: ts(row.try_get("updated_at_ms").map_err(|e| backend(&e))?)?,
-    })
-}
-
-#[async_trait]
-impl SessionStore for PgStore {
-    async fn load(&self) -> Result<Option<BrowserSession>, RepoError> {
-        sqlx::query("SELECT user_agent, cookies, updated_at_ms FROM browser_session WHERE id = 1")
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| backend(&e))?
-            .as_ref()
-            .map(session_from_row)
-            .transpose()
-    }
-
-    async fn save(&self, session: &BrowserSession) -> Result<(), RepoError> {
-        sqlx::query(
-            "INSERT INTO browser_session (id, user_agent, cookies, updated_at_ms)
-             VALUES (1, $1, $2, $3)
-             ON CONFLICT (id) DO UPDATE SET user_agent = EXCLUDED.user_agent,
-                 cookies = EXCLUDED.cookies, updated_at_ms = EXCLUDED.updated_at_ms",
-        )
-        .bind(&session.user_agent)
-        .bind(sqlx::types::Json(&session.cookies))
-        .bind(to_millis(session.updated_at))
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|e| backend(&e))
-    }
-
-    async fn refresh(
-        &self,
-        session: &BrowserSession,
-        based_on: Timestamp,
-    ) -> Result<bool, RepoError> {
-        sqlx::query(
-            "UPDATE browser_session SET user_agent = $1, cookies = $2, updated_at_ms = $3
-             WHERE id = 1 AND updated_at_ms = $4",
-        )
-        .bind(&session.user_agent)
-        .bind(sqlx::types::Json(&session.cookies))
-        .bind(to_millis(session.updated_at))
-        .bind(to_millis(based_on))
-        .execute(&self.pool)
-        .await
-        .map(|done| done.rows_affected() == 1)
-        .map_err(|e| backend(&e))
-    }
-
-    async fn clear(&self) -> Result<bool, RepoError> {
-        sqlx::query("DELETE FROM browser_session WHERE id = 1")
-            .execute(&self.pool)
-            .await
-            .map(|done| done.rows_affected() == 1)
-            .map_err(|e| backend(&e))
     }
 }

@@ -11,7 +11,6 @@ pub mod library;
 pub mod mail;
 pub mod metadata;
 pub mod retry;
-pub mod session;
 pub mod timestamp;
 pub mod work;
 

@@ -118,10 +118,9 @@ password = { file = "/run/secrets/x" } # a file (a trailing newline is ignored)
 |---|---|---|
 | `[database]` | `host`, `port` (5432), `name`, `user`, `password`, `ssl_mode` (`require`), `max_connections` (5) | PostgreSQL connection. Use a session-level connection: a pooler in transaction mode breaks live updates. |
 | `[library]` | `path`, `scratch` (`/tmp/fanfold`) | `path` is the folder of finished books; `scratch` is temporary per-download space. |
-| `[ao3]` | `username`, `password` | Your AO3 login. Required unless you use FlareSolverr; with FlareSolverr it is optional and only used for works that need a login. |
-| `[downloader]` | `python`, `timeout` (`10m`), `personal_ini`, `proxy` | The Python with FanFicFare installed, the longest one download may take, where the generated FanFicFare settings are written, and optionally an HTTP proxy for every request that does not go through FlareSolverr. See [Fetching from another network](#fetching-from-another-network). |
-| `[downloader.browser]` | `url`, `timeout` (`180s`) | Optional. Send every request, logins included, through [fanfold-browser](#fanfold-browser-one-browser-for-every-request). Replaces `[downloader.flaresolverr]` and `downloader.proxy`. |
-| `[downloader.flaresolverr]` | `url`, `timeout` (`60s`), `sessions` (`true`) | Optional. Fetch through FlareSolverr, or a server with its API such as Byparr (then `sessions = false`). See [Getting past Cloudflare](#getting-past-cloudflare). |
+| `[ao3]` | `username`, `password` | Your AO3 login. Required unless you use [fanfold-browser](#getting-past-cloudflare); with it, optional and only used for works that need a login. |
+| `[downloader]` | `python`, `timeout` (`10m`), `personal_ini` | The Python with FanFicFare installed, the longest one download may take, and where the generated FanFicFare settings are written. |
+| `[downloader.browser]` | `url`, `timeout` (`180s`) | Send every request, logins included, through fanfold-browser. See [Getting past Cloudflare](#getting-past-cloudflare). |
 | `[retry]` | `max_attempts` (5), `base` (`1m`), `cap` (`1h`) | A failing job is retried with a doubling delay (with `1m`/`1h`: 1, 2, 4, 8... minutes, then hourly), AO3 outages and rate limits included, so a struggling AO3 is asked ever more rarely. Only failures that are the work's own fault use up attempts; AO3 being down does not. |
 | `[breaker]` | `failure_threshold` (3), `open_for` (`2m`), `max_open_for` (`1h`) | After this many site-wide failures in a row, Fanfold pauses downloads and probes now and then. |
 | `[worker]` | `poll_interval` (`5s`), `concurrency` (1) | Keep concurrency at 1: AO3 rate-limits. |
@@ -218,29 +217,17 @@ FROM work_timeline WHERE work_id = 10000004 ORDER BY version;
 
 ## Getting past Cloudflare
 
-Reaching AO3 takes two separate things, and it helps to keep them apart:
+AO3 sits behind Cloudflare, and Cloudflare ties the clearance it gives a browser to that
+browser: its cookies do not work when another program sends them, and trying marks the client
+as a bot. So the reliable way is to make every request from one real browser.
 
-- **Cloudflare**, which sits in front of AO3. Depending on your network, plain requests
-  sometimes work and sometimes come back as `525` errors, challenges or long timeouts.
-- **Being logged in**, which AO3 only requires for works restricted to registered users. Most
-  works, including everything an anonymous visitor can open, need no login.
+### fanfold-browser (recommended)
 
-There are three setups.
-
-### Plain requests with your AO3 login (the default)
-
-Fanfold logs in with the `[ao3]` username and password and fetches everything directly, so
-restricted works are available. Fine when Cloudflare lets your network through.
-
-### fanfold-browser: one browser for every request
-
-Cloudflare ties the clearance it gives a browser to that browser, so its cookies do not work
-when another program sends them. fanfold-browser is a small service, shipped as its own image
-(`ghcr.io/arlllk/fanfold-browser`, released with the same versions as Fanfold), that runs one
-[Camoufox](https://camoufox.com) browser and makes every request Fanfold sends to AO3: pages,
-the login token and the login form itself. The browser keeps all the cookies (Cloudflare's
-clearance, AO3's session and login) in its profile; FanFicFare keeps none, and nothing is
-imported.
+fanfold-browser is a small service, shipped as its own image (`ghcr.io/arlllk/fanfold-browser`,
+released with the same versions as Fanfold), that runs one [Camoufox](https://camoufox.com)
+browser and makes every request Fanfold sends to AO3: pages, the login token and the login
+form itself. The browser keeps all the cookies (Cloudflare's clearance, AO3's session and
+login) in its profile; Fanfold and FanFicFare keep none.
 
 ```sh
 docker volume create fanfold-browser
@@ -258,6 +245,7 @@ timeout = "180s"                      # per request, waiting in its queue includ
 
 Keep `[ao3]` for restricted works: FanFicFare then logs in through the browser when a work asks
 for it, and the browser stays logged in (keep `/data` on a volume so a restart does too).
+Without `[ao3]` only public works can be downloaded, and no password is ever sent.
 
 It is built to be light on AO3, however many downloads run at once:
 
@@ -280,72 +268,11 @@ through, for example to leave from a home connection), `MIN_INTERVAL_S`, `COOLDO
 OOM-killed at 768 MiB, so start at 1.5 GiB. Run one instance (the queue is per instance), and let
 only Fanfold reach it.
 
-### Fetching from another network
+### Plain requests
 
-If AO3 refuses requests from the network Fanfold runs on, its traffic can leave from another
-one, such as a home connection: run an HTTP proxy there
-(or one that tunnels to it) and set:
-
-```toml
-[downloader]
-proxy = "http://home-proxy:8080"   # an HTTP proxy (CONNECT for HTTPS); no credentials
-```
-
-Every request FanFicFare makes over plain HTTP then goes through it: all downloads without
-FlareSolverr, and with FlareSolverr the direct tries and the login fallback. FlareSolverr's own
-browser is not affected: point it at the same proxy in its own settings (Byparr:
-`PROXY_SERVER`), so that the Cloudflare clearance it earns for the login fallback is used from
-the same address.
-
-### FlareSolverr (recommended when plain requests fail)
-
-[FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) is a separate service that drives a
-real browser and solves Cloudflare's challenge. Start it next to Fanfold:
-
-```sh
-docker run -d --name flaresolverr --restart unless-stopped --shm-size=512m \
-  -p 127.0.0.1:8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
-```
-
-and add to `config.toml`:
-
-```toml
-[downloader.flaresolverr]
-url = "http://flaresolverr:8191"    # the origin only
-timeout = "60s"                     # per request; must be below downloader.timeout
-```
-
-[Byparr](https://github.com/ThePhaseless/Byparr) speaks the same API with a Firefox-based
-browser. It has no sessions, so add `sessions = false` for it. It only fetches pages (no form
-posts), which is all the FlareSolverr tries need.
-
-Each try of a download goes one of two ways, taking turns: the first try, the third, and so
-on go through FlareSolverr; the second, the fourth, and so on fetch directly. When one route
-is being refused, the next try (after the back-off) uses the other. The job log says which way
-each try went.
-
-1. **Anonymously, through FlareSolverr** (odd tries). This is usually the better route, and it
-   covers public works. In testing, full downloads took 15-30 seconds. If FlareSolverr is down,
-   jobs wait and retry without using up their attempts, and finish once it is back.
-2. **Directly, without FlareSolverr** (even tries): plain requests, the way FanFicFare fetches on
-   its own and as AutomatedFanfic does: no stored cookies, and a fresh login with the `[ao3]`
-   credentials on every run when you set them (anonymous otherwise).
-3. **Only if AO3 says the work needs a login**, a **login fallback** runs. AO3 rejects a login
-   form submitted *through* FlareSolverr (it answers "Auth Error"), so FlareSolverr is used
-   only to pass Cloudflare. Fanfold then fetches over plain HTTP carrying that clearance, using
-   the login cookie it has stored, and if there is no valid one, it logs in with the `[ao3]`
-   credentials and stores the new cookie.
-
-So keep `[ao3]` if you want restricted works, and leave it out if you only want public ones
-(nothing then ever sends a password anywhere). Your credentials are only ever sent when AO3
-asks for a login.
-
-**The login lasts about 3 months and renews itself.** AO3's "remember me" cookie
-(`remember_user_token`) is valid for 92 days from a real login, and the fallback stores it, so
-later restricted works skip the login. AO3 does not extend it by merely browsing, so when it
-expires (or is missing) the next restricted download logs in again with your credentials and
-stores a fresh one. Without `[ao3]`, import a new cookie on the **Session** page instead (see
-below); the page warns before it lapses.
+Without `[downloader.browser]`, FanFicFare fetches by itself over plain HTTP, logging in with
+the `[ao3]` username and password on every download. Fine when Cloudflare lets your network
+through; when it does not, use fanfold-browser.
 
 ## The web interface
 
@@ -356,7 +283,6 @@ below); the page warns before it lapses.
 | **Book** | One work in full: its summary, every tag, statistics, chapters and series, where the file is, and buttons to open it on AO3, check it for updates or delete it. |
 | **History** | Every job, filtered by state, with paging. Tick failed jobs and use **Retry selected**, or **Retry all failed**. |
 | **Job** | The title, state, failure reason and a log split by attempt, with **Retry** or **Cancel**. |
-| **Session** | The imported browser cookies, their expiry, and an import form. |
 
 Pages update live as jobs change. Everything also works with JavaScript turned off, without
 live refresh. It is laid out for phones as well as desktops, follows your light or dark
@@ -377,32 +303,6 @@ setting, and never relies on colour alone.
 <img src="docs/screenshots/mobile-outage.png" width="190" alt="While AO3 is having trouble">
 <img src="docs/screenshots/mobile-dark.png" width="190" alt="Dark mode">
 </p>
-
-### Importing browser cookies
-
-Instead of (or as well as) a password in the config, you can give Fanfold the login from your
-own browser. With FlareSolverr, the imported login cookie is used by the login fallback (see
-[Getting past Cloudflare](#getting-past-cloudflare)); without it, the cookies are sent with
-every download.
-
-1. In a browser where you are logged in to AO3 and can open works normally, export the
-   site's cookies. Either:
-   - a **`cookies.txt`** (Netscape format) from a cookie-export extension, or
-   - a **HAR file**: open the developer tools' Network tab, load an AO3 page, and
-     "Save all as HAR". A HAR also carries your browser's exact `User-Agent`, which Cloudflare
-     ties its clearance cookie to.
-2. Open **Session**, paste the file's contents, and press **Import**. Cookies for other sites
-   are ignored.
-3. Imports merge with what is stored, so you can import a HAR and then a `cookies.txt` and
-   get the union (a HAR can include cookies an extension may hide, such as `cf_clearance`,
-   while a `cookies.txt` carries the expiry dates).
-4. The page lists each cookie's expiry and warns when one is expiring or has expired. Import
-   again when that happens. Values are never displayed after import.
-
-If you import a `cookies.txt` alone, also fill in the **User-Agent** field with your
-browser's. The `Cookie` values are credentials: they are stored in the database, so protect
-it as you would the AO3 password. Cloudflare clearance is often bound to your IP address and
-browser, so cookies from a laptop may not work from a server elsewhere.
 
 ## The container image
 
@@ -480,22 +380,22 @@ Upgrading from a version without series support starts the library afresh: each 
 under `series/` or `single/` at its next download. The old flat `Title [id].epub` files are
 left untouched; delete them once the new ones are there.
 
-**Backups.** The books are in the library folder. The queue, history, mail position and
-browser cookies are in PostgreSQL; the file names in the library are what your reader keys
+**Backups.** The books are in the library folder. The queue, history and mail position are in
+PostgreSQL (fanfold-browser's cookies are in its `/data` volume); the file names in the library are what your reader keys
 on, so keep the two together.
 
 **Security.** The interface has no login: run it behind something that authenticates. State-
 changing requests are checked against cross-site forgery, and every page carries a strict
-content security policy. The AO3 login and cookies are credentials: they are held in memory
-and the database, and scrubbed from the job logs.
+content security policy. The AO3 login is a credential: it is held in memory, written only to
+the private FanFicFare settings file, and scrubbed from the job logs.
 
 ## Troubleshooting
 
 | You see | Likely cause and fix |
 |---|---|
-| Jobs retry with `site_unavailable`, `525` or long timeouts | Cloudflare is slowing or refusing plain requests. Use [FlareSolverr](#getting-past-cloudflare). |
-| Job fails with `auth_failed` ("Login Failed…") | The work needs a login and Fanfold has none that works: the `[ao3]` username or password is wrong, or there is no `[ao3]` and no valid imported login cookie. The job log shows both tries (the anonymous one, then the login fallback). Fix the credentials, or import a fresh cookie on the Session page. |
-| Job fails with `blocked` | Cloudflare refused the request. Try FlareSolverr, or import fresh cookies. |
+| Jobs retry with `site_unavailable`, `525` or long timeouts | Cloudflare is slowing or refusing plain requests. Use [fanfold-browser](#getting-past-cloudflare). |
+| Job fails with `auth_failed` ("Login Failed…") | The work needs a login and Fanfold has none that works: there is no `[ao3]`, or its username or password is wrong. |
+| Job fails with `blocked` | Cloudflare refused the request. Use fanfold-browser; with it, check its log for the refusal and give its cool-down time. |
 | `fanfold check-config` lists problems | Each line names the setting. A secret reference that points at a missing variable or file is reported by name. |
 | Nothing happens after a notification email | Check `fanfold_mail_polls_total` and the logs. The JMAP server's advertised address must be reachable, and `allowed_senders` must match the sender. |
 | "could not start `…/python`" | `downloader.python` points at a Python without FanFicFare. In the image it is `/opt/venv/bin/python`. |

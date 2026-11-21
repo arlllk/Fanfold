@@ -1,4 +1,4 @@
-"""Unit tests for ffd_worker.py: fast, offline, no FlareSolverr.
+"""Unit tests for ffd_worker.py: fast and offline.
 
     python -I -m unittest discover -s crates/adapters/fanficfare/worker
 
@@ -197,13 +197,9 @@ class RequestTest(unittest.TestCase):
         self.assertIn(why, caught.exception.message)
 
     def test_what_the_rust_side_sends_is_read_field_by_field(self):
-        request = w.parse_request(dict(
-            self.MINIMAL, op="list_series", existing=None, personal_ini="/p.ini", cookies="/c.txt",
-            user_agent=None, clearance={"flaresolverr": "http://fs:8191", "timeout_ms": 5000, "url": WORK},
-        ))
+        request = w.parse_request(dict(self.MINIMAL, op="list_series", existing=None, personal_ini="/p.ini"))
         self.assertEqual(request.op, "list_series")
-        self.assertEqual((request.existing, request.personal_ini, request.cookies), (None, "/p.ini", "/c.txt"))
-        self.assertEqual(request.clearance, w.Clearance("http://fs:8191", WORK, 5000))
+        self.assertEqual((request.existing, request.personal_ini), (None, "/p.ini"))
 
     def test_a_download_is_the_default(self):
         self.assertEqual(w.parse_request(self.MINIMAL), w.Request("download", WORK, "/tmp/w"))
@@ -214,11 +210,6 @@ class RequestTest(unittest.TestCase):
         self.refused(dict(self.MINIMAL, url=""), "'url'")
         self.refused(dict(self.MINIMAL, op="delete"), "unknown op")
         self.refused(dict(self.MINIMAL, existing=7), "'existing'")
-        self.refused(dict(self.MINIMAL, clearance="yes"), "'clearance'")
-        clearance = {"flaresolverr": "http://fs", "url": WORK}
-        self.refused(dict(self.MINIMAL, clearance=dict(clearance, timeout_ms=True)), "timeout_ms")
-        self.refused(dict(self.MINIMAL, clearance=dict(clearance, timeout_ms=0)), "timeout_ms")
-        self.refused(dict(self.MINIMAL, clearance={"url": WORK}), "'flaresolverr'")
         self.refused(dict(self.MINIMAL, browser="yes"), "'browser'")
         self.refused(dict(self.MINIMAL, browser={"timeout_ms": 5}), "'url'")
         self.refused(dict(self.MINIMAL, browser={"url": "http://b", "timeout_ms": -1}), "timeout_ms")
