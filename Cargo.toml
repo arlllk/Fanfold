@@ -10,6 +10,7 @@ members = [
     "crates/adapters/fanficfare",
     "crates/adapters/discord",
     "crates/adapters/postgres",
+    "crates/adapters/epub",
     "crates/server",
     # cargo-fuzz targets; built with `just fuzz` (needs nightly).
     "fuzz",
@@ -37,6 +38,7 @@ fanfold-adapter-jmap = { path = "crates/adapters/jmap" }
 fanfold-adapter-fanficfare = { path = "crates/adapters/fanficfare" }
 fanfold-adapter-discord = { path = "crates/adapters/discord" }
 fanfold-adapter-postgres = { path = "crates/adapters/postgres" }
+fanfold-adapter-epub = { path = "crates/adapters/epub" }
 fanfold-adapter-web = { path = "crates/adapters/web" }
 fanfold-server = { path = "crates/server" }
 
@@ -71,6 +73,12 @@ sqlx = { version = "0.9.0", default-features = false }
 secrecy = "0.10.3"
 toml = "1.2.1"
 tempfile = "3.27.0"
+
+# EPUB finishing: rewriting the package, rendering the cover
+zip = { version = "9.8.1", default-features = false, features = ["deflate"] }
+quick-xml = "0.42.0"
+resvg = { version = "0.50.0", default-features = false, features = ["text"] }
+ttf-parser = { version = "0.25.1", default-features = false, features = ["std"] }
 
 # testing
 proptest = "1.12.0"

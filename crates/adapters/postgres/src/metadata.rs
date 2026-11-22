@@ -15,10 +15,10 @@ use fanfold_domain::{
     Timestamp,
     job::JobId,
     metadata::{
-        Author, Chapter, Date, FollowSource, SeriesMetadata, SeriesPart, SpanChanges, Tag, TagKind,
-        WorkFacts, WorkMetadata, WorkState, plan_work_update,
+        Author, Changes, Chapter, Date, FollowSource, SeriesMetadata, SeriesPart, SpanChanges, Tag,
+        TagKind, WorkFacts, WorkMetadata, WorkState, WorkVersionChanges, plan_work_update,
     },
-    timestamp::to_millis,
+    timestamp::{from_millis, to_millis},
     work::{SeriesId, WorkId},
 };
 use sqlx::{PgConnection, Row, postgres::PgRow, types::Json};
@@ -74,6 +74,150 @@ fn facts_from_row(row: &PgRow) -> Result<WorkFacts, RepoError> {
     })
 }
 
+fn author_from_row(r: &PgRow) -> Result<Author, RepoError> {
+    Ok(Author {
+        user: get(r, "user_name")?,
+        pseud: get(r, "pseud")?,
+    })
+}
+
+fn tag_from_row(r: &PgRow) -> Result<Tag, RepoError> {
+    Ok(Tag {
+        kind: get::<String>(r, "kind")?
+            .parse::<TagKind>()
+            .map_err(|_| corrupt("tag kind"))?,
+        name: get(r, "name")?,
+    })
+}
+
+fn series_from_row(r: &PgRow) -> Result<SeriesPart, RepoError> {
+    Ok(SeriesPart {
+        id: SeriesId::from_i64(get(r, "series_id")?).ok_or_else(|| corrupt("series_id"))?,
+        name: get(r, "name")?,
+        part: get::<Option<i32>>(r, "part")?
+            .map(|n| to_u32(n, "part"))
+            .transpose()?,
+    })
+}
+
+fn chapter_from_row(r: &PgRow) -> Result<Chapter, RepoError> {
+    Ok(Chapter {
+        number: to_u32(get(r, "number")?, "chapter number")?,
+        title: get(r, "title")?,
+        ao3_id: get::<Option<i64>>(r, "ao3_chapter_id")?
+            .map(|n| u64::try_from(n).map_err(|_| corrupt("ao3_chapter_id")))
+            .transpose()?,
+        posted_on: date(get(r, "posted_on")?)?,
+    })
+}
+
+/// Sort one list's spans into the versions that opened and closed them.
+async fn spread_spans<T: Clone>(
+    conn: &mut PgConnection,
+    sql: &'static str,
+    work: i64,
+    versions: &mut [(i64, WorkVersionChanges)],
+    item: fn(&PgRow) -> Result<T, RepoError>,
+    list: fn(&mut WorkVersionChanges) -> &mut Changes<T>,
+) -> Result<(), RepoError> {
+    let rows = sqlx::query(sql)
+        .bind(work)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| backend(&e))?;
+    for row in &rows {
+        let value = item(row)?;
+        let added: i64 = get(row, "added_in")?;
+        let removed: Option<i64> = get(row, "removed_in")?;
+        for (id, version) in versions.iter_mut() {
+            if *id == added {
+                list(version).added.push(value.clone());
+            }
+            if Some(*id) == removed {
+                list(version).removed.push(value.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn load_history(
+    conn: &mut PgConnection,
+    work: WorkId,
+) -> Result<Vec<WorkVersionChanges>, RepoError> {
+    let id = work.to_i64();
+    let rows = sqlx::query(
+        "SELECT id, seen_at_ms, title, byline, summary_html, language, rating, restricted, status,
+                to_char(published_on, 'YYYY-MM-DD') AS published_on,
+                to_char(updated_on, 'YYYY-MM-DD') AS updated_on,
+                chapters_posted, chapters_total, words
+         FROM work_versions WHERE work_id = $1 ORDER BY id",
+    )
+    .bind(id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| backend(&e))?;
+    let mut versions = rows
+        .iter()
+        .map(|row| {
+            let seen_at = from_millis(get(row, "seen_at_ms")?).ok_or_else(|| corrupt("seen_at"))?;
+            Ok((
+                get::<i64>(row, "id")?,
+                WorkVersionChanges {
+                    seen_at,
+                    facts: facts_from_row(row)?,
+                    authors: Changes::default(),
+                    tags: Changes::default(),
+                    series: Changes::default(),
+                    chapters: Changes::default(),
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, RepoError>>()?;
+    spread_spans(
+        conn,
+        "SELECT user_name, pseud, added_in, removed_in FROM work_authors
+         WHERE work_id = $1 ORDER BY position, added_in",
+        id,
+        &mut versions,
+        author_from_row,
+        |v| &mut v.authors,
+    )
+    .await?;
+    spread_spans(
+        conn,
+        "SELECT kind, name, added_in, removed_in FROM work_tags
+         WHERE work_id = $1 ORDER BY position, added_in",
+        id,
+        &mut versions,
+        tag_from_row,
+        |v| &mut v.tags,
+    )
+    .await?;
+    spread_spans(
+        conn,
+        "SELECT series_id, name, part, added_in, removed_in FROM work_series
+         WHERE work_id = $1 ORDER BY position, added_in",
+        id,
+        &mut versions,
+        series_from_row,
+        |v| &mut v.series,
+    )
+    .await?;
+    spread_spans(
+        conn,
+        "SELECT number, title, ao3_chapter_id, to_char(posted_on, 'YYYY-MM-DD') AS posted_on,
+                added_in, removed_in
+         FROM work_chapters WHERE work_id = $1 ORDER BY position, added_in",
+        id,
+        &mut versions,
+        chapter_from_row,
+        |v| &mut v.chapters,
+    )
+    .await?;
+    Ok(versions.into_iter().map(|(_, v)| v).collect())
+}
+
 /// The latest version's facts and the open spans, read inside the caller's transaction.
 async fn load_state(conn: &mut PgConnection, work: WorkId) -> Result<Option<WorkState>, RepoError> {
     let id = work.to_i64();
@@ -102,12 +246,7 @@ async fn load_state(conn: &mut PgConnection, work: WorkId) -> Result<Option<Work
     .await
     .map_err(|e| backend(&e))?
     .iter()
-    .map(|r| {
-        Ok(Author {
-            user: get(r, "user_name")?,
-            pseud: get(r, "pseud")?,
-        })
-    })
+    .map(author_from_row)
     .collect::<Result<_, RepoError>>()?;
 
     let tags = sqlx::query(
@@ -119,14 +258,7 @@ async fn load_state(conn: &mut PgConnection, work: WorkId) -> Result<Option<Work
     .await
     .map_err(|e| backend(&e))?
     .iter()
-    .map(|r| {
-        Ok(Tag {
-            kind: get::<String>(r, "kind")?
-                .parse::<TagKind>()
-                .map_err(|_| corrupt("tag kind"))?,
-            name: get(r, "name")?,
-        })
-    })
+    .map(tag_from_row)
     .collect::<Result<_, RepoError>>()?;
 
     let series = sqlx::query(
@@ -138,15 +270,7 @@ async fn load_state(conn: &mut PgConnection, work: WorkId) -> Result<Option<Work
     .await
     .map_err(|e| backend(&e))?
     .iter()
-    .map(|r| {
-        Ok(SeriesPart {
-            id: SeriesId::from_i64(get(r, "series_id")?).ok_or_else(|| corrupt("series_id"))?,
-            name: get(r, "name")?,
-            part: get::<Option<i32>>(r, "part")?
-                .map(|n| to_u32(n, "part"))
-                .transpose()?,
-        })
-    })
+    .map(series_from_row)
     .collect::<Result<_, RepoError>>()?;
 
     let chapters = sqlx::query(
@@ -158,16 +282,7 @@ async fn load_state(conn: &mut PgConnection, work: WorkId) -> Result<Option<Work
     .await
     .map_err(|e| backend(&e))?
     .iter()
-    .map(|r| {
-        Ok(Chapter {
-            number: to_u32(get(r, "number")?, "chapter number")?,
-            title: get(r, "title")?,
-            ao3_id: get::<Option<i64>>(r, "ao3_chapter_id")?
-                .map(|n| u64::try_from(n).map_err(|_| corrupt("ao3_chapter_id")))
-                .transpose()?,
-            posted_on: date(get(r, "posted_on")?)?,
-        })
-    })
+    .map(chapter_from_row)
     .collect::<Result<_, RepoError>>()?;
 
     Ok(Some(WorkState {
@@ -474,6 +589,11 @@ impl MetadataStore for PgStore {
     async fn work_state(&self, work: WorkId) -> Result<Option<WorkState>, RepoError> {
         let mut conn = self.pool.acquire().await.map_err(|e| backend(&e))?;
         load_state(&mut conn, work).await
+    }
+
+    async fn work_history(&self, work: WorkId) -> Result<Vec<WorkVersionChanges>, RepoError> {
+        let mut conn = self.pool.acquire().await.map_err(|e| backend(&e))?;
+        load_history(&mut conn, work).await
     }
 
     async fn follow_series(

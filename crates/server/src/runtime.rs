@@ -3,6 +3,7 @@
 use std::{sync::Arc, time::Duration};
 
 use fanfold_adapter_discord::DiscordNotifier;
+use fanfold_adapter_epub::EpubFinisher;
 use fanfold_adapter_fanficfare::{
     BrowserService, FanFicFareConfig, FanFicFareDownloader, runner::ProcessRunner, sweep_stale,
 };
@@ -27,7 +28,10 @@ use tokio::{sync::watch, task::JoinSet};
 use crate::{
     config::{Config, Secrets, SslMode},
     infra::{LogOnlyNotifier, SystemClock, SystemJitter},
-    ini::{IniError, render_login_on_demand_ini, render_personal_ini, write_private},
+    ini::{
+        IniError, render_login_on_demand_ini, render_personal_ini, with_book_settings,
+        write_private,
+    },
 };
 
 #[derive(Debug, Error)]
@@ -124,6 +128,7 @@ fn write_fanficfare_settings(
     } else {
         render_personal_ini(credentials)?
     };
+    let ini = with_book_settings(&ini);
     write_private(&config.downloader.personal_ini, &ini).map_err(|e| {
         StartupError::Io(format!(
             "cannot write {}: {e}",
@@ -185,6 +190,7 @@ pub fn build_worker_with(
             metadata: Arc::<PgStore>::clone(store),
             downloader: Arc::new(downloader),
             library: Arc::new(FsLibrary::new(config.library.path.clone())),
+            finisher: Arc::new(EpubFinisher::new().map_err(|e| StartupError::Io(e.to_string()))?),
             notifier,
             clock: Arc::new(SystemClock),
             jitter: Arc::new(SystemJitter),
@@ -510,6 +516,7 @@ mod tests {
                 metadata: jobs.clone(),
                 downloader: downloader.clone(),
                 library: Arc::new(InMemoryLibrary::new()),
+                finisher: Arc::new(fanfold_testkit::memory::RecordingFinisher::new()),
                 notifier: notifier.clone(),
                 clock: Arc::new(SystemClock),
                 jitter: Arc::new(FixedJitter(0.5)),

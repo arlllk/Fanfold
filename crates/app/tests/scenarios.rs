@@ -33,8 +33,8 @@ use fanfold_domain::{
     work::{SeriesId, WorkId},
 };
 use fanfold_testkit::memory::{
-    FakeClock, FixedJitter, InMemoryJobs, InMemoryLibrary, InMemoryMail, RecordingNotifier,
-    ScriptedDownloader,
+    FakeClock, FixedJitter, InMemoryJobs, InMemoryLibrary, InMemoryMail, RecordingFinisher,
+    RecordingNotifier, ScriptedDownloader,
 };
 
 const START: i64 = 1_000;
@@ -44,6 +44,7 @@ struct Harness {
     library: Arc<InMemoryLibrary>,
     downloader: Arc<ScriptedDownloader>,
     notifier: Arc<RecordingNotifier>,
+    finisher: Arc<RecordingFinisher>,
     clock: Arc<FakeClock>,
     worker: Worker,
 }
@@ -54,6 +55,7 @@ impl Harness {
         let library = Arc::new(InMemoryLibrary::new());
         let downloader = Arc::new(ScriptedDownloader::new());
         let notifier = Arc::new(RecordingNotifier::new());
+        let finisher = Arc::new(RecordingFinisher::new());
         let clock = Arc::new(FakeClock::at_secs(START));
         let worker = Worker::new(
             Ports {
@@ -62,6 +64,7 @@ impl Harness {
                 metadata: jobs.clone(),
                 downloader: downloader.clone(),
                 library: library.clone(),
+                finisher: finisher.clone(),
                 notifier: notifier.clone(),
                 clock: clock.clone(),
                 jitter: Arc::new(FixedJitter(0.5)),
@@ -84,6 +87,7 @@ impl Harness {
             library,
             downloader,
             notifier,
+            finisher,
             clock,
             worker,
         }
@@ -940,6 +944,103 @@ async fn a_work_in_several_series_goes_under_the_first_followed_one() {
         h.library.published()[0].0,
         "series/Followed 2/05 Crossover 9.epub"
     );
+}
+
+#[tokio::test]
+async fn every_published_book_is_finished_with_its_history_and_main_series() {
+    let h = Harness::new();
+    h.jobs
+        .follow_series(
+            SeriesId::new(2).unwrap(),
+            FollowSource::Manual,
+            h.clock_now(),
+        )
+        .await
+        .unwrap();
+    h.enqueue(9).await;
+    h.downloader.push_ok_with("Crossover", |m| {
+        m.series = vec![part(1, "Not Followed", 3), part(2, "Followed", 5)];
+    });
+    h.worker.run_once().await.unwrap();
+
+    let calls = h.finisher.calls();
+    assert_eq!(calls.len(), 1);
+    let (path, extras) = &calls[0];
+    assert_eq!(
+        path.to_str(),
+        Some("/scratch/Crossover.epub"),
+        "the scratch copy, before publishing"
+    );
+    assert_eq!(extras.metadata.facts.title, "Crossover");
+    assert_eq!(
+        extras.main_series,
+        SeriesId::new(2),
+        "the series the library files it under"
+    );
+    assert_eq!(
+        extras.history.len(),
+        1,
+        "this download's version is already recorded"
+    );
+    assert_eq!(extras.fetched_at, h.clock_now());
+}
+
+#[tokio::test]
+async fn a_book_that_cannot_be_finished_is_published_as_downloaded() {
+    let h = Harness::new();
+    let id = h.enqueue(9).await;
+    h.finisher.fail(true);
+    h.downloader.push_ok("Plain");
+    h.worker.run_once().await.unwrap();
+    assert_eq!(h.job(id).await.state, JobState::Succeeded);
+    assert_eq!(h.library.published().len(), 1);
+    let logs = h.jobs.logs(id).await.unwrap();
+    assert!(
+        logs.iter().any(|l| l.level == LogLevel::Warn
+            && l.message.contains("cover renderer broke")
+            && l.message.contains("published as downloaded")),
+        "{logs:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_book_from_before_finishing_is_finished_at_its_next_check_quietly() {
+    let h = Harness::new();
+    h.enqueue(9).await;
+    h.downloader.push_ok("Old");
+    h.worker.run_once().await.unwrap();
+    let before = h.notifier.events().len();
+
+    h.finisher.outdate(true);
+    let id = h.enqueue(9).await;
+    h.downloader.push_unchanged("Old");
+    h.worker.run_once().await.unwrap();
+
+    assert_eq!(h.finisher.calls().len(), 2, "finished again");
+    assert_eq!(h.library.published().len(), 2, "and published again");
+    assert_eq!(
+        h.notifier.events().len(),
+        before,
+        "without announcing an update"
+    );
+    let logs = h.jobs.logs(id).await.unwrap();
+    assert!(
+        logs.iter()
+            .any(|l| l.message.contains("adding the current cover")),
+        "{logs:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_update_with_nothing_new_is_not_finished_again() {
+    let h = Harness::new();
+    h.enqueue(9).await;
+    h.downloader.push_ok("Same");
+    h.worker.run_once().await.unwrap();
+    h.enqueue(9).await;
+    h.downloader.push_unchanged("Same");
+    h.worker.run_once().await.unwrap();
+    assert_eq!(h.finisher.calls().len(), 1);
 }
 
 #[tokio::test]

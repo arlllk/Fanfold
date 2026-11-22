@@ -75,6 +75,30 @@ pub fn render_login_on_demand_ini(
     Ok(SecretString::from(ini))
 }
 
+/// How FanFicFare builds the book. Appended to an `[archiveofourown.org]` section, so the
+/// first lines belong to it.
+///
+/// * The title page also lists collections and AO3's counters (as of the download).
+/// * EPUB 3, with the series in calibre's `calibre:series` form, which e-readers group by
+///   (Fanfold adds the EPUB 3 form, and every series, afterwards).
+/// * A log page that records what changed with each update (works in progress only), at the
+///   back of the book with Fanfold's about page, so the book opens on its cover and title.
+const BOOK_SETTINGS: &str = "\
+extra_titlepage_entries:collectionsHTML,kudos,hits,bookmarks,comments
+
+[epub]
+epub_version:3.0
+calibre_series_meta:true
+include_logpage:smart
+logpage_at_end:true
+";
+
+/// `ini` (one of the renderings above) followed by [`BOOK_SETTINGS`].
+#[must_use]
+pub fn with_book_settings(ini: &SecretString) -> SecretString {
+    SecretString::from(format!("{}{BOOK_SETTINGS}", ini.expose_secret()))
+}
+
 /// Write `content` readable by the owner only, replacing any previous file.
 pub fn write_private(path: &Path, content: &SecretString) -> io::Result<()> {
     use std::io::Write as _;
@@ -194,6 +218,23 @@ mod tests {
         );
         let anonymous = render_login_on_demand_ini(None).unwrap();
         assert!(!anonymous.expose_secret().contains("username"));
+    }
+
+    #[test]
+    fn book_settings_follow_the_site_section() {
+        let ini = with_book_settings(&render_personal_ini(None).unwrap());
+        let text = ini.expose_secret();
+        assert!(text.starts_with("[archiveofourown.org]\nis_adult:true\n"));
+        let site = text.split("\n[epub]\n").next().unwrap();
+        assert!(site.contains("extra_titlepage_entries:"), "{site}");
+        let epub = text.split("\n[epub]\n").nth(1).unwrap();
+        for line in [
+            "epub_version:3.0",
+            "calibre_series_meta:true",
+            "include_logpage:smart",
+        ] {
+            assert!(epub.lines().any(|l| l == line), "{line}");
+        }
     }
 
     #[test]

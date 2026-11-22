@@ -20,6 +20,9 @@ by pasting a link, or automatically from AO3's subscription emails.
   keep their path forever, so your reader keeps your place when a work is updated.
 - Everything AO3 says about a work is kept as a timeline: which update added a tag, when a work
   became restricted, how chapters and words grew.
+- Each book gets a generated cover, an "About this work" page with its history, and its
+  series, rating, fandoms and tags as metadata your reader can sort and group by
+  (see [what is in each book](#what-is-in-each-book)).
 - If AO3 has a bad day, Fanfold backs off and retries by itself instead of failing everything.
 - Optional notifications to Discord.
 
@@ -31,6 +34,7 @@ the work, keeps the library tidy and gives you the interface. It was inspired by
 
 [Quick start](#quick-start) · [Configuration](#configuration) · [Adding works](#adding-works) ·
 [The library and its history](#the-library-and-its-history) ·
+[What is in each book](#what-is-in-each-book) ·
 [Getting past Cloudflare](#getting-past-cloudflare) · [The web interface](#the-web-interface) ·
 [The container image](#the-container-image) · [Running without Docker](#running-without-docker) ·
 [Operating it](#operating-it) · [Troubleshooting](#troubleshooting) · [Development](#development)
@@ -214,6 +218,24 @@ FROM work_tag_timeline WHERE name = 'Fluff';
 SELECT seen_at, updated_on, chapters_posted, chapters_total, words, status, restricted
 FROM work_timeline WHERE work_id = 10000004 ORDER BY version;
 ```
+
+## What is in each book
+
+FanFicFare writes the chapters and a title page. Fanfold then adds, after every download:
+
+- **A cover**, the first page: title, author, fandom, series and part, the rating's colour,
+  and progress (chapters, words, last update). Works of the same fandom share a colour.
+- **Metadata your reader can group by**: the series and part number, and the tags labelled by
+  kind (`Rating: …`, `Fandom: …`, `Relationship: …`, `Character: …`, `Tag: …`,
+  `Status: Complete`), so a reader's tag list sorts them into groups.
+- **"About this work"**, the last page and in the table of contents: summary, every tag,
+  series, counts, the chapters with the dates they were posted (the newest marked), and the
+  work's history as Fanfold saw it (chapters added, tags changed, marked complete, ...).
+- **An update log** (works in progress), also at the back, with what each update changed.
+
+The same facts are in the book as structured `ao3:` metadata for other software
+([reference](docs/epub-metadata.md)). Books already in the library get all of this at their
+next check, even when the work has no new chapters.
 
 ## Getting past Cloudflare
 

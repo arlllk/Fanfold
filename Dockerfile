@@ -193,6 +193,8 @@ COPY --from=build /out/fanfold /usr/local/bin/fanfold
 COPY LICENSE-0BSD LICENSE-MIT LICENSE-APACHE /usr/share/doc/fanfold/
 COPY --from=rust-licenses /out/THIRD-PARTY-LICENSES-RUST.txt /usr/share/doc/fanfold/
 COPY --from=venv /out/THIRD-PARTY-LICENSES-PYTHON.txt /usr/share/doc/fanfold/
+# The fonts built into the binary for the generated covers.
+COPY crates/adapters/epub/fonts/OFL.txt /usr/share/doc/fanfold/LICENSE-FONTS-NOTO-OFL.txt
 
 LABEL org.opencontainers.image.licenses="0BSD OR MIT OR Apache-2.0"
 

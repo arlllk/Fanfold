@@ -16,7 +16,7 @@ use fanfold_domain::{
     job::{Job, JobId, JobSource, Target},
     metadata::{
         Chapter, FollowSource, SeriesMetadata, SeriesPart, Tag, WorkFacts, WorkMetadata, WorkState,
-        WorkStats,
+        WorkStats, WorkVersionChanges,
     },
     work::{SeriesId, WorkId},
 };
@@ -426,6 +426,10 @@ pub trait MetadataStore: Send + Sync {
     /// The latest recorded version and open spans of a work.
     async fn work_state(&self, work: WorkId) -> Result<Option<WorkState>, RepoError>;
 
+    /// Every recorded version of a work with what it changed, oldest first (empty for a
+    /// work never observed). Lists keep the order the work's page showed them in.
+    async fn work_history(&self, work: WorkId) -> Result<Vec<WorkVersionChanges>, RepoError>;
+
     /// Start following a series. Idempotent: the first follow's time and source are kept.
     async fn follow_series(
         &self,
@@ -502,6 +506,41 @@ pub trait Downloader: Send + Sync {
     /// book `download` returned, after it was published or abandoned. Best effort:
     /// it cannot fail, only log. Whoever creates scratch space removes it.
     async fn release(&self, book: &DownloadedBook);
+}
+
+// ---------------------------------------------------------------- book finisher
+
+/// What Fanfold knows about a book's work beyond what the downloader wrote into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookExtras {
+    /// What the site said during this download.
+    pub metadata: WorkMetadata,
+    /// The work's recorded versions, oldest first (this download's included).
+    pub history: Vec<WorkVersionChanges>,
+    /// The series the book is grouped under when a reader takes only one: the followed
+    /// series the library files it under, else the first the work's page names.
+    pub main_series: Option<SeriesId>,
+    /// When this download happened (the counters are as of then).
+    pub fetched_at: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("cannot finish the book: {0}")]
+pub struct FinishError(pub String);
+
+/// Adds what Fanfold knows to a downloaded book before it is published.
+///
+/// Structured metadata, an about page, a cover. Must be idempotent: an update hands the
+/// downloader the finished book, and the downloader may carry parts of it over.
+#[cfg_attr(any(test, feature = "mocks"), mockall::automock)]
+#[async_trait]
+pub trait BookFinisher: Send + Sync {
+    /// Rewrite the EPUB at `book` in place. On error the file is left as it was.
+    async fn finish(&self, book: &Path, extras: &BookExtras) -> Result<(), FinishError>;
+
+    /// Whether `book` already carries what this version of the finisher adds; `false` for a
+    /// book finished by an older version, never finished, or unreadable.
+    async fn is_current(&self, book: &Path) -> bool;
 }
 
 // --------------------------------------------------------------------- cursors
