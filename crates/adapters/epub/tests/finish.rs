@@ -142,9 +142,16 @@ fn quick_xml_reader(text: &str) -> quick_xml::Reader<&[u8]> {
 }
 
 #[tokio::test]
-async fn a_downloaded_book_gets_metadata_a_cover_and_an_about_page() {
+async fn a_downloaded_book_gets_metadata_and_a_cover_and_nothing_after_the_story() {
     let dir = tempfile::tempdir().unwrap();
     let path = copy_fixture(dir.path());
+    assert!(
+        Book::open(&path)
+            .names
+            .iter()
+            .any(|n| n == "OEBPS/log_page.xhtml"),
+        "the fixture has FanFicFare's update log"
+    );
     let finisher = EpubFinisher::new().unwrap();
     finisher.finish(&path, &extras()).await.unwrap();
 
@@ -158,7 +165,6 @@ async fn a_downloaded_book_gets_metadata_a_cover_and_an_about_page() {
     for name in [
         "OEBPS/fanfold_cover.png",
         "OEBPS/fanfold_cover.xhtml",
-        "OEBPS/fanfold_about.xhtml",
         "OEBPS/file0001.xhtml",
     ] {
         assert!(
@@ -200,29 +206,33 @@ async fn a_downloaded_book_gets_metadata_a_cover_and_an_about_page() {
     );
     let spine = opf.split("<spine").nth(1).unwrap();
     assert!(spine.find("fanfold-cover").unwrap() < spine.find("title_page").unwrap());
-    assert!(spine.find("file0001").unwrap() < spine.find("fanfold-about").unwrap());
-
-    let about = book.text("OEBPS/fanfold_about.xhtml");
-    well_formed("about", &about);
-    for expected in [
-        "About this work",
-        "The Keeper and the Logbook",
-        "Part 2 of <a href=\"https://archiveofourown.org/series/2000001\">The Harbor Saga</a>",
-        "2. The Logbook <span class=\"ff-date\">· 9 Oct 2026</span> <b>· new</b>",
-        "Added tag: Fluff &amp; &lt;Angst&gt;.",
-        "Words 60,000 → 120,000 (+60,000).",
-        "First downloaded: 1/? chapters, 60,000 words.",
-        "Kudos 1,234",
-    ] {
-        assert!(about.contains(expected), "{expected}\n{about}");
-    }
+    assert!(!opf.contains("log_page"), "{opf}");
+    let last = spine.rsplit("<itemref ").next().unwrap();
+    assert!(
+        last.starts_with("idref=\"file0001\""),
+        "the story ends the book: {spine}"
+    );
+    assert!(
+        !book
+            .names
+            .iter()
+            .any(|n| n.contains("about") || n.contains("log_page")),
+        "{:?}",
+        book.names
+    );
     well_formed("cover page", &book.text("OEBPS/fanfold_cover.xhtml"));
     let nav = book.text("nav.xhtml");
     well_formed("nav", &nav);
-    assert!(nav.contains("<a href=\"OEBPS/fanfold_about.xhtml\">About this work</a>"));
+    assert!(
+        !nav.contains("fanfold") && !nav.contains("log_page"),
+        "{nav}"
+    );
     let ncx = book.text("toc.ncx");
     well_formed("ncx", &ncx);
-    assert!(ncx.contains("<content src=\"OEBPS/fanfold_about.xhtml\"/>"));
+    assert!(
+        !ncx.contains("fanfold") && !ncx.contains("log_page"),
+        "{ncx}"
+    );
 }
 
 #[tokio::test]
@@ -241,12 +251,7 @@ async fn finishing_twice_is_finishing_once() {
     finisher.finish(&path, &extras()).await.unwrap();
     let mut twice = Book::open(&path);
     assert_eq!(once.names, twice.names);
-    for name in [
-        "content.opf",
-        "nav.xhtml",
-        "toc.ncx",
-        "OEBPS/fanfold_about.xhtml",
-    ] {
+    for name in ["content.opf", "nav.xhtml", "toc.ncx"] {
         assert_eq!(once.text(name), twice.text(name), "{name}");
     }
 }
@@ -280,7 +285,7 @@ async fn an_epub2_book_gets_only_what_epub2_allows() {
     ] {
         assert!(!opf.contains(absent), "{absent}\n{opf}");
     }
-    assert!(book.text("toc.ncx").contains("fanfold_about.xhtml"));
+    assert!(!book.text("toc.ncx").contains("fanfold"));
     assert!(finisher.is_current(&path).await);
     finisher.finish(&path, &extras()).await.unwrap();
     assert_eq!(Book::open(&path).text("content.opf"), opf, "idempotent");
@@ -322,4 +327,88 @@ async fn preview() {
         .unwrap();
     let mut book = Book::open(&path);
     std::fs::write(out.join("cover.png"), book.bytes("OEBPS/fanfold_cover.png")).unwrap();
+}
+
+/// The package, navigation document and NCX entries and the page an older Fanfold (finishing
+/// version 1) added for "About this work", put into a book finished by this one.
+fn as_finished_by_version_1(path: &Path) {
+    use std::io::Write as _;
+    let mut book = Book::open(path);
+    let swap = |name: &str, text: String| -> (String, String) { (name.to_owned(), text) };
+    let opf = book
+        .text("content.opf")
+        .replace("content=\"2\"/>", "content=\"1\"/>")
+        .replace(
+            "</manifest>",
+            "\t<item id=\"fanfold-about\" href=\"OEBPS/fanfold_about.xhtml\" media-type=\"application/xhtml+xml\"/>\n\t</manifest>",
+        )
+        .replace(
+            "</spine>",
+            "\t<itemref idref=\"fanfold-about\" linear=\"yes\"/>\n\t</spine>",
+        );
+    let nav = book.text("nav.xhtml").replacen(
+        "</ol>",
+        "<!--fanfold--><li><a href=\"OEBPS/fanfold_about.xhtml\">About this work</a></li><!--/fanfold-->\n</ol>",
+        1,
+    );
+    let ncx = book.text("toc.ncx").replace(
+        "</navMap>",
+        "<!--fanfold--><navPoint id=\"fanfold-about\" playOrder=\"9\"><navLabel><text>About this work</text></navLabel><content src=\"OEBPS/fanfold_about.xhtml\"/></navPoint><!--/fanfold-->\n</navMap>",
+    );
+    assert!(
+        opf.contains("fanfold-about") && opf.contains("content=\"1\"/>"),
+        "{opf}"
+    );
+    let swapped = [
+        swap("content.opf", opf),
+        swap("nav.xhtml", nav),
+        swap("toc.ncx", ncx),
+        swap("OEBPS/fanfold_about.xhtml", "<html/>".to_owned()),
+    ];
+    let out = path.with_extension("v1");
+    let mut writer = zip::ZipWriter::new(std::fs::File::create(&out).unwrap());
+    for index in 0..book.archive.len() {
+        let entry = book.archive.by_index_raw(index).unwrap();
+        let name = entry.name().unwrap().into_owned();
+        if swapped.iter().any(|(n, _)| *n == name) {
+            continue;
+        }
+        writer.raw_copy_file(entry).unwrap();
+    }
+    for (name, text) in &swapped {
+        writer
+            .start_file(name.as_str(), zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(text.as_bytes()).unwrap();
+    }
+    writer.finish().unwrap();
+    std::fs::rename(out, path).unwrap();
+}
+
+#[tokio::test]
+async fn a_book_finished_with_an_about_page_loses_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = copy_fixture(dir.path());
+    let finisher = EpubFinisher::new().unwrap();
+    finisher.finish(&path, &extras()).await.unwrap();
+    let mut clean = Book::open(&path);
+    as_finished_by_version_1(&path);
+    assert!(
+        !finisher.is_current(&path).await,
+        "a book with the about page is finished again"
+    );
+
+    finisher.finish(&path, &extras()).await.unwrap();
+    let mut book = Book::open(&path);
+    assert!(finisher.is_current(&path).await);
+    assert!(
+        !book.names.iter().any(|n| n.contains("about")),
+        "{:?}",
+        book.names
+    );
+    for name in ["content.opf", "nav.xhtml", "toc.ncx"] {
+        let text = book.text(name);
+        assert!(!text.contains("about"), "{name}: {text}");
+        assert_eq!(text, clean.text(name), "{name}");
+    }
 }

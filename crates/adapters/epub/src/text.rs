@@ -21,82 +21,6 @@ pub fn esc(text: &str) -> String {
     out
 }
 
-/// AO3's summary HTML as plain paragraphs. The summary is the site's markup, which need not
-/// be well-formed XHTML, so it is never copied into the book as markup.
-#[must_use]
-pub fn paragraphs(html: &str) -> Vec<String> {
-    let mut text = String::with_capacity(html.len());
-    let mut rest = html;
-    while let Some(start) = rest.find('<') {
-        text.push_str(rest.get(..start).unwrap_or_default());
-        let after = rest.get(start..).unwrap_or_default();
-        let Some(end) = after.find('>') else {
-            rest = "";
-            break;
-        };
-        let tag = after
-            .get(1..end)
-            .unwrap_or_default()
-            .trim_start_matches('/')
-            .split(|c: char| c.is_whitespace() || c == '/')
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if matches!(
-            tag.as_str(),
-            "p" | "br" | "div" | "blockquote" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-        ) {
-            text.push('\n');
-        }
-        rest = after.get(end + 1..).unwrap_or_default();
-    }
-    text.push_str(rest);
-    decode_entities(&text)
-        .split('\n')
-        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|line| !line.is_empty())
-        .collect()
-}
-
-fn decode_entities(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find('&') {
-        out.push_str(rest.get(..start).unwrap_or_default());
-        let after = rest.get(start..).unwrap_or_default();
-        let entity = after
-            .find(';')
-            .filter(|&end| end <= 10)
-            .and_then(|end| after.get(1..end).map(|name| (name, end)));
-        let decoded = entity.and_then(|(name, end)| {
-            let c = match name {
-                "amp" => Some('&'),
-                "lt" => Some('<'),
-                "gt" => Some('>'),
-                "quot" => Some('"'),
-                "apos" => Some('\''),
-                "nbsp" => Some(' '),
-                _ => name
-                    .strip_prefix("#x")
-                    .or_else(|| name.strip_prefix("#X"))
-                    .and_then(|hex| u32::from_str_radix(hex, 16).ok())
-                    .or_else(|| name.strip_prefix('#').and_then(|d| d.parse().ok()))
-                    .and_then(char::from_u32),
-            }?;
-            Some((c, end))
-        });
-        if let Some((c, end)) = decoded {
-            out.push(c);
-            rest = after.get(end + 1..).unwrap_or_default();
-        } else {
-            out.push('&');
-            rest = after.get(1..).unwrap_or_default();
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 /// `12345` → `12,345`.
 #[must_use]
 pub fn thousands(n: u64) -> String {
@@ -163,22 +87,6 @@ mod tests {
             esc("a < b & \"c\" 'd' >\u{1}"),
             "a &lt; b &amp; &quot;c&quot; &#39;d&#39; &gt;"
         );
-    }
-
-    #[test]
-    fn summaries_become_plain_paragraphs() {
-        let html = "<p>First &amp; <em>best</em>.</p>\n<p>Second<br/>line&nbsp;two &#8212; &#x2014; &bogus; & done</p><p>  </p>";
-        assert_eq!(
-            paragraphs(html),
-            [
-                "First & best.",
-                "Second",
-                "line two \u{2014} \u{2014} &bogus; & done"
-            ]
-        );
-        assert_eq!(paragraphs("plain text"), ["plain text"]);
-        assert_eq!(paragraphs("<p>unclosed <b"), ["unclosed"]);
-        assert_eq!(paragraphs(""), [] as [std::string::String; 0]);
     }
 
     #[test]

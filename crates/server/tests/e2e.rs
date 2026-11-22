@@ -298,13 +298,10 @@ personal_ini = "{ini}"
     let second = Epub::read(&book);
     assert_eq!(second.chapters(), 3, "{:?}", second.names);
     second.assert_finished(1003);
-    assert!(second.names.iter().any(|n| n.ends_with("log_page.xhtml")));
     assert!(
-        second
-            .text("OEBPS/fanfold_about.xhtml")
-            .contains("New chapters: 2. Two, 3. Three."),
-        "{}",
-        second.text("OEBPS/fanfold_about.xhtml")
+        !second.names.iter().any(|n| n.ends_with("log_page.xhtml")),
+        "no update log: {:?}",
+        second.names
     );
 }
 
@@ -366,11 +363,7 @@ impl Epub {
     }
 
     fn assert_finished(&self, work: u64) {
-        for ours in [
-            "OEBPS/fanfold_cover.png",
-            "OEBPS/fanfold_cover.xhtml",
-            "OEBPS/fanfold_about.xhtml",
-        ] {
+        for ours in ["OEBPS/fanfold_cover.png", "OEBPS/fanfold_cover.xhtml"] {
             assert_eq!(
                 self.names.iter().filter(|n| *n == ours).count(),
                 1,
@@ -389,7 +382,12 @@ impl Epub {
             1,
             "{opf}"
         );
-        assert!(self.text("nav.xhtml").contains("About this work"));
+        assert!(
+            !self.names.iter().any(|n| n.contains("about")),
+            "nothing follows the story: {:?}",
+            self.names
+        );
+        assert!(!self.text("nav.xhtml").contains("About this work"));
     }
 }
 

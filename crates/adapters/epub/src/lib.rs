@@ -6,9 +6,10 @@
 //!   e-readers group by) and in EPUB 3's; every AO3 fact is an `ao3:` property
 //!   (`docs/epub-metadata.md`).
 //! * A generated cover, first in the book.
-//! * An "About this work" page at the back: details, chapters with their dates, and the
-//!   history of the work as Fanfold saw it.
 //!
+//! Nothing follows the story, so an update never moves the reader's place: FanFicFare's
+//! update log and the "About this work" page an older Fanfold added are taken out, with their
+//! table-of-contents entries.
 //! The downloader rebuilds the book on every update and drops all of this (it keeps only its
 //! own chapter files), so it is added after every download; a second pass over a finished
 //! book replaces the first one's additions.
@@ -30,7 +31,7 @@ pub mod opf;
 pub mod pages;
 pub mod text;
 
-use book::{ABOUT_PAGE, COVER_IMAGE, COVER_PAGE};
+use book::{COVER_IMAGE, COVER_PAGE, RETIRED_FILES};
 
 /// Finishes EPUBs in place.
 #[derive(Debug, Clone)]
@@ -140,7 +141,7 @@ fn finish(renderer: &cover::Renderer, path: &Path, extras: &BookExtras) -> Resul
     }) {
         let name = format!("{base}{}", nav.href);
         let text = read_entry(&mut archive, &name)?;
-        if let Some(text) = nav::nav_with_about(&text, &nav::relative(&nav.href, ABOUT_PAGE)) {
+        if let Some(text) = nav::clean_nav(&text) {
             replaced.push((name, text.into_bytes()));
         }
     }
@@ -150,7 +151,7 @@ fn finish(renderer: &cover::Renderer, path: &Path, extras: &BookExtras) -> Resul
     {
         let name = format!("{base}{}", ncx.href);
         let text = read_entry(&mut archive, &name)?;
-        if let Some(text) = nav::ncx_with_about(&text, &nav::relative(&ncx.href, ABOUT_PAGE)) {
+        if let Some(text) = nav::clean_ncx(&text) {
             replaced.push((name, text.into_bytes()));
         }
     }
@@ -167,22 +168,29 @@ fn finish(renderer: &cover::Renderer, path: &Path, extras: &BookExtras) -> Resul
             pages::cover_page(title, &lang).into_bytes(),
             true,
         ),
-        (
-            format!("{base}{ABOUT_PAGE}"),
-            pages::about_page(extras, &lang).into_bytes(),
-            true,
-        ),
     ];
-    write_book(&mut archive, path, &replaced, &added)
+    // Fanfold's old page, and FanFicFare's update log wherever its manifest puts it.
+    let retired: Vec<String> = RETIRED_FILES
+        .iter()
+        .map(|f| format!("{base}{f}"))
+        .chain(
+            items
+                .iter()
+                .filter(|i| opf::is_fanficfare_log(&i.id))
+                .map(|i| format!("{base}{}", i.href)),
+        )
+        .collect();
+    write_book(&mut archive, path, &replaced, &added, &retired)
 }
 
-/// The book with `replaced` entries swapped and `added` ones appended, written next to `path`
-/// and then moved over it.
+/// The book with `replaced` entries swapped, `retired` ones dropped and `added` ones appended,
+/// written next to `path` and then moved over it.
 fn write_book(
     archive: &mut ZipArchive<std::fs::File>,
     path: &Path,
     replaced: &[(String, Vec<u8>)],
     added: &[(String, Vec<u8>, bool)],
+    retired: &[String],
 ) -> Result<(), String> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let out = tempfile::Builder::new()
@@ -200,7 +208,7 @@ fn write_book(
             .name()
             .map_err(|e| format!("entry {index}: {e}"))?
             .into_owned();
-        if added.iter().any(|(n, _, _)| *n == name) {
+        if added.iter().any(|(n, _, _)| *n == name) || retired.contains(&name) {
             continue;
         }
         if let Some((_, data)) = replaced.iter().find(|(n, _)| *n == name) {

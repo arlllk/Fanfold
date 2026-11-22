@@ -338,7 +338,7 @@ impl Worker {
         })
     }
 
-    /// Write Fanfold's metadata, cover and about page into the book. Best effort: a book
+    /// Write Fanfold's metadata and cover into the book. Best effort: a book
     /// without them is still a good book, so a failure is logged and the book published as
     /// downloaded.
     /// `refresh`: the chapters did not change, only Fanfold's additions are renewed.

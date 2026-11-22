@@ -16,7 +16,10 @@ use crate::{
 
 /// What a book finished by this version carries, so books finished by an older one (or never)
 /// are finished again at their next check. Bump it when what is added changes.
-pub const FINISH_VERSION: u32 = 1;
+///
+/// 2: nothing after the story: no "About this work" page (version 1 added one) and no
+/// FanFicFare update log (taken out).
+pub const FINISH_VERSION: u32 = 2;
 
 /// The marker in the package, as written.
 #[must_use]
@@ -27,33 +30,13 @@ pub fn finish_marker() -> String {
 /// Names of Fanfold's files, relative to the package document.
 pub const COVER_IMAGE: &str = "OEBPS/fanfold_cover.png";
 pub const COVER_PAGE: &str = "OEBPS/fanfold_cover.xhtml";
-pub const ABOUT_PAGE: &str = "OEBPS/fanfold_about.xhtml";
+/// Files an older Fanfold added and this one leaves out of a book it finishes again.
+pub const RETIRED_FILES: &[&str] = &["OEBPS/fanfold_about.xhtml"];
 
 /// `2026-11-21`.
 #[must_use]
 pub fn iso_day(at: Timestamp) -> String {
     at.strftime("%Y-%m-%d").to_string()
-}
-
-/// An AO3 profile page.
-#[must_use]
-pub fn author_url(author: &Author) -> String {
-    fn part(s: &str) -> String {
-        s.bytes()
-            .map(|b| {
-                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
-                    char::from(b).to_string()
-                } else {
-                    format!("%{b:02X}")
-                }
-            })
-            .collect()
-    }
-    format!(
-        "https://archiveofourown.org/users/{}/pseuds/{}",
-        part(&author.user),
-        part(&author.pseud)
-    )
 }
 
 /// `pseud (user)`, or just the name when they are the same.
@@ -270,8 +253,7 @@ pub fn additions(extras: &BookExtras, epub3: bool) -> Additions {
         metadata: m,
         manifest: format!(
             "\n\t\t<item id=\"{ID_PREFIX}cover-image\" href=\"{COVER_IMAGE}\" media-type=\"image/png\"{}/>\n\
-             \t\t<item id=\"{ID_PREFIX}cover\" href=\"{COVER_PAGE}\" media-type=\"application/xhtml+xml\"/>\n\
-             \t\t<item id=\"{ID_PREFIX}about\" href=\"{ABOUT_PAGE}\" media-type=\"application/xhtml+xml\"/>\n\t",
+             \t\t<item id=\"{ID_PREFIX}cover\" href=\"{COVER_PAGE}\" media-type=\"application/xhtml+xml\"/>\n\t",
             if epub3 {
                 " properties=\"cover-image\""
             } else {
@@ -280,6 +262,6 @@ pub fn additions(extras: &BookExtras, epub3: bool) -> Additions {
         ),
         epub3,
         spine_first: format!("\n\t\t<itemref idref=\"{ID_PREFIX}cover\" linear=\"yes\"/>"),
-        spine_last: format!("\n\t\t<itemref idref=\"{ID_PREFIX}about\" linear=\"yes\"/>\n\t"),
+        spine_last: String::new(),
     }
 }

@@ -52,8 +52,10 @@ In EPUB 3 as `<meta property="ao3:words">120000</meta>`; in EPUB 2 as
 
 - `OEBPS/fanfold_cover.png` (1000 × 1500), the cover (`<meta name="cover">`, and in EPUB 3
   `properties="cover-image"`), shown by `OEBPS/fanfold_cover.xhtml`, the first page.
-- `OEBPS/fanfold_about.xhtml`, the last page, listed in the table of contents as
-  "About this work": details, chapters with their dates, and the work's history.
+- Nothing after the story, so an update never moves the reader's place. Books finished
+  before finishing version 2 had `OEBPS/fanfold_about.xhtml` ("About this work") there, and
+  FanFicFare's update log (`log_page`); finishing them again removes both, with their
+  table-of-contents entries.
 
 ## Updates
 

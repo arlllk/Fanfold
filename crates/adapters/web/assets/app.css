@@ -68,14 +68,20 @@ a { color: var(--accent); }
   padding-top: env(safe-area-inset-top);
 }
 .top .wrap { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; padding-block: 8px; }
-.brand { font: italic 600 1.25rem var(--serif); color: var(--ink); text-decoration: none; margin-right: auto; }
-.nav { display: flex; gap: 4px; }
+.brand { font: italic 600 1.25rem var(--serif); color: var(--ink); text-decoration: none; }
+.nav { display: flex; gap: 4px; margin-left: auto; }
+/* Phones: the brand and live dot on one line, the nav on its own full-width row below,
+   scrolling sideways rather than widening the page if the links don't fit. */
+@media (max-width: 559px) {
+  .nav { flex: 1 1 100%; margin-left: -12px; overflow-x: auto; scrollbar-width: none; }
+  .nav a { flex: none; }
+}
 .nav a {
   display: inline-flex; align-items: center; min-height: 44px; padding: 0 12px;
   color: var(--muted); text-decoration: none; border-radius: 10px; font-weight: 600;
 }
 .nav a[aria-current="page"] { color: var(--ink); background: color-mix(in srgb, var(--ink) 8%, transparent); }
-.livedot { width: 8px; height: 8px; border-radius: 50%; background: var(--done); }
+.livedot { flex: none; width: 8px; height: 8px; margin-left: -8px; border-radius: 50%; background: var(--done); }
 html[data-live="off"] .livedot { background: var(--retrying); }
 
 .pill {
@@ -375,8 +381,9 @@ details.danger p { margin: 8px 0 10px; color: var(--muted); font-size: .92rem; }
 }
 .lib-count { margin: 0 0 10px; color: var(--muted); font-size: .9rem; }
 
-.books { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
-@media (min-width: 680px) { .books { grid-template-columns: 1fr 1fr; } }
+/* minmax(0, …): a column must not grow to fit a card's unwrapped fandom line. */
+.books { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+@media (min-width: 680px) { .books { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .book {
   display: flex; gap: 14px; height: 100%; padding: 12px;
   background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
