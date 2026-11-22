@@ -530,7 +530,7 @@ pub struct FinishError(pub String);
 
 /// Adds what Fanfold knows to a downloaded book before it is published.
 ///
-/// Structured metadata, an about page, a cover. Must be idempotent: an update hands the
+/// Structured metadata and a cover. Must be idempotent: an update hands the
 /// downloader the finished book, and the downloader may carry parts of it over.
 #[cfg_attr(any(test, feature = "mocks"), mockall::automock)]
 #[async_trait]

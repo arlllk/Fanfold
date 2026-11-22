@@ -1,6 +1,6 @@
 [package]
 name = "fanfold-adapter-epub"
-description = "BookFinisher adapter: structured metadata, an about page and a generated cover in each EPUB."
+description = "BookFinisher adapter: structured metadata and a generated cover in each EPUB."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

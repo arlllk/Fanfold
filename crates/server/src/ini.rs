@@ -81,16 +81,15 @@ pub fn render_login_on_demand_ini(
 /// * The title page also lists collections and AO3's counters (as of the download).
 /// * EPUB 3, with the series in calibre's `calibre:series` form, which e-readers group by
 ///   (Fanfold adds the EPUB 3 form, and every series, afterwards).
-/// * A log page that records what changed with each update (works in progress only), at the
-///   back of the book with Fanfold's about page, so the book opens on its cover and title.
+/// * No update log page: nothing may follow the story, or each update moves the reader's
+///   place (Fanfold also takes it out of books that have one).
 const BOOK_SETTINGS: &str = "\
 extra_titlepage_entries:collectionsHTML,kudos,hits,bookmarks,comments
 
 [epub]
 epub_version:3.0
 calibre_series_meta:true
-include_logpage:smart
-logpage_at_end:true
+include_logpage:false
 ";
 
 /// `ini` (one of the renderings above) followed by [`BOOK_SETTINGS`].
@@ -231,7 +230,7 @@ mod tests {
         for line in [
             "epub_version:3.0",
             "calibre_series_meta:true",
-            "include_logpage:smart",
+            "include_logpage:false",
         ] {
             assert!(epub.lines().any(|l| l == line), "{line}");
         }

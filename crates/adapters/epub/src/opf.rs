@@ -24,7 +24,7 @@ pub struct Additions {
     pub manifest: String,
     /// Spine entries read before the downloader's (the cover).
     pub spine_first: String,
-    /// Spine entries read after the downloader's (the about page).
+    /// Spine entries read after the downloader's (none at present).
     pub spine_last: String,
     /// An EPUB 3 package: declare the `ao3:` prefix, replace the downloader's `dc:date`s.
     pub epub3: bool,
@@ -88,7 +88,13 @@ pub fn manifest(opf: &str) -> Result<Vec<Item>, String> {
     }
 }
 
-/// Whether a child of `parent` is one Fanfold replaces.
+/// FanFicFare's id for its update log page, which Fanfold takes out of every book.
+#[must_use]
+pub fn is_fanficfare_log(id: &str) -> bool {
+    id == "log_page"
+}
+
+/// Whether a child of `parent` is one Fanfold replaces (or, for the update log, removes).
 fn replaced(parent: &str, e: &BytesStart<'_>, epub3: bool) -> bool {
     let ours = |name: &str| attr(e, name).is_some_and(|v| v.starts_with(ID_PREFIX));
     match (parent, local(e).as_str()) {
@@ -114,8 +120,10 @@ fn replaced(parent: &str, e: &BytesStart<'_>, epub3: bool) -> bool {
                 || property.starts_with("ao3:")
                 || property == "belongs-to-collection"
         }
-        ("manifest", "item") => ours("id"),
-        ("spine", "itemref") => ours("idref"),
+        ("manifest", "item") => ours("id") || attr(e, "id").is_some_and(|i| is_fanficfare_log(&i)),
+        ("spine", "itemref") => {
+            ours("idref") || attr(e, "idref").is_some_and(|i| is_fanficfare_log(&i))
+        }
         _ => false,
     }
 }
@@ -265,12 +273,13 @@ pub fn rewrite(opf: &str, add: &Additions) -> Result<String, String> {
                     _ => None,
                 };
                 match addition {
-                    // The additions bring their own line breaks and indentation.
-                    Some(text) => {
+                    // The additions bring their own line breaks and indentation; with none,
+                    // the closing tag keeps the indentation it had.
+                    Some(text) if !text.is_empty() => {
                         pending.clear();
                         raw(&mut writer, text);
                     }
-                    None => flush(&mut writer, &mut pending),
+                    _ => flush(&mut writer, &mut pending),
                 }
                 writer.write_event(Event::End(e)).map_err(|e| fail(&e))?;
             }

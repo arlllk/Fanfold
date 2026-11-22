@@ -20,7 +20,7 @@ by pasting a link, or automatically from AO3's subscription emails.
   keep their path forever, so your reader keeps your place when a work is updated.
 - Everything AO3 says about a work is kept as a timeline: which update added a tag, when a work
   became restricted, how chapters and words grew.
-- Each book gets a generated cover, an "About this work" page with its history, and its
+- Each book gets a generated cover, and its
   series, rating, fandoms and tags as metadata your reader can sort and group by
   (see [what is in each book](#what-is-in-each-book)).
 - If AO3 has a bad day, Fanfold backs off and retries by itself instead of failing everything.
@@ -228,10 +228,10 @@ FanFicFare writes the chapters and a title page. Fanfold then adds, after every 
 - **Metadata your reader can group by**: the series and part number, and the tags labelled by
   kind (`Rating: …`, `Fandom: …`, `Relationship: …`, `Character: …`, `Tag: …`,
   `Status: Complete`), so a reader's tag list sorts them into groups.
-- **"About this work"**, the last page and in the table of contents: summary, every tag,
-  series, counts, the chapters with the dates they were posted (the newest marked), and the
-  work's history as Fanfold saw it (chapters added, tags changed, marked complete, ...).
-- **An update log** (works in progress), also at the back, with what each update changed.
+
+Nothing follows the story, so an update never moves your place in the book: there is no
+update log or "about" page at the back (books that have one lose it at their next check).
+The work's details are on the title page and on its page in the library.
 
 The same facts are in the book as structured `ao3:` metadata for other software
 ([reference](docs/epub-metadata.md)). Books already in the library get all of this at their
