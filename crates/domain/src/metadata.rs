@@ -169,6 +169,41 @@ pub struct WorkState {
     pub chapters: Vec<Chapter>,
 }
 
+/// What one list (authors, tags, ...) gained and lost in one version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Changes<T> {
+    pub added: Vec<T>,
+    pub removed: Vec<T>,
+}
+
+impl<T> Default for Changes<T> {
+    fn default() -> Self {
+        Self {
+            added: Vec::new(),
+            removed: Vec::new(),
+        }
+    }
+}
+
+impl<T> Changes<T> {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+}
+
+/// One recorded version of a work: when it was seen, its facts then, and what its lists
+/// gained and lost compared with the version before (the first version gains everything).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkVersionChanges {
+    pub seen_at: crate::Timestamp,
+    pub facts: WorkFacts,
+    pub authors: Changes<Author>,
+    pub tags: Changes<Tag>,
+    pub series: Changes<SeriesPart>,
+    pub chapters: Changes<Chapter>,
+}
+
 impl WorkMetadata {
     #[must_use]
     pub fn state(&self) -> WorkState {

@@ -14,11 +14,12 @@ use async_trait::async_trait;
 use fanfold_app::{
     error::{MailError, NotifyError, RepoError, StoreError},
     ports::{
-        BookCatalog, BookRecord, Checkpoint, Clock, CursorStore, DownloadError, DownloadRequest,
-        DownloadedBook, Downloader, EnqueueOutcome, Event, EventSource, Jitter, JobCounts,
-        JobFilter, JobRepository, LibraryCatalog, LibraryEntry, LibraryPage, LibraryQuery,
-        LibrarySort, LibraryStatus, LibraryStore, LibraryTotals, LogEntry, MailBatch, MailSource,
-        MetadataStore, Notifier, NotifyEvent, Readiness, Recorded,
+        BookCatalog, BookExtras, BookFinisher, BookRecord, Checkpoint, Clock, CursorStore,
+        DownloadError, DownloadRequest, DownloadedBook, Downloader, EnqueueOutcome, Event,
+        EventSource, FinishError, Jitter, JobCounts, JobFilter, JobRepository, LibraryCatalog,
+        LibraryEntry, LibraryPage, LibraryQuery, LibrarySort, LibraryStatus, LibraryStore,
+        LibraryTotals, LogEntry, MailBatch, MailSource, MetadataStore, Notifier, NotifyEvent,
+        Readiness, Recorded,
     },
 };
 use fanfold_domain::{
@@ -26,8 +27,8 @@ use fanfold_domain::{
     failure::FailureKind,
     job::{Job, JobId, JobSource, JobState, Target},
     metadata::{
-        Author, FollowSource, SeriesFacts, SeriesMetadata, SeriesPart, Tag, TagKind, WorkFacts,
-        WorkMetadata, WorkState, WorkStats, plan_work_update,
+        Author, Changes, FollowSource, SeriesFacts, SeriesMetadata, SeriesPart, Tag, TagKind,
+        WorkFacts, WorkMetadata, WorkState, WorkStats, WorkVersionChanges, plan_work_update,
     },
     timestamp,
     work::{SeriesId, WorkId},
@@ -169,6 +170,37 @@ fn apply<T: Clone + PartialEq>(
 }
 
 impl WorkHistory {
+    /// Every version with what it changed, as `MetadataStore::work_history` returns it.
+    fn history(&self) -> Vec<WorkVersionChanges> {
+        fn changes<T: Clone>(spans: &[Span<T>], version: u64) -> Changes<T> {
+            let mut ordered: Vec<&Span<T>> = spans.iter().collect();
+            ordered.sort_by_key(|s| (s.position, s.added_in));
+            Changes {
+                added: ordered
+                    .iter()
+                    .filter(|s| s.added_in == version)
+                    .map(|s| s.item.clone())
+                    .collect(),
+                removed: ordered
+                    .iter()
+                    .filter(|s| s.removed_in == Some(version))
+                    .map(|s| s.item.clone())
+                    .collect(),
+            }
+        }
+        self.versions
+            .iter()
+            .map(|v| WorkVersionChanges {
+                seen_at: v.seen_at,
+                facts: v.facts.clone(),
+                authors: changes(&self.authors, v.id),
+                tags: changes(&self.tags, v.id),
+                series: changes(&self.series, v.id),
+                chapters: changes(&self.chapters, v.id),
+            })
+            .collect()
+    }
+
     fn state(&self) -> Option<WorkState> {
         let latest = self.versions.last()?;
         Some(WorkState {
@@ -657,6 +689,14 @@ impl MetadataStore for InMemoryJobs {
             .and_then(WorkHistory::state))
     }
 
+    async fn work_history(&self, work: WorkId) -> Result<Vec<WorkVersionChanges>, RepoError> {
+        Ok(self
+            .metadata_state()?
+            .works
+            .get(&work)
+            .map_or_else(Vec::new, WorkHistory::history))
+    }
+
     async fn follow_series(
         &self,
         series: SeriesId,
@@ -998,13 +1038,16 @@ impl ScriptedDownloader {
     }
 
     /// An update that found nothing new.
+    /// An update that found nothing new; like the real downloader, it still reports what the
+    /// site said ([`sample_metadata`]).
     pub fn push_unchanged(&self, title: &str) {
+        let metadata = WorkId::new(1).map(|placeholder| sample_metadata(placeholder, title));
         lock(&self.state).script.push_back(Ok(DownloadedBook {
             path: PathBuf::from(format!("/library/{title}.epub")),
             title: title.to_owned(),
             changed: false,
             log: "already contains all chapters".to_owned(),
-            metadata: None,
+            metadata,
         }));
     }
 
@@ -1072,6 +1115,53 @@ impl Downloader for ScriptedDownloader {
 
     async fn release(&self, book: &DownloadedBook) {
         lock(&self.state).released.push(book.path.clone());
+    }
+}
+
+// -------------------------------------------------------------------- finisher
+
+/// A [`BookFinisher`] that records what it was given and leaves the book alone.
+#[derive(Debug, Default)]
+pub struct RecordingFinisher {
+    calls: Mutex<Vec<(PathBuf, BookExtras)>>,
+    failing: Mutex<bool>,
+    /// Whether stored books count as already finished (default: yes).
+    outdated: Mutex<bool>,
+}
+
+impl RecordingFinisher {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn fail(&self, failing: bool) {
+        *lock(&self.failing) = failing;
+    }
+
+    /// Make every book look finished by an older version (or never).
+    pub fn outdate(&self, outdated: bool) {
+        *lock(&self.outdated) = outdated;
+    }
+
+    #[must_use]
+    pub fn calls(&self) -> Vec<(PathBuf, BookExtras)> {
+        lock(&self.calls).clone()
+    }
+}
+
+#[async_trait]
+impl BookFinisher for RecordingFinisher {
+    async fn finish(&self, book: &Path, extras: &BookExtras) -> Result<(), FinishError> {
+        lock(&self.calls).push((book.to_path_buf(), extras.clone()));
+        if *lock(&self.failing) {
+            return Err(FinishError("cover renderer broke".into()));
+        }
+        Ok(())
+    }
+
+    async fn is_current(&self, _book: &Path) -> bool {
+        !*lock(&self.outdated)
     }
 }
 

@@ -21,6 +21,7 @@ fanfold-app = { workspace = true }
 fanfold-domain = { workspace = true }
 fanfold-adapter-discord = { workspace = true }
 fanfold-adapter-fanficfare = { workspace = true }
+fanfold-adapter-epub = { workspace = true }
 fanfold-adapter-fs = { workspace = true }
 fanfold-adapter-jmap = { workspace = true }
 fanfold-adapter-postgres = { workspace = true }

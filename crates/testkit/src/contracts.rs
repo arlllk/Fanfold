@@ -1181,6 +1181,7 @@ where
 {
     versions_are_written_only_for_changes(&*make().await).await;
     spans_follow_what_the_site_shows(&*make().await).await;
+    the_history_tells_what_each_version_changed(&*make().await).await;
     series_are_followed_once_and_named(&*make().await).await;
     a_series_can_be_unfollowed_and_knows_its_members(&*make().await).await;
     a_series_folder_is_chosen_once(&*make().await).await;
@@ -1279,6 +1280,45 @@ async fn spans_follow_what_the_site_shows(store: &dyn MetadataStore) {
             .unwrap()
             .new_version
     );
+}
+
+async fn the_history_tells_what_each_version_changed(store: &dyn MetadataStore) {
+    assert_eq!(store.work_history(work(5)).await.unwrap(), Vec::new());
+    let first = observed_work(5);
+    store.record_work(&first, t(10), None).await.unwrap();
+    let mut second = first.clone();
+    let dropped = second.tags.remove(2);
+    let fluff = Tag {
+        kind: TagKind::Freeform,
+        name: "Fluff".into(),
+    };
+    second.tags.insert(0, fluff.clone());
+    second.series[0].part = Some(3);
+    second.facts.chapters_posted += 1;
+    store.record_work(&second, t(20), None).await.unwrap();
+    // Counters only: no version.
+    let mut third = second.clone();
+    third.stats.kudos = Some(9_999);
+    store.record_work(&third, t(30), None).await.unwrap();
+
+    let history = store.work_history(work(5)).await.unwrap();
+    assert_eq!(history.len(), 2, "{history:#?}");
+    let (v1, v2) = (&history[0], &history[1]);
+    assert_eq!((v1.seen_at, v2.seen_at), (t(10), t(20)));
+    assert_eq!(v1.facts, first.facts);
+    assert_eq!(v2.facts, second.facts);
+    assert_eq!(
+        v1.tags.added, first.tags,
+        "the first version adds everything, in order"
+    );
+    assert_eq!(v1.authors.added, first.authors);
+    assert_eq!(v1.chapters.added, first.chapters);
+    assert!(v1.tags.removed.is_empty() && v1.series.removed.is_empty());
+    assert_eq!(v2.tags.added, vec![fluff]);
+    assert_eq!(v2.tags.removed, vec![dropped]);
+    assert_eq!(v2.series.added, second.series);
+    assert_eq!(v2.series.removed, first.series);
+    assert!(v2.authors.is_empty() && v2.chapters.is_empty());
 }
 
 async fn series_are_followed_once_and_named(store: &dyn MetadataStore) {

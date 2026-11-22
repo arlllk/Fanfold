@@ -18,9 +18,10 @@ use fanfold_domain::{
 use crate::{
     error::AppError,
     ports::{
-        BookCatalog, BookRecord, Clock, DownloadDetails, DownloadError, DownloadRequest,
-        DownloadedBook, Downloader, EnqueueOutcome, Jitter, JobRepository, LibraryStore, LogEntry,
-        LogLevel, MetadataStore, Notifier, NotifyEvent, SiteStatus, SiteStatusSource,
+        BookCatalog, BookExtras, BookFinisher, BookRecord, Clock, DownloadDetails, DownloadError,
+        DownloadRequest, DownloadedBook, Downloader, EnqueueOutcome, Jitter, JobRepository,
+        LibraryStore, LogEntry, LogLevel, MetadataStore, Notifier, NotifyEvent, SiteStatus,
+        SiteStatusSource,
     },
     stats::WorkerStats,
 };
@@ -33,6 +34,8 @@ pub struct Ports {
     pub metadata: Arc<dyn MetadataStore>,
     pub downloader: Arc<dyn Downloader>,
     pub library: Arc<dyn LibraryStore>,
+    /// Adds what Fanfold knows to each downloaded book before it is published.
+    pub finisher: Arc<dyn BookFinisher>,
     pub notifier: Arc<dyn Notifier>,
     pub clock: Arc<dyn Clock>,
     pub jitter: Arc<dyn Jitter>,
@@ -264,8 +267,12 @@ impl Worker {
             return Err(err);
         }
 
-        // An update that found nothing new: leave the library file alone.
-        if !book.changed && updated {
+        // An update that found nothing new: leave the library file alone, unless it lacks what
+        // Fanfold adds to books (it predates that, or an older Fanfold finished it). Then it is
+        // finished and published again, quietly: its chapters did not change.
+        let refresh = !book.changed && updated;
+        if refresh && (book.metadata.is_none() || self.ports.finisher.is_current(&book.path).await)
+        {
             self.ports.downloader.release(&book).await;
             let title = record.map_or(book.title, |r| r.title);
             return Ok(Published {
@@ -289,6 +296,7 @@ impl Worker {
                 }
             },
         };
+        self.finish_book(job, &book, refresh).await;
         let published = self.ports.library.publish(&book.path, &file_name).await;
         // Scratch space goes whether or not publishing worked: a failed publish is
         // retried with a fresh download.
@@ -324,10 +332,58 @@ impl Worker {
         Ok(Published {
             title: book.title,
             updated,
-            changed: true,
+            changed: !refresh,
             log: book.log,
             details,
         })
+    }
+
+    /// Write Fanfold's metadata, cover and about page into the book. Best effort: a book
+    /// without them is still a good book, so a failure is logged and the book published as
+    /// downloaded.
+    /// `refresh`: the chapters did not change, only Fanfold's additions are renewed.
+    async fn finish_book(&self, job: &Job, book: &DownloadedBook, refresh: bool) {
+        let Some(metadata) = &book.metadata else {
+            return;
+        };
+        if refresh {
+            self.log(
+                job,
+                LogLevel::Info,
+                "no new chapters; adding the current cover and details to the book".to_owned(),
+            )
+            .await;
+        }
+        let history = match self.ports.metadata.work_history(metadata.work).await {
+            Ok(history) => history,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read the work's history for the book");
+                Vec::new()
+            }
+        };
+        // Grouped under the series the library files it under, as `choose_path` picks it.
+        let candidates: Vec<SeriesId> = metadata.series.iter().map(|p| p.id).collect();
+        let main_series = self
+            .ports
+            .metadata
+            .followed(&candidates)
+            .await
+            .ok()
+            .and_then(|followed| followed.first().copied());
+        let extras = BookExtras {
+            metadata: metadata.clone(),
+            history,
+            main_series,
+            fetched_at: self.ports.clock.now(),
+        };
+        if let Err(e) = self.ports.finisher.finish(&book.path, &extras).await {
+            self.log(
+                job,
+                LogLevel::Warn,
+                format!("{e}; the book is published as downloaded"),
+            )
+            .await;
+        }
     }
 
     async fn record_metadata(&self, job: &Job, book: &DownloadedBook) -> Result<(), DownloadError> {

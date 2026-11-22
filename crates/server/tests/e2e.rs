@@ -240,6 +240,157 @@ personal_ini = "{ini}"
 
     // 3. Nothing else is queued.
     assert_eq!(worker.run_once().await.unwrap(), Tick::Idle);
+
+    // 4. A book Fanfold finished is updated by FanFicFare and finished again.
+    let growing = |chapters: &[&str]| {
+        let base = std::fs::read_to_string(&ini_path).unwrap();
+        let base = base.split("\n[teststory:1003]").next().unwrap().to_owned();
+        std::fs::write(
+            &ini_path,
+            format!(
+                "{base}\n[teststory:1003]\nvalid_entries:title,author,authorId,numChapters,status\n\
+                 title:Growing Story\nauthor:Nobody\nauthorId:1\nstatus:In-Progress\n\
+                 numChapters:{}\n\
+                 chaptertitles:{}\n",
+                chapters.len(),
+                chapters.join(",")
+            ),
+        )
+        .unwrap();
+    };
+    let run = |work: WorkId| {
+        let store = Arc::clone(&store);
+        let worker = &worker;
+        async move {
+            let EnqueueOutcome::Created(job) = store
+                .enqueue(work.into(), JobSource::Manual, SystemClock.now())
+                .await
+                .unwrap()
+            else {
+                panic!("must create");
+            };
+            let tick = worker.run_once().await.unwrap();
+            let logs = store.logs(job.id).await.unwrap();
+            assert_eq!(
+                tick,
+                Tick::Processed {
+                    job: job.id,
+                    outcome: Outcome::Succeeded
+                },
+                "{logs:#?}"
+            );
+            assert!(
+                !logs.iter().any(|l| l.message.contains("cannot finish")),
+                "{logs:#?}"
+            );
+        }
+    };
+    let grown = WorkId::new(1003).unwrap();
+    growing(&["One"]);
+    run(grown).await;
+    let book = root.join("library/single/Nobody/Growing Story 1003.epub");
+    let first = Epub::read(&book);
+    assert_eq!(first.chapters(), 1, "{:?}", first.names);
+    first.assert_finished(1003);
+
+    growing(&["One", "Two", "Three"]);
+    run(grown).await;
+    let second = Epub::read(&book);
+    assert_eq!(second.chapters(), 3, "{:?}", second.names);
+    second.assert_finished(1003);
+    assert!(second.names.iter().any(|n| n.ends_with("log_page.xhtml")));
+    assert!(
+        second
+            .text("OEBPS/fanfold_about.xhtml")
+            .contains("New chapters: 2. Two, 3. Three."),
+        "{}",
+        second.text("OEBPS/fanfold_about.xhtml")
+    );
+}
+
+/// A book's entries, read with the zip tools FanFicFare would use.
+struct Epub {
+    names: Vec<String>,
+    path: std::path::PathBuf,
+}
+
+impl Epub {
+    fn read(path: &Path) -> Self {
+        let out = std::process::Command::new(std::env::var("FFD_PYTHON").unwrap())
+            .args([
+                "-I",
+                "-c",
+                "import sys, zipfile; print('\\n'.join(zipfile.ZipFile(sys.argv[1]).namelist()))",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        Self {
+            names: String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect(),
+            path: path.to_path_buf(),
+        }
+    }
+
+    fn text(&self, name: &str) -> String {
+        let out = std::process::Command::new(std::env::var("FFD_PYTHON").unwrap())
+            .args([
+                "-I",
+                "-c",
+                "import sys, zipfile; sys.stdout.write(zipfile.ZipFile(sys.argv[1]).read(sys.argv[2]).decode())",
+            ])
+            .arg(&self.path)
+            .arg(name)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// The chapters FanFicFare itself finds, as an update would.
+    fn chapters(&self) -> usize {
+        let out = std::process::Command::new(std::env::var("FFD_PYTHON").unwrap())
+            .args([
+                "-I",
+                "-c",
+                "import sys; from fanficfare.epubutils import get_dcsource_chaptercount as c; \
+                 print(c(sys.argv[1])[1])",
+            ])
+            .arg(&self.path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    fn assert_finished(&self, work: u64) {
+        for ours in [
+            "OEBPS/fanfold_cover.png",
+            "OEBPS/fanfold_cover.xhtml",
+            "OEBPS/fanfold_about.xhtml",
+        ] {
+            assert_eq!(
+                self.names.iter().filter(|n| *n == ours).count(),
+                1,
+                "{ours} in {:?}",
+                self.names
+            );
+        }
+        let opf = self.text("content.opf");
+        assert!(opf.contains("<package version=\"3.0\""), "{opf}");
+        assert!(
+            opf.contains(&format!("<meta property=\"ao3:work-id\">{work}</meta>")),
+            "{opf}"
+        );
+        assert_eq!(
+            opf.matches("properties=\"cover-image\"").count(),
+            1,
+            "{opf}"
+        );
+        assert!(self.text("nav.xhtml").contains("About this work"));
+    }
 }
 
 /// Small helper trait so the test reads naturally.
