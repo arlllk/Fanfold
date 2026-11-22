@@ -17,6 +17,12 @@ pub struct Status {
 
 #[must_use]
 pub const fn status_of(job: &Job) -> Status {
+    if job.resolved_by.is_some() {
+        return Status {
+            label: "Resolved",
+            class: "resolved",
+        };
+    }
     match (job.state, job.last_error.is_some()) {
         (JobState::Queued, false) => Status {
             label: "Queued",
@@ -415,6 +421,12 @@ mod tests {
         }
         let classes: std::collections::HashSet<_> = all.iter().map(|a| a.3).collect();
         assert_eq!(classes.len(), all.len());
+
+        let mut resolved = job(JobState::Failed, Some("x"));
+        resolved.resolved_by = Some(fanfold_domain::job::JobId::new(9));
+        let status = status_of(&resolved);
+        assert_eq!((status.label, status.class), ("Resolved", "resolved"));
+        assert!(!classes.contains(status.class));
     }
 
     #[test]

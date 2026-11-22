@@ -171,6 +171,7 @@ code { font-family: var(--mono); font-size: .9em; overflow-wrap: anywhere; }
 .retrying { --c: var(--retrying); }
 .done { --c: var(--done); }
 .failed { --c: var(--failed); }
+.resolved { --c: var(--done); }
 .cancelled { --c: var(--cancelled); }
 @media (prefers-reduced-motion: no-preference) {
   .running .ribbon { animation: pulse 1.8s ease-in-out infinite; }

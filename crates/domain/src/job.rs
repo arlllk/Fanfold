@@ -14,6 +14,9 @@
 //!
 //! A *forced* retry (`force_retry`, also from `Succeeded`) re-queues with `force` set: the
 //! next download ignores the stored book and starts from scratch, until one succeeds.
+//!
+//! A `Failed` job is *resolved* once a later job for the same target succeeds: it stays in
+//! the history, but no longer needs attention.
 
 use std::{fmt, str::FromStr};
 
@@ -222,6 +225,10 @@ pub struct Job {
     /// Download from scratch, ignoring the stored book (a forced retry). Cleared on success.
     #[serde(default)]
     pub force: bool,
+    /// For a `Failed` job: the later job for the same target that succeeded, so this failure
+    /// needs no attention any more. Set by the repository when that job is saved.
+    #[serde(default)]
+    pub resolved_by: Option<JobId>,
 }
 
 impl Job {
@@ -239,7 +246,14 @@ impl Job {
             updated_at: now,
             last_error: None,
             force: false,
+            resolved_by: None,
         }
+    }
+
+    /// Failed, and not fixed since by a later job for the same target.
+    #[must_use]
+    pub const fn needs_attention(&self) -> bool {
+        matches!(self.state, JobState::Failed) && self.resolved_by.is_none()
     }
 
     fn expect(&self, allowed: &[JobState], action: &'static str) -> Result<(), TransitionError> {
@@ -307,6 +321,7 @@ impl Job {
         self.tries = 0;
         self.next_attempt_at = now;
         self.updated_at = now;
+        self.resolved_by = None;
         Ok(())
     }
 
@@ -323,6 +338,7 @@ impl Job {
         self.next_attempt_at = now;
         self.updated_at = now;
         self.force = true;
+        self.resolved_by = None;
         Ok(())
     }
 

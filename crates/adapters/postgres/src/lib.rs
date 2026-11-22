@@ -64,7 +64,7 @@ fn backend(e: &sqlx::Error) -> RepoError {
 
 macro_rules! job_columns {
     () => {
-        "id, target_kind, target_id, source, state, attempt, next_attempt_at_ms, created_at_ms, updated_at_ms, last_error, force, tries"
+        "id, target_kind, target_id, source, state, attempt, next_attempt_at_ms, created_at_ms, updated_at_ms, last_error, force, tries, resolved_by"
     };
 }
 
@@ -95,6 +95,10 @@ fn job_from_row(row: &PgRow) -> Result<Job, RepoError> {
         updated_at: ts(row.try_get("updated_at_ms").map_err(|e| backend(&e))?)?,
         last_error: row.try_get("last_error").map_err(|e| backend(&e))?,
         force: row.try_get("force").map_err(|e| backend(&e))?,
+        resolved_by: row
+            .try_get::<Option<i64>, _>("resolved_by")
+            .map_err(|e| backend(&e))?
+            .map(JobId::new),
     })
 }
 
@@ -212,9 +216,11 @@ impl JobRepository for PgStore {
     }
 
     async fn save(&self, job: &Job) -> Result<(), RepoError> {
+        let mut tx = self.pool.begin().await.map_err(|e| backend(&e))?;
         let result = sqlx::query(
             "UPDATE jobs SET state = $2, attempt = $3, next_attempt_at_ms = $4, updated_at_ms = $5, last_error = $6,
-                 force = $7, tries = $8
+                 force = $7, tries = $8,
+                 resolved_by = CASE WHEN $2 = 'failed' THEN resolved_by END
              WHERE id = $1",
         )
         .bind(job.id.get())
@@ -225,7 +231,7 @@ impl JobRepository for PgStore {
         .bind(job.last_error.as_deref())
         .bind(job.force)
         .bind(i32::try_from(job.tries).unwrap_or(i32::MAX))
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| match &e {
             // unique_violation on jobs_one_active_per_work
@@ -237,7 +243,19 @@ impl JobRepository for PgStore {
         if result.rows_affected() == 0 {
             return Err(RepoError::NotFound(job.id));
         }
-        Ok(())
+        if job.state == JobState::Succeeded {
+            sqlx::query(
+                "UPDATE jobs SET resolved_by = $1
+                 WHERE target_kind = $2 AND target_id = $3 AND state = 'failed' AND resolved_by IS NULL",
+            )
+            .bind(job.id.get())
+            .bind(job.target.kind().as_str())
+            .bind(job.target.id_i64())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| backend(&e))?;
+        }
+        tx.commit().await.map_err(|e| backend(&e))
     }
 
     async fn get(&self, id: JobId) -> Result<Option<Job>, RepoError> {
@@ -266,7 +284,7 @@ impl JobRepository for PgStore {
                  WHEN 'all' THEN true
                  WHEN 'active' THEN state IN ('queued', 'running')
                  WHEN 'retrying' THEN state = 'queued' AND last_error IS NOT NULL
-                 WHEN 'failed' THEN state = 'failed'
+                 WHEN 'failed' THEN state = 'failed' AND resolved_by IS NULL
                  WHEN 'succeeded' THEN state = 'succeeded'
                  WHEN 'finished' THEN state IN ('succeeded', 'failed', 'cancelled')
                  ELSE false END
@@ -288,7 +306,8 @@ impl JobRepository for PgStore {
                  count(*) FILTER (WHERE state = 'running') AS running,
                  count(*) FILTER (WHERE state = 'queued' AND last_error IS NOT NULL) AS retrying,
                  count(*) FILTER (WHERE state = 'succeeded') AS succeeded,
-                 count(*) FILTER (WHERE state = 'failed') AS failed,
+                 count(*) FILTER (WHERE state = 'failed' AND resolved_by IS NULL) AS failed,
+                 count(*) FILTER (WHERE state = 'failed' AND resolved_by IS NOT NULL) AS resolved,
                  count(*) FILTER (WHERE state = 'cancelled') AS cancelled
              FROM jobs",
         )
@@ -305,6 +324,7 @@ impl JobRepository for PgStore {
             retrying: count("retrying")?,
             succeeded: count("succeeded")?,
             failed: count("failed")?,
+            resolved: count("resolved")?,
             cancelled: count("cancelled")?,
         })
     }

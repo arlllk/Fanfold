@@ -56,6 +56,7 @@ where
     a_work_and_a_series_with_the_same_number_are_different_targets(&*make().await).await;
     a_forced_retry_survives_storage_and_claiming(&*make().await).await;
     recover_requeues_only_running_jobs(&*make().await).await;
+    a_success_resolves_the_earlier_failures_of_its_target(&*make().await).await;
     list_matches_the_filter_definitions_and_pages(&*make().await).await;
     counts_agree_with_the_listing(&*make().await).await;
     save_rejects_a_second_active_job_for_one_work(&*make().await).await;
@@ -289,6 +290,70 @@ async fn save_of_unknown_job_is_not_found(repo: &dyn JobRepository) {
     assert_eq!(repo.save(&ghost).await, Err(RepoError::NotFound(ghost.id)));
 }
 
+/// Enqueue, claim and finish one job for `target`: succeeded, or failed for good.
+async fn finish(repo: &dyn JobRepository, target: Target, succeed: bool, now: Timestamp) -> Job {
+    let id = unwrap_created(repo.enqueue(target, JobSource::Mail, now).await.unwrap()).id;
+    let mut job = claim_specific(repo, id, now).await;
+    if succeed {
+        job.succeed(now).unwrap();
+    } else {
+        job.fail(now, FailureKind::Permanent, "gone".into(), &POLICY, 0.5)
+            .unwrap();
+    }
+    repo.save(&job).await.unwrap();
+    job
+}
+
+async fn a_success_resolves_the_earlier_failures_of_its_target(repo: &dyn JobRepository) {
+    let failed = finish(repo, Target::Work(work(1)), false, t(10)).await;
+    let other_work = finish(repo, Target::Work(work(2)), false, t(11)).await;
+    let same_number_series = finish(
+        repo,
+        Target::Series(SeriesId::new(1).unwrap()),
+        false,
+        t(12),
+    )
+    .await;
+    let fixed = finish(repo, Target::Work(work(1)), true, t(20)).await;
+
+    let get = |id| async move { repo.get(id).await.unwrap().unwrap() };
+    assert_eq!(get(failed.id).await.resolved_by, Some(fixed.id));
+    assert_eq!(
+        get(failed.id).await.state,
+        JobState::Failed,
+        "history is kept"
+    );
+    assert_eq!(get(other_work.id).await.resolved_by, None);
+    assert_eq!(get(same_number_series.id).await.resolved_by, None);
+    assert_eq!(get(fixed.id).await.resolved_by, None);
+
+    let still_failed: Vec<_> = repo
+        .list(JobFilter::Failed, 100, 0)
+        .await
+        .unwrap()
+        .iter()
+        .map(|j| j.id)
+        .collect();
+    assert_eq!(still_failed, [same_number_series.id, other_work.id]);
+    let counts = repo.counts().await.unwrap();
+    assert_eq!((counts.failed, counts.resolved), (2, 1));
+
+    // A stale copy saved while still failed cannot undo the resolution...
+    repo.save(&failed).await.unwrap();
+    assert_eq!(get(failed.id).await.resolved_by, Some(fixed.id));
+    // ...but retrying it makes it an ordinary job again.
+    let mut retried = get(failed.id).await;
+    retried.retry(t(30)).unwrap();
+    assert_eq!(retried.resolved_by, None);
+    retried.resolved_by = Some(fixed.id);
+    repo.save(&retried).await.unwrap();
+    assert_eq!(
+        get(failed.id).await.resolved_by,
+        None,
+        "only failed jobs are resolved"
+    );
+}
+
 async fn recover_requeues_only_running_jobs(repo: &dyn JobRepository) {
     let orphan = unwrap_created(
         repo.enqueue(Target::Work(work(1)), JobSource::Mail, t(1))
@@ -404,6 +469,9 @@ async fn populate(repo: &dyn JobRepository) -> Vec<JobId> {
     job.cancel(next(1)).unwrap();
     repo.save(&job).await.unwrap();
     ids.push(id);
+    // failed, then fixed by a later job
+    ids.push(finish(repo, Target::Work(work(7)), false, next(1)).await.id);
+    ids.push(finish(repo, Target::Work(work(7)), true, next(1)).await.id);
     ids
 }
 
@@ -463,8 +531,9 @@ async fn list_matches_the_filter_definitions_and_pages(repo: &dyn JobRepository)
     };
     assert_eq!(page(2, 0).await, everything[..2]);
     assert_eq!(page(2, 2).await, everything[2..4]);
-    assert_eq!(page(2, 4).await, everything[4..]);
-    assert_eq!(page(100, 6).await, Vec::new(), "past the end");
+    assert_eq!(page(2, 4).await, everything[4..6]);
+    assert_eq!(page(4, 6).await, everything[6..]);
+    assert_eq!(page(100, 8).await, Vec::new(), "past the end");
     assert_eq!(page(0, 0).await, Vec::new(), "limit 0");
 }
 
@@ -475,6 +544,10 @@ async fn counts_agree_with_the_listing(repo: &dyn JobRepository) {
     let counts = repo.counts().await.unwrap();
     assert_eq!(counts.retrying, len(JobFilter::Retrying).await);
     assert_eq!(counts.failed, len(JobFilter::Failed).await);
+    assert_eq!(
+        counts.succeeded + counts.failed + counts.resolved + counts.cancelled,
+        len(JobFilter::Finished).await
+    );
     assert_eq!(counts.succeeded, len(JobFilter::Succeeded).await);
     assert_eq!(
         counts.queued + counts.running + counts.retrying,
@@ -487,9 +560,10 @@ async fn counts_agree_with_the_listing(repo: &dyn JobRepository) {
             counts.retrying,
             counts.succeeded,
             counts.failed,
+            counts.resolved,
             counts.cancelled
         ),
-        (1, 1, 1, 1, 1, 1)
+        (1, 1, 1, 2, 1, 1, 1)
     );
 }
 
