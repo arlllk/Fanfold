@@ -250,12 +250,12 @@ pub fn page(frame: Frame<'_>, above: &Markup, content: &Markup) -> Markup {
                 header class="top" {
                     div class="wrap" {
                         a class="brand" href="/" { "Fanfold" }
+                        span class="livedot" title="Live updates" {}
                         nav class="nav" aria-label="Main" {
                             (nav_link("Dashboard", "/", nav == Nav::Dashboard))
                             (nav_link("Library", "/library", nav == Nav::Library))
                             (nav_link("History", "/jobs", nav == Nav::History))
                         }
-                        span class="livedot" title="Live updates" {}
                     }
                 }
                 main class="wrap" {
