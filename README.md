@@ -281,7 +281,7 @@ through; when it does not, use fanfold-browser.
 | **Dashboard** | Site health, an add-a-link form, a strip of recent results (one colour per job, oldest to newest), what needs attention, what is running, and the latest results. |
 | **Library** | Every book you have, as a shelf of covers: title, author, fandom, rating, chapters, length, series and kudos. Search by title, author, tag or series; show only complete or in-progress works; order by update, title, author or length. |
 | **Book** | One work in full: its summary, every tag, statistics, chapters and series, where the file is, and buttons to open it on AO3, check it for updates or delete it. |
-| **History** | Every job, filtered by state, with paging. Tick failed jobs and use **Retry selected**, or **Retry all failed**. |
+| **History** | Every job, filtered by state, with paging. Tick failed jobs and use **Retry selected**, or **Retry all failed**. A failed job that a later job for the same work fixed shows as **Resolved** and links to that job. |
 | **Job** | The title, state, failure reason and a log split by attempt, with **Retry** or **Cancel**. |
 
 Pages update live as jobs change. Everything also works with JavaScript turned off, without

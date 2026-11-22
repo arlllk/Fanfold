@@ -396,6 +396,17 @@ async fn main() {
         log(&repo, flaky, at, LogLevel::Error, &line).await;
     }
     job(&repo, 2002, "", 40, Some(Err((FailureKind::AuthFailed, "Login failed: check the AO3 username and password. (This story is restricted.)\nsecond line of detail that is not shown in the list")))).await;
+    // Failed, then fixed by a later job: resolved, no attention needed.
+    let resolve = "Login failed: check the AO3 username and password.";
+    job(
+        &repo,
+        2003,
+        "The Second Try",
+        300,
+        Some(Err((FailureKind::AuthFailed, resolve))),
+    )
+    .await;
+    job(&repo, 2003, "The Second Try", 60, Some(Ok(()))).await;
     // In progress.
     job(&repo, 3001, "A Study in Unreasonable Doubt, Volume II: The Reckoning of Small Hours and Other Long Titles", 1, None).await;
     job(&repo, 3002, "", 1, None).await;

@@ -436,8 +436,9 @@ fn history_href(filter: JobFilter, page: u32) -> String {
     }
 }
 
+/// Failed or cancelled; a failure a later job already fixed has nothing left to retry.
 const fn is_retryable(job: &Job) -> bool {
-    matches!(job.state, JobState::Failed | JobState::Cancelled)
+    job.needs_attention() || matches!(job.state, JobState::Cancelled)
 }
 
 /// Whether the job can be re-run from scratch, ignoring the stored book.
@@ -610,6 +611,9 @@ pub fn job_content(m: &JobModel) -> Markup {
                 }
                 dl class="facts" {
                     div { dt { "Source" } dd { (source_label(job.source)) } }
+                    @if let Some(by) = job.resolved_by {
+                        div { dt { "Fixed by" } dd { a href=(format!("/jobs/{by}")) { "job #" (by) } } }
+                    }
                     div { dt { "Failed attempts" } dd { (job.attempt) " of " (m.max_attempts) } }
                     @if job.state == JobState::Queued {
                         div { dt { "Next try" } dd { (when(m.now, job.next_attempt_at)) } }

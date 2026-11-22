@@ -114,6 +114,7 @@ pub enum JobFilter {
     Active,
     /// Queued again after a failure: has an error and is waiting for its next attempt.
     Retrying,
+    /// Failed and not resolved: no later job for the same target has succeeded.
     Failed,
     Succeeded,
     /// Succeeded, failed or cancelled.
@@ -156,7 +157,7 @@ impl JobFilter {
             Self::All => true,
             Self::Active => job.state.is_active(),
             Self::Retrying => job.state == S::Queued && job.last_error.is_some(),
-            Self::Failed => job.state == S::Failed,
+            Self::Failed => job.needs_attention(),
             Self::Succeeded => job.state == S::Succeeded,
             Self::Finished => matches!(job.state, S::Succeeded | S::Failed | S::Cancelled),
         }
@@ -172,7 +173,10 @@ pub struct JobCounts {
     /// Queued again after a failure.
     pub retrying: u64,
     pub succeeded: u64,
+    /// Failed and not resolved since.
     pub failed: u64,
+    /// Failed, then fixed by a later job for the same target.
+    pub resolved: u64,
     pub cancelled: u64,
 }
 
@@ -183,7 +187,10 @@ pub struct JobCounts {
 /// * `claim_next` atomically moves exactly one due `Queued` job to `Running`,
 ///   oldest `next_attempt_at` first, and is safe under concurrent callers;
 /// * `save` overwrites a job's mutable fields, and fails with
-///   [`RepoError::Conflict`] if that would leave two active jobs for one target.
+///   [`RepoError::Conflict`] if that would leave two active jobs for one target;
+/// * `resolved_by` belongs to the repository: saving a `Succeeded` job sets it on every
+///   unresolved `Failed` job for the same target, and `save` keeps it only while the job
+///   it is saving stays `Failed` (whatever the given job carries).
 #[cfg_attr(any(test, feature = "mocks"), mockall::automock)]
 #[async_trait]
 pub trait JobRepository: Send + Sync {

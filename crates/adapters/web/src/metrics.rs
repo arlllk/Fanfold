@@ -42,6 +42,7 @@ pub fn render(
         ("running", counts.running),
         ("succeeded", counts.succeeded),
         ("failed", counts.failed),
+        ("resolved", counts.resolved),
         ("cancelled", counts.cancelled),
     ] {
         let _ = writeln!(out, "fanfold_jobs{{state=\"{state}\"}} {n}");
@@ -253,6 +254,7 @@ mod tests {
             retrying: 3,
             succeeded: 40,
             failed: 4,
+            resolved: 5,
             cancelled: 0,
         };
         render(
@@ -271,6 +273,7 @@ mod tests {
             "fanfold_jobs{state=\"queued\"} 2",
             "fanfold_jobs{state=\"retrying\"} 3",
             "fanfold_jobs{state=\"failed\"} 4",
+            "fanfold_jobs{state=\"resolved\"} 5",
             "fanfold_site_degraded 0",
             "fanfold_downloads_total{outcome=\"downloaded\"} 1",
             "fanfold_downloads_total{outcome=\"retry_scheduled\"} 1",

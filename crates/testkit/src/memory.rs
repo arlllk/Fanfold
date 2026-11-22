@@ -331,9 +331,26 @@ impl JobRepository for InMemoryJobs {
                 job.target
             )));
         }
-        state.jobs.insert(job.id, job.clone());
+        let mut saved = job.clone();
+        saved.resolved_by = match (job.state, state.jobs.get(&job.id)) {
+            (JobState::Failed, Some(stored)) => stored.resolved_by,
+            _ => None,
+        };
+        state.jobs.insert(job.id, saved);
+        let mut resolved = Vec::new();
+        if job.state == JobState::Succeeded {
+            for other in state.jobs.values_mut() {
+                if other.target == job.target && other.needs_attention() {
+                    other.resolved_by = Some(job.id);
+                    resolved.push(other.id);
+                }
+            }
+        }
         drop(state);
         self.emit(Event::JobChanged(job.id));
+        for id in resolved {
+            self.emit(Event::JobChanged(id));
+        }
         Ok(())
     }
 
@@ -369,7 +386,8 @@ impl JobRepository for InMemoryJobs {
                 (JobState::Queued, true) => counts.retrying += 1,
                 (JobState::Running, _) => counts.running += 1,
                 (JobState::Succeeded, _) => counts.succeeded += 1,
-                (JobState::Failed, _) => counts.failed += 1,
+                (JobState::Failed, _) if job.needs_attention() => counts.failed += 1,
+                (JobState::Failed, _) => counts.resolved += 1,
                 (JobState::Cancelled, _) => counts.cancelled += 1,
             }
         }
