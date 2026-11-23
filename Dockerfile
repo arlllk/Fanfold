@@ -195,6 +195,8 @@ COPY --from=rust-licenses /out/THIRD-PARTY-LICENSES-RUST.txt /usr/share/doc/fanf
 COPY --from=venv /out/THIRD-PARTY-LICENSES-PYTHON.txt /usr/share/doc/fanfold/
 # The fonts built into the binary for the generated covers.
 COPY crates/adapters/epub/fonts/OFL.txt /usr/share/doc/fanfold/LICENSE-FONTS-NOTO-OFL.txt
+# The scripts built into the binary for the web UI (htmx, Alpine), and Tailwind CSS's in app.css.
+COPY crates/adapters/web/assets/vendor/LICENSES.txt /usr/share/doc/fanfold/THIRD-PARTY-LICENSES-JS.txt
 
 LABEL org.opencontainers.image.licenses="0BSD OR MIT OR Apache-2.0"
 

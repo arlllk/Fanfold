@@ -1,0 +1,42 @@
+# The web UI's third-party files, self-hosted (no CDN). See scripts/vendor.py.
+#
+# Change only the `version` lines (Renovate does, see renovate.json), then run
+# `just vendor` (the vendor-sync workflow does it on Renovate's branches): it downloads
+# those versions and fills in every hash below. `just vendor-check` (CI) verifies the files.
+
+[[npm]]
+package = "htmx.org"
+version = "4.0.2"
+integrity = "sha512-rt+yUQwgQXLhpMZQZmT97vP9wiThqfTyxsPy60WntlQHKyS0o4uBCbcdNWOTh6n5LCCPuI8WYSQedP1K7xaQlQ=="
+files = [
+    { from = "dist/htmx.min.js", to = "htmx.min.js", sha256 = "fd25ba3fe5e44768756f23862a6daa4f928192199a121e825e882e719bc8aabd" },
+    { from = "dist/ext/hx-sse.min.js", to = "hx-sse.min.js", sha256 = "650d88a96a017a50ca0e16ffcf8663ca9ebd12a7e2e73ab22086540e5924ce5f" },
+    { from = "dist/ext/hx-alpine-compat.min.js", to = "hx-alpine-compat.min.js", sha256 = "d2047ba85b277df33b44a890a470213246d0e8f7458ffa766e77c7347551767e" },
+]
+
+[[npm]]
+package = "@alpinejs/csp"
+version = "3.17.5"
+integrity = "sha512-7e5lYgzJJL2eZ7esnx+E7wtxws+VDs9em9ztttZ+AQAYEng2bABHFp2SUga0wt84RyfL7hc6B+S/RGglXsPf6w=="
+files = [
+    { from = "dist/cdn.min.js", to = "alpine-csp.min.js", sha256 = "48c170c92032e527cbae71b8ce75cf1f96ca06fa869a6120ef0fe438d8e92c36" },
+]
+
+[[npm]]
+package = "@fontsource-variable/literata"
+version = "5.3.0"
+integrity = "sha512-1Jw7xvOcoGyB83lxB2nG4bfNbqtX2/TTbdh9sHAOmU064SvmSdulDtA5RBu5JYWf64fdaKX7xU+z3GO1T2bCHA=="
+files = [
+    { from = "files/literata-latin-wght-normal.woff2", to = "literata-latin.woff2", sha256 = "9adbeac5b167fe5ad6c49d9e29aa0c76e2f1bb3b46bf4ebf12a9eca7d3525384" },
+    { from = "files/literata-latin-wght-italic.woff2", to = "literata-latin-italic.woff2", sha256 = "ab198d6616c7cc966f26a4a5b28a3977dc47439640f09d9b3361226bd465c404" },
+]
+
+[[tool]]
+name = "tailwindcss"
+repository = "tailwindlabs/tailwindcss"
+version = "4.3.5"
+assets = [
+    { platform = "linux-x64", file = "tailwindcss-linux-x64", sha256 = "e47695cee3f0d90623a91f3939b08bdee610eb5ad99340adff9d4145b284d6cc" },
+    { platform = "linux-arm64", file = "tailwindcss-linux-arm64", sha256 = "ffcd0d21dbd7c605dc12743ff0c0b47debc963c86b399674084c1c8f2c96ecad" },
+    { platform = "macos-arm64", file = "tailwindcss-macos-arm64", sha256 = "f3f4f5d1727e2b693b8f1c9a1492b5dd87008c86ea286bee1589cb458e6235fc" },
+]

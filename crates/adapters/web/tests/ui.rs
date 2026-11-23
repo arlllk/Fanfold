@@ -75,6 +75,10 @@ fn rig_with_page_size(page_size: u32) -> Rig {
         catalog: jobs.clone(),
         metadata: jobs.clone(),
         listing: jobs.clone(),
+        browser: Arc::new(fanfold_app::browse::LibraryBrowser::new(
+            jobs.clone(),
+            Arc::new(fanfold_adapter_search::TantivyIndexer),
+        )),
         admin: Arc::new(JobAdmin::new(jobs.clone(), clock.clone())),
         library: Arc::new(fanfold_app::library::LibraryAdmin::new(
             jobs.clone(),
@@ -275,11 +279,11 @@ async fn the_page_is_usable_on_a_phone() {
     assert!(body.contains(r#"<html lang="en""#));
     let css = get(&rig.ui, "/static/app.css").await.body;
     for needle in [
-        "min-height: 44px",
-        "env(safe-area-inset-bottom)",
+        "min-height:44px",             // fingers, on touch screens
+        "env(safe-area-inset-bottom)", // the home bar
         "prefers-reduced-motion",
-        "prefers-color-scheme: dark",
-        "font-size: 1rem; /* 16px",
+        "prefers-color-scheme:dark",
+        "font-size:16px", // iOS zooms into smaller inputs
     ] {
         assert!(css.contains(needle), "css lacks {needle:?}");
     }
@@ -322,12 +326,23 @@ async fn pages_contain_nothing_the_csp_would_block() {
             "{path}"
         );
         assert!(!body.contains("javascript:"), "{path}");
+        let scripts: Vec<&str> = body.split("<script").skip(1).collect();
         assert_eq!(
-            body.matches("<script").count(),
-            1,
-            "{path}: only the external script"
+            scripts.len(),
+            5,
+            "{path}: htmx, two extensions, ours, Alpine"
         );
+        for script in scripts {
+            assert!(
+                script.starts_with(r#" src="/static/"#) && script.contains("defer></script>"),
+                "{path}: only external scripts from here: {script:.60}"
+            );
+        }
         assert!(body.contains(r#"<script src="/static/app.js" defer></script>"#));
+        assert!(
+            !body.contains("hx-on"),
+            "{path}: htmx handlers would need eval"
+        );
     }
 }
 
@@ -400,7 +415,7 @@ async fn the_shelf_shows_finished_jobs_oldest_first_with_accessible_labels() {
     }
     let body = get(&rig.ui, "/").await.body;
     let shelf = body
-        .split(r#"class="shelf""#)
+        .split(r#"class="shelf fanfold""#)
         .nth(1)
         .unwrap()
         .split("</ul>")
@@ -419,13 +434,13 @@ async fn the_shelf_shows_finished_jobs_oldest_first_with_accessible_labels() {
 #[tokio::test]
 async fn the_site_pill_reflects_the_breaker() {
     let rig = rig();
-    assert!(get(&rig.ui, "/").await.body.contains(r#"class="pill ok""#));
+    assert!(get(&rig.ui, "/").await.body.contains(r#"tone-ok pill ok""#));
     *rig.site.0.lock().unwrap() = SiteStatus::Degraded {
         retry_at: fanfold_domain::timestamp::add(rig.clock.now(), Duration::from_secs(240)),
     };
     let body = get(&rig.ui, "/").await.body;
     assert!(
-        body.contains(r#"class="pill bad""#)
+        body.contains(r#"tone-err pill bad""#)
             && body.contains("AO3 is having trouble. Trying again in 4 min"),
         "{body}"
     );
@@ -437,7 +452,7 @@ async fn the_site_pill_reflects_the_breaker() {
 async fn fragments_are_just_the_live_region() {
     let rig = rig();
     rig.queue(1).await;
-    let reply = send(&rig.ui, Method::GET, "/", &[("x-fragment", "1")], "").await;
+    let reply = send(&rig.ui, Method::GET, "/", &[("hx-request", "true")], "").await;
     assert_eq!(reply.status, StatusCode::OK);
     assert!(!reply.body.contains("<html") && !reply.body.contains("<head"));
     assert!(reply.body.contains("pill") && reply.body.contains("Needs attention"));
@@ -509,9 +524,9 @@ async fn history_filters_and_pages() {
     // Newest first: 5, 4 | 3, 2 | 1
     let page1 = get(&rig.ui, "/jobs").await.body;
     assert!(page1.contains("Work #5") && page1.contains("Work #4") && !page1.contains("Work #3"));
-    assert!(page1.contains("Older →") && !page1.contains("← Newer"));
+    assert!(page1.contains("Next →") && !page1.contains("← Previous"));
     let page3 = get(&rig.ui, "/jobs?page=3").await.body;
-    assert!(page3.contains("Work #1") && page3.contains("← Newer") && !page3.contains("Older →"));
+    assert!(page3.contains("Work #1") && page3.contains("← Previous") && !page3.contains("Next →"));
 
     let failed = get(&rig.ui, "/jobs?filter=failed").await.body;
     assert!(
@@ -1012,7 +1027,14 @@ async fn the_event_stream_announces_changes() {
             seen.push_str(&String::from_utf8_lossy(&data));
         }
     }
-    assert!(seen.contains("event: change"), "{seen}");
+    assert!(
+        seen.contains("event: refresh"),
+        "every page refreshes: {seen}"
+    );
+    assert!(
+        seen.contains(&format!("event: job-{}", job.id)),
+        "and the job's own page: {seen}"
+    );
 }
 
 #[tokio::test]
@@ -1159,7 +1181,7 @@ async fn the_pill_comes_first_and_updates_travel_with_a_marker() {
     let rig = rig();
     let page = get(&rig.ui, "/").await.body;
     let (pill, form, live) = (
-        page.find("data-pill").unwrap(),
+        page.find(r#"id="site""#).unwrap(),
         page.find("Add a work").unwrap(),
         page.find(r#"id="live""#).unwrap(),
     );
@@ -1168,16 +1190,16 @@ async fn the_pill_comes_first_and_updates_travel_with_a_marker() {
         "status first, then the form, then the live content"
     );
     assert_eq!(
-        page.matches("data-pill").count(),
+        page.matches(r#"id="site""#).count(),
         1,
         "the full page has exactly one pill"
     );
-    let fragment = send(&rig.ui, Method::GET, "/", &[("x-fragment", "1")], "")
+    let fragment = send(&rig.ui, Method::GET, "/", &[("hx-request", "true")], "")
         .await
         .body;
     assert!(
-        fragment.starts_with("<div id=\"site\" data-pill"),
-        "the script moves this into place"
+        fragment.contains(r##"<hx-partial hx-target="#site" hx-swap="outerHTML"><div id="site""##),
+        "htmx moves the pill into place: {fragment}"
     );
 }
 
@@ -1232,18 +1254,19 @@ async fn every_page_has_working_navigation_and_relative_times() {
     for (path, current) in [("/", "Dashboard"), ("/jobs", "History")] {
         let body = get(&rig.ui, path).await.body;
         assert!(
-            body.contains(r#"<a href="/">Dashboard</a>"#)
-                || body.contains(r#"href="/" aria-current="page">Dashboard"#),
+            body.contains(r#"<a href="/" "#) && body.contains(">Dashboard</a>"),
             "{path}"
         );
         assert!(
             body.contains(r#"href="/jobs""#) && body.contains("History"),
             "{path}"
         );
-        assert!(
-            body.contains(&format!(r#"aria-current="page">{current}</a>"#)),
-            "{path}: marks where you are"
-        );
+        let marked = body.split(r#"aria-current="page""#).skip(1).any(|after| {
+            after
+                .split_once("</a>")
+                .is_some_and(|(link, _)| link.ends_with(&format!(">{current}")))
+        });
+        assert!(marked, "{path}: marks where you are");
         assert!(
             body.contains(r#"<time datetime=""#),
             "{path}: times are real <time> elements"
@@ -1260,11 +1283,15 @@ async fn history_and_job_pages_refresh_as_fragments_too() {
     let job = rig.queue(5).await;
     rig.titled(5, "Live Story").await;
     for path in ["/jobs".to_owned(), format!("/jobs/{}", job.id)] {
-        let fragment = send(&rig.ui, Method::GET, &path, &[("x-fragment", "1")], "").await;
+        let fragment = send(&rig.ui, Method::GET, &path, &[("hx-request", "true")], "").await;
         assert_eq!(fragment.status, StatusCode::OK, "{path}");
         assert!(!fragment.body.contains("<html"), "{path}: no page chrome");
         assert!(
-            fragment.body.starts_with("<div id=\"site\" data-pill"),
+            fragment.body.starts_with(r#"<div id="live" hx-get=""#),
+            "{path}: the live region, which refreshes from the same URL"
+        );
+        assert!(
+            fragment.body.contains(r##"<hx-partial hx-target="#site""##),
             "{path}: the pill travels with it"
         );
         assert!(
@@ -1272,7 +1299,7 @@ async fn history_and_job_pages_refresh_as_fragments_too() {
             "{path}: and the content: {}",
             fragment.body
         );
-        assert_eq!(fragment.headers[header::VARY], "x-fragment");
+        assert_eq!(fragment.headers[header::VARY], "hx-request");
     }
 }
 
@@ -1300,7 +1327,7 @@ async fn filter_chips_show_the_right_counts() {
     }
     let body = get(&rig.ui, "/jobs").await.body;
     for (label, count) in [("Active", 9), ("Retrying", 4), ("Failed", 1), ("Done", 5)] {
-        let chip = format!(r#"{label} <span class="mono">{count}</span>"#);
+        let chip = format!(r#"{label} <span class="mono tabular-nums opacity-70">{count}</span>"#);
         assert!(body.contains(&chip), "expected {chip:?} in the filters");
     }
 }
@@ -1333,10 +1360,10 @@ async fn the_last_page_is_recognised_even_when_it_is_exactly_full() {
     }
     let second = get(&rig.ui, "/jobs?page=2").await.body;
     assert!(
-        second.contains("← Newer") && !second.contains("Older →"),
+        second.contains("← Previous") && !second.contains("Next →"),
         "4 jobs at 2 per page end on page 2"
     );
-    assert!(get(&rig.ui, "/jobs").await.body.contains("Older →"));
+    assert!(get(&rig.ui, "/jobs").await.body.contains("Next →"));
 }
 
 #[tokio::test]
@@ -1397,30 +1424,56 @@ async fn apostrophes_cannot_break_out_of_attributes() {
 // ------------------------------------------------------- phone and desktop layouts
 
 #[tokio::test]
-async fn the_stylesheet_has_a_wide_screen_layout_as_well_as_the_phone_one() {
+async fn every_responsive_or_arbitrary_class_the_pages_use_is_in_the_stylesheet() {
     let rig = rig();
+    let job = rig.queue(1).await;
+    rig.log(job.id, LogLevel::Info, "starting attempt 1").await;
+    rig.observed(2, |_| {}).await;
     let css = get(&rig.ui, "/static/app.css").await.body;
-    let wide = css
-        .split("@media (min-width: 900px)")
-        .nth(1)
-        .expect("a desktop section");
-    for needle in [
-        ".board { display: grid",             // work queue beside the history
-        "grid-template-columns: var(--cols)", // history as a table
-        ".jobgrid { display: grid",           // facts beside the log
-        "position: sticky",                   // the facts stay put while the log scrolls
-        ".bar { flex-direction: row-reverse", // form and status share a row
+    // How Tailwind writes a class as a selector: every character outside [A-Za-z0-9_-]
+    // escaped with a backslash.
+    let selector = |class: &str| {
+        let mut out = String::from(".");
+        for c in class.chars() {
+            if !(c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out
+    };
+    let mut checked = 0;
+    for path in [
+        "/",
+        "/jobs",
+        &format!("/jobs/{}", job.id),
+        "/library",
+        "/library/2",
+        "/library/series",
+        "/library/authors",
     ] {
-        assert!(wide.contains(needle), "desktop rules lack {needle:?}");
+        let body = get(&rig.ui, path).await.body;
+        for attr in body.split(r#"class=""#).skip(1) {
+            let classes = attr.split('"').next().unwrap().replace("&amp;", "&");
+            for class in classes
+                .split_whitespace()
+                .filter(|c| c.contains(':') || c.contains('[') || c.contains('/'))
+            {
+                assert!(
+                    css.contains(&selector(class)),
+                    "{path}: {class} is not in app.css (run `just css`)"
+                );
+                checked += 1;
+            }
+        }
     }
     assert!(
-        css.contains("@media (min-width: 1280px)"),
-        "and room to breathe on large screens"
+        checked > 50,
+        "wide-screen and arbitrary classes are in use: {checked}"
     );
-    // The phone rules still come first and stand alone.
     assert!(
-        css.find(".cells { display: flex").unwrap()
-            < css.find("@media (min-width: 900px)").unwrap()
+        css.contains("@media (min-width:64rem)"),
+        "the wide-screen layout"
     );
 }
 
@@ -1433,8 +1486,8 @@ async fn the_dashboard_markup_lets_the_queue_sit_beside_the_history() {
     let done = rig.queue(3).await;
     rig.succeed(done.id).await;
     let body = get(&rig.ui, "/").await.body;
-    let main = body.find(r#"class="board-main""#).expect("main column");
-    let side = body.find(r#"class="board-side""#).expect("side column");
+    let main = body.find(r#"class="board-main"#).expect("main column");
+    let side = body.find(r#"class="board-side"#).expect("side column");
     let (attention, progress, recent) = (
         body.find("Needs attention").unwrap(),
         body.find("In progress").unwrap(),
@@ -1457,22 +1510,22 @@ async fn history_rows_are_cells_that_can_line_up_as_a_table() {
     let body = get(&rig.ui, "/jobs").await.body;
 
     assert!(
-        body.contains(r#"class="thead" aria-hidden="true""#),
+        body.contains(r#"aria-hidden="true"><span></span><span>Status</span>"#),
         "column headers, hidden from screen readers"
     );
-    for label in ["Status", "Work", "ID", "Tries", "Updated", "Last error"] {
+    for label in ["Status", "Work", "ID", "Tries", "Updated"] {
         assert!(
             body.contains(&format!("<span>{label}</span>")),
             "header {label}"
         );
     }
     assert_eq!(
-        body.matches(r#"class="body cells""#).count(),
+        body.matches(r#"class="c-status""#).count(),
         3,
         "every row uses the same cells"
     );
-    assert_eq!(body.matches(r#"class="c-status""#).count(), 3);
-    assert_eq!(body.matches(r#"class="c-title""#).count(), 3);
+    assert_eq!(body.matches(r#"class="c-title "#).count(), 3);
+    assert_eq!(body.matches(r#"class="c-when "#).count(), 3);
     // Rows that cannot be selected keep the column aligned with a spacer. It must not
     // reuse the empty-state class, which draws a dashed box.
     assert_eq!(body.matches("pick-spacer").count(), 2);
@@ -1486,8 +1539,8 @@ async fn the_job_page_markup_puts_the_facts_beside_the_log() {
     rig.log(job.id, LogLevel::Info, "starting attempt 1").await;
     let body = get(&rig.ui, &format!("/jobs/{}", job.id)).await.body;
     let (grid, side, log) = (
-        body.find(r#"class="jobgrid""#).unwrap(),
-        body.find(r#"class="jobside""#).unwrap(),
+        body.find(r#"class="jobgrid"#).unwrap(),
+        body.find(r#"class="jobside"#).unwrap(),
         body.find(r#"role="log""#).unwrap(),
     );
     assert!(grid < side && side < log);
@@ -1573,8 +1626,8 @@ async fn the_library_lists_every_book_with_what_ao3_said() {
     assert!(complete.contains("Alpha Light") && !complete.contains("Beta Tide"));
     assert!(complete.contains("1 of 3 books"));
     assert!(
-        complete.contains(r#"name="status" value="complete""#),
-        "searching keeps the filter"
+        complete.contains(r#"value="is:complete""#),
+        "an old link's filter becomes part of the search, so searching keeps it"
     );
 
     let search = get(&rig.ui, "/library?q=beta").await.body;
@@ -1599,11 +1652,24 @@ async fn the_library_lists_every_book_with_what_ao3_said() {
         "unknown parameters fall back to the defaults"
     );
 
-    let fragment = send(&rig.ui, Method::GET, "/library", &[("x-fragment", "1")], "").await;
+    let fragment = send(
+        &rig.ui,
+        Method::GET,
+        "/library",
+        &[("hx-request", "true")],
+        "",
+    )
+    .await;
     assert!(!fragment.body.contains("<html") && fragment.body.contains("Alpha Light"));
     assert!(
-        fragment.body.contains("data-pill"),
+        fragment.body.contains(r##"<hx-partial hx-target="#site""##),
         "a live update carries the site pill"
+    );
+    assert!(
+        fragment
+            .body
+            .contains(r##"<hx-partial hx-target="#suggest""##),
+        "and the search's suggestions"
     );
 }
 
@@ -1634,7 +1700,7 @@ async fn a_book_page_shows_everything_and_never_trusts_the_summary() {
     assert_eq!(page.status, StatusCode::OK);
     for needle in [
         "The Keeper and the Logbook",
-        "by quillandink",
+        ">quillandink</a>",
         "Ada Marsh/Ben Ward",
         "Enemies to Lovers",
         "1. First Light",

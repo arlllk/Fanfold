@@ -54,7 +54,7 @@ pub async fn csrf_guard(request: Request, next: Next) -> Response {
 }
 
 /// Content-Security-Policy: everything comes from this origin, nothing inline.
-pub const CSP: &str = "default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self'; \
+pub const CSP: &str = "default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self'; font-src 'self'; \
                        connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
 pub async fn security_headers(request: Request, next: Next) -> Response {

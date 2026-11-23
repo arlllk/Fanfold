@@ -1,0 +1,26 @@
+[package]
+name = "fanfold-adapter-search"
+description = "LibraryIndex adapter: the library's books in an in-memory tantivy index."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+fanfold-app = { workspace = true }
+fanfold-domain = { workspace = true }
+async-trait = { workspace = true }
+tantivy = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+fanfold-testkit = { workspace = true }
+serde_json = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

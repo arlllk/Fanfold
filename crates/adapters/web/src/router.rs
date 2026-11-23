@@ -4,8 +4,9 @@
 //! gateway's login, and **ops** (`/healthz`, `/readyz`, `/metrics`), which Kubernetes
 //! and Prometheus reach directly on a separate port.
 //!
-//! Pages are rendered completely on the server. Live updates re-request the same URL
-//! with `X-Fragment: 1` and swap in the returned body, so there is one rendering path.
+//! Pages are rendered completely on the server. htmx re-requests the same URL (a live
+//! update, a search as you type) with `HX-Request: true` and gets only the page's live
+//! region back, so there is one rendering path.
 
 // Problem documents are only built on error paths, so the size of an `Err` is
 // irrelevant to throughput; boxing them would only add noise to every handler.
@@ -17,7 +18,7 @@ use axum::{
     Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, RawQuery, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     middleware,
     response::{
         IntoResponse, Redirect, Response,
@@ -27,10 +28,12 @@ use axum::{
 };
 use fanfold_app::{
     admin::{AdminError, JobAdmin},
+    browse::{BrowseError, GroupKind, LibraryBrowser, LibrarySort},
     ports::{
         BookCatalog, Clock, Event, EventSource, JobFilter, JobRepository, LibraryCatalog,
-        LibraryQuery, LibrarySort, LibraryStatus, MetadataStore, Readiness, SiteStatusSource,
+        MetadataStore, Readiness, SiteStatusSource,
     },
+    search::{Clause, Flag, SearchQuery, Token},
     stats::{MailStats, WorkerStats},
 };
 use fanfold_domain::{
@@ -47,7 +50,10 @@ use crate::{
     forms, metrics,
     problem::ProblemDetails,
     security::{csrf_guard, security_headers},
-    views::{self, DashboardModel, HistoryModel, JobModel, JobRow, Notice},
+    views::{
+        self, DashboardModel, HistoryModel, JobModel, JobRow, Notice,
+        library::{self, BooksModel, GroupsModel, LibraryFrame, SeriesListModel, Tab},
+    },
 };
 
 /// Largest request body any route accepts.
@@ -66,8 +72,10 @@ pub struct WebDeps {
     pub admin: Arc<JobAdmin>,
     /// The delete buttons.
     pub library: Arc<fanfold_app::library::LibraryAdmin>,
-    /// The library page: every book with its metadata.
+    /// One book's page.
     pub listing: Arc<dyn LibraryCatalog>,
+    /// The library pages: search, series, authors, fandoms.
+    pub browser: Arc<LibraryBrowser>,
     pub events: Arc<dyn EventSource>,
     pub site: Arc<dyn SiteStatusSource>,
     pub clock: Arc<dyn Clock>,
@@ -108,7 +116,7 @@ fn html_response(status: StatusCode, markup: &Markup) -> Response {
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.insert(header::VARY, HeaderValue::from_static("x-fragment"));
+    headers.insert(header::VARY, HeaderValue::from_static("hx-request"));
     response
 }
 
@@ -129,16 +137,27 @@ fn problem_response(headers: &HeaderMap, problem: ProblemDetails) -> Response {
     }
 }
 
+/// Whether htmx asked (a live update, a search as you type): it gets the live region only.
 fn is_fragment(headers: &HeaderMap) -> bool {
-    headers.contains_key("x-fragment")
+    headers
+        .get("hx-request")
+        .is_some_and(|v| v.as_bytes() == b"true")
+        && !headers.contains_key("hx-history-restore-request")
 }
 
-/// A full page, or just the live region when asked for a fragment.
-fn page_or_fragment(headers: &HeaderMap, page: &Markup, fragment: &Markup) -> Response {
-    html_response(
-        StatusCode::OK,
-        if is_fragment(headers) { fragment } else { page },
-    )
+/// A full page, or just its live region when htmx asks.
+fn respond(headers: &HeaderMap, screen: &views::Screen<'_>, notice: Option<Notice>) -> Response {
+    if is_fragment(headers) {
+        html_response(StatusCode::OK, &views::fragment(screen))
+    } else {
+        html_response(StatusCode::OK, &views::full_page(screen, notice))
+    }
+}
+
+/// The path and query a page was asked for: what its live region refreshes from.
+fn page_url(uri: &Uri) -> String {
+    uri.path_and_query()
+        .map_or_else(|| uri.path().to_owned(), ToString::to_string)
 }
 
 fn parse_job_id(raw: &str) -> Result<JobId, ProblemDetails> {
@@ -201,9 +220,10 @@ fn query_pairs(raw: Option<String>) -> Vec<(String, String)> {
 async fn dashboard(
     State(deps): State<Deps>,
     headers: HeaderMap,
+    uri: Uri,
     RawQuery(query): RawQuery,
 ) -> Response {
-    match dashboard_inner(&deps, &headers, query).await {
+    match dashboard_inner(&deps, &headers, &page_url(&uri), query).await {
         Ok(response) => response,
         Err(problem) => problem_response(&headers, problem),
     }
@@ -212,6 +232,7 @@ async fn dashboard(
 async fn dashboard_inner(
     deps: &WebDeps,
     headers: &HeaderMap,
+    url: &str,
     query: Option<String>,
 ) -> Result<Response, ProblemDetails> {
     let now = deps.clock.now();
@@ -250,19 +271,20 @@ async fn dashboard_inner(
         shelf: rows(deps, finished).await?,
     };
     let notice = Notice::from_query(&query_pairs(query));
-    Ok(page_or_fragment(
+    Ok(respond(
         headers,
-        &views::dashboard_page(&model, notice),
-        &views::dashboard(&model),
+        &views::dashboard_screen(&model, url),
+        notice,
     ))
 }
 
 async fn history(
     State(deps): State<Deps>,
     headers: HeaderMap,
+    uri: Uri,
     RawQuery(query): RawQuery,
 ) -> Response {
-    match history_inner(&deps, &headers, query).await {
+    match history_inner(&deps, &headers, &page_url(&uri), query).await {
         Ok(response) => response,
         Err(problem) => problem_response(&headers, problem),
     }
@@ -271,6 +293,7 @@ async fn history(
 async fn history_inner(
     deps: &WebDeps,
     headers: &HeaderMap,
+    url: &str,
     query: Option<String>,
 ) -> Result<Response, ProblemDetails> {
     let pairs = query_pairs(query);
@@ -302,78 +325,201 @@ async fn history_inner(
         has_next,
     };
     let notice = Notice::from_query(&pairs);
-    Ok(page_or_fragment(
+    Ok(respond(
         headers,
-        &views::history_page(&model, notice),
-        &views::history(&model),
+        &views::history_screen(&model, url),
+        notice,
     ))
 }
 
 async fn library_page(
     State(deps): State<Deps>,
     headers: HeaderMap,
+    uri: Uri,
     RawQuery(query): RawQuery,
 ) -> Response {
-    match library_inner(&deps, &headers, query).await {
+    let url = page_url(&uri);
+    match library_inner(&deps, &headers, Tab::Books, &url, query).await {
         Ok(response) => response,
         Err(problem) => problem_response(&headers, problem),
     }
 }
 
-/// Longest search accepted; anything longer is cut (nobody types a 200-character title).
-const MAX_SEARCH_CHARS: usize = 200;
+async fn library_series_page(
+    State(deps): State<Deps>,
+    headers: HeaderMap,
+    uri: Uri,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let url = page_url(&uri);
+    match library_inner(&deps, &headers, Tab::Series, &url, query).await {
+        Ok(response) => response,
+        Err(problem) => problem_response(&headers, problem),
+    }
+}
+
+async fn library_authors_page(
+    State(deps): State<Deps>,
+    headers: HeaderMap,
+    uri: Uri,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let url = page_url(&uri);
+    match library_inner(&deps, &headers, Tab::Authors, &url, query).await {
+        Ok(response) => response,
+        Err(problem) => problem_response(&headers, problem),
+    }
+}
+
+async fn library_fandoms_page(
+    State(deps): State<Deps>,
+    headers: HeaderMap,
+    uri: Uri,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let url = page_url(&uri);
+    match library_inner(&deps, &headers, Tab::Fandoms, &url, query).await {
+        Ok(response) => response,
+        Err(problem) => problem_response(&headers, problem),
+    }
+}
+
+/// Longest search accepted; anything longer is cut (nobody types a 500-character search).
+const MAX_SEARCH_CHARS: usize = 500;
+
+fn browse_problem(error: &BrowseError) -> ProblemDetails {
+    internal(error)
+}
+
+/// The search in a library URL: `q`, plus the completion filter of older links (`status`).
+fn library_query(pairs: &[(String, String)]) -> SearchQuery {
+    let text: String = forms::first(pairs, "q")
+        .unwrap_or("")
+        .chars()
+        .take(MAX_SEARCH_CHARS)
+        .collect();
+    let query = SearchQuery::parse(&text);
+    let legacy = match forms::first(pairs, "status") {
+        Some("complete") => Some(Flag::Complete),
+        Some("in_progress") => Some(Flag::InProgress),
+        _ => None,
+    };
+    match legacy {
+        Some(flag) => query.with(Token::new(Clause::Is(flag)), |_| false),
+        None => query,
+    }
+}
 
 async fn library_inner(
     deps: &WebDeps,
     headers: &HeaderMap,
+    tab: Tab,
+    url: &str,
     query: Option<String>,
 ) -> Result<Response, ProblemDetails> {
     let pairs = query_pairs(query);
-    let page = forms::first(&pairs, "page")
-        .and_then(|p| p.parse::<u32>().ok())
-        .filter(|p| *p >= 1)
-        .unwrap_or(1);
-    let size = deps.page_size.max(1);
-    let library_query = LibraryQuery {
-        search: forms::first(&pairs, "q")
-            .map(|q| q.trim().chars().take(MAX_SEARCH_CHARS).collect::<String>())
-            .filter(|q| !q.is_empty()),
-        status: forms::first(&pairs, "status")
-            .and_then(LibraryStatus::parse)
-            .unwrap_or_default(),
-        sort: forms::first(&pairs, "sort")
-            .and_then(LibrarySort::parse)
-            .unwrap_or_default(),
-        limit: size,
-        offset: (page - 1).saturating_mul(size),
-    };
-    let result = deps
-        .listing
-        .library(&library_query)
-        .await
-        .map_err(|e| internal(&e))?;
-    let model = views::library::LibraryModel {
+    let search = library_query(&pairs);
+    let browser = &deps.browser;
+    let fail = |e: BrowseError| browse_problem(&e);
+    let frame = LibraryFrame {
         now: deps.clock.now(),
         site: deps.site.site_status(),
-        query: library_query,
-        page,
-        result,
+        tab,
+        totals: browser.totals().await.map_err(fail)?,
+        suggestions: browser.suggest(&search).await.map_err(fail)?,
+        query: search,
     };
     let notice = Notice::from_query(&pairs);
-    Ok(page_or_fragment(
-        headers,
-        &views::library::library_page(&model, notice),
-        &views::library::library(&model),
-    ))
+    let response = match tab {
+        Tab::Books => {
+            let page = forms::first(&pairs, "page")
+                .and_then(|p| p.parse::<u32>().ok())
+                .filter(|p| *p >= 1)
+                .unwrap_or(1);
+            let size = deps.page_size.max(1);
+            let offset = (page - 1).saturating_mul(size);
+            let sort = forms::first(&pairs, "sort").and_then(LibrarySort::parse);
+            let result = browser
+                .books(&frame.query, sort, offset, size)
+                .await
+                .map_err(fail)?;
+            let model = BooksModel {
+                frame,
+                sort,
+                page,
+                offset,
+                result,
+            };
+            respond(headers, &library::books_screen(&model, url), notice)
+        }
+        Tab::Series => {
+            let series = browser.series(&frame.query).await.map_err(fail)?;
+            let model = SeriesListModel { frame, series };
+            respond(headers, &library::series_list_screen(&model, url), notice)
+        }
+        Tab::Authors | Tab::Fandoms => {
+            let kind = if tab == Tab::Authors {
+                GroupKind::Author
+            } else {
+                GroupKind::Fandom
+            };
+            let groups = browser.groups(kind, &frame.query).await.map_err(fail)?;
+            let model = GroupsModel {
+                frame,
+                kind,
+                groups,
+            };
+            respond(headers, &library::groups_screen(&model, url), notice)
+        }
+    };
+    Ok(response)
+}
+
+async fn series_page(
+    State(deps): State<Deps>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(raw): Path<String>,
+) -> Response {
+    let url = page_url(&uri);
+    let result = async {
+        let id = parse_ao3_id(&raw)
+            .and_then(SeriesId::new)
+            .ok_or_else(|| invalid_id("series"))?;
+        let series = deps
+            .browser
+            .one_series(id)
+            .await
+            .map_err(|e| browse_problem(&e))?
+            .ok_or_else(|| {
+                ProblemDetails::about_blank(StatusCode::NOT_FOUND).with_detail(
+                    "No book in your library belongs to that series, and it is not followed.",
+                )
+            })?;
+        let model = library::SeriesModel {
+            now: deps.clock.now(),
+            site: deps.site.site_status(),
+            series,
+        };
+        Ok::<_, ProblemDetails>(respond(
+            &headers,
+            &library::series_screen(&model, &url),
+            None,
+        ))
+    }
+    .await;
+    result.unwrap_or_else(|problem| problem_response(&headers, problem))
 }
 
 async fn book_page(
     State(deps): State<Deps>,
     headers: HeaderMap,
+    uri: Uri,
     Path(raw): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Response {
-    match book_inner(&deps, &headers, &raw, query).await {
+    let url = page_url(&uri);
+    match book_inner(&deps, &headers, &url, &raw, query).await {
         Ok(response) => response,
         Err(problem) => problem_response(&headers, problem),
     }
@@ -382,6 +528,7 @@ async fn book_page(
 async fn book_inner(
     deps: &WebDeps,
     headers: &HeaderMap,
+    url: &str,
     raw: &str,
     query: Option<String>,
 ) -> Result<Response, ProblemDetails> {
@@ -402,27 +549,24 @@ async fn book_inner(
         .work_state(work)
         .await
         .map_err(|e| internal(&e))?;
-    let model = views::library::BookModel {
+    let model = library::BookModel {
         now: deps.clock.now(),
         site: deps.site.site_status(),
         entry,
         state,
     };
     let notice = Notice::from_query(&query_pairs(query));
-    Ok(page_or_fragment(
-        headers,
-        &views::library::book_page(&model, notice),
-        &views::library::book(&model),
-    ))
+    Ok(respond(headers, &library::book_screen(&model, url), notice))
 }
 
 async fn job_page(
     State(deps): State<Deps>,
     headers: HeaderMap,
+    uri: Uri,
     Path(id): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Response {
-    match job_inner(&deps, &headers, &id, query).await {
+    match job_inner(&deps, &headers, &page_url(&uri), &id, query).await {
         Ok(response) => response,
         Err(problem) => problem_response(&headers, problem),
     }
@@ -431,6 +575,7 @@ async fn job_page(
 async fn job_inner(
     deps: &WebDeps,
     headers: &HeaderMap,
+    url: &str,
     raw_id: &str,
     query: Option<String>,
 ) -> Result<Response, ProblemDetails> {
@@ -464,10 +609,11 @@ async fn job_inner(
         max_attempts: deps.max_attempts,
     };
     let notice = Notice::from_query(&query_pairs(query));
-    Ok(page_or_fragment(
+    let name = model.row.name();
+    Ok(respond(
         headers,
-        &views::job_page(&model, notice),
-        &views::job_detail(&model),
+        &views::job_screen(&model, &name, url),
+        notice,
     ))
 }
 
@@ -645,14 +791,26 @@ async fn retry_failed(State(deps): State<Deps>, headers: HeaderMap) -> Response 
 
 // -------------------------------------------------------------------- events
 
-fn sse_data(
+/// The SSE messages one change becomes. Named, so pages listen without filtering in script:
+/// every page refreshes on `refresh`, a job's page only on `job-<id>`, all of them on
+/// `resync` (a slow reader skipped events, or the source reconnected).
+fn sse_events(
     event: &Result<Event, tokio_stream::wrappers::errors::BroadcastStreamRecvError>,
-) -> String {
+) -> Vec<SseEvent> {
     match event {
-        Ok(Event::JobChanged(id)) => format!("job {id}"),
-        Ok(Event::LogAppended(id)) => format!("log {id}"),
-        // A slow reader skipped events, or the source reconnected: refetch everything.
-        Ok(Event::Resync) | Err(_) => "resync".to_owned(),
+        Ok(Event::JobChanged(id)) => vec![
+            SseEvent::default()
+                .event("refresh")
+                .data(format!("job {id}")),
+            SseEvent::default().event(format!("job-{id}")).data("job"),
+        ],
+        Ok(Event::LogAppended(id)) => vec![
+            SseEvent::default()
+                .event("refresh")
+                .data(format!("log {id}")),
+            SseEvent::default().event(format!("job-{id}")).data("log"),
+        ],
+        Ok(Event::Resync) | Err(_) => vec![SseEvent::default().event("resync").data("resync")],
     }
 }
 
@@ -665,16 +823,17 @@ enum Tick {
 async fn events(State(deps): State<Deps>) -> Response {
     let changes = BroadcastStream::new(deps.events.subscribe()).map(Tick::Change);
     let shutdown = WatchStream::new(deps.shutdown.clone()).map(Tick::Shutdown);
-    let stream = changes
+    let ticks = changes
         .merge(shutdown)
         // End the stream at shutdown so graceful shutdown is not held open by it.
-        .take_while(|tick| !matches!(tick, Tick::Shutdown(true)))
-        .filter_map(|tick| match tick {
-            Tick::Change(event) => Some(Ok::<_, Infallible>(
-                SseEvent::default().event("change").data(sse_data(&event)),
-            )),
-            Tick::Shutdown(_) => None,
-        });
+        .take_while(|tick| !matches!(tick, Tick::Shutdown(true)));
+    let stream = futures_util::StreamExt::flat_map(ticks, |tick| {
+        let events = match tick {
+            Tick::Change(event) => sse_events(&event),
+            Tick::Shutdown(_) => Vec::new(),
+        };
+        futures_util::stream::iter(events.into_iter().map(Ok::<_, Infallible>))
+    });
     let mut response = Sse::new(stream)
         .keep_alive(
             KeepAlive::new()
@@ -694,7 +853,7 @@ async fn events(State(deps): State<Deps>) -> Response {
 
 // -------------------------------------------------------------------- assets
 
-fn asset(content_type: &'static str, body: &'static str) -> Response {
+fn asset(content_type: &'static str, body: &'static [u8]) -> Response {
     let mut response = (StatusCode::OK, body).into_response();
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
@@ -706,18 +865,64 @@ fn asset(content_type: &'static str, body: &'static str) -> Response {
 }
 
 async fn css() -> Response {
-    asset("text/css; charset=utf-8", include_str!("../assets/app.css"))
+    asset(
+        "text/css; charset=utf-8",
+        include_bytes!("../assets/app.css"),
+    )
 }
 
 async fn js() -> Response {
     asset(
         "text/javascript; charset=utf-8",
-        include_str!("../assets/app.js"),
+        include_bytes!("../assets/app.js"),
     )
 }
 
 async fn icon() -> Response {
-    asset("image/svg+xml", include_str!("../assets/icon.svg"))
+    asset("image/svg+xml", include_bytes!("../assets/icon.svg"))
+}
+
+const JS: &str = "text/javascript; charset=utf-8";
+
+/// The self-hosted third-party files (assets/vendor, pinned by vendor.toml).
+const VENDOR: [(&str, &str, &[u8]); 6] = [
+    (
+        "htmx.min.js",
+        JS,
+        include_bytes!("../assets/vendor/htmx.min.js"),
+    ),
+    (
+        "hx-sse.min.js",
+        JS,
+        include_bytes!("../assets/vendor/hx-sse.min.js"),
+    ),
+    (
+        "hx-alpine-compat.min.js",
+        JS,
+        include_bytes!("../assets/vendor/hx-alpine-compat.min.js"),
+    ),
+    (
+        "alpine-csp.min.js",
+        JS,
+        include_bytes!("../assets/vendor/alpine-csp.min.js"),
+    ),
+    (
+        "literata-latin.woff2",
+        "font/woff2",
+        include_bytes!("../assets/vendor/literata-latin.woff2"),
+    ),
+    (
+        "literata-latin-italic.woff2",
+        "font/woff2",
+        include_bytes!("../assets/vendor/literata-latin-italic.woff2"),
+    ),
+];
+
+async fn vendor(headers: HeaderMap, Path(name): Path<String>) -> Response {
+    match VENDOR.iter().find(|(file, _, _)| *file == name) {
+        Some((_, content_type, body)) => asset(content_type, body),
+        None => not_found(headers).await,
+    }
 }
 
 async fn not_found(headers: HeaderMap) -> Response {
@@ -734,6 +939,10 @@ pub fn ui_router(deps: Deps) -> Router {
         .route("/jobs/retry", post(retry_selected))
         .route("/jobs/retry-failed", post(retry_failed))
         .route("/library", get(library_page))
+        .route("/library/series", get(library_series_page))
+        .route("/library/series/{id}", get(series_page))
+        .route("/library/authors", get(library_authors_page))
+        .route("/library/fandoms", get(library_fandoms_page))
         .route("/library/{id}", get(book_page))
         .route("/jobs/{id}", get(job_page))
         .route("/jobs/{id}/retry", post(retry_job))
@@ -745,6 +954,7 @@ pub fn ui_router(deps: Deps) -> Router {
         .route("/static/app.css", get(css))
         .route("/static/app.js", get(js))
         .route("/static/icon.svg", get(icon))
+        .route("/static/vendor/{file}", get(vendor))
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn(csrf_guard))

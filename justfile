@@ -33,6 +33,7 @@ test-postgres:
 lint-python:
     {{parent_directory(ffd_python)}}/pyrefly check --config crates/adapters/fanficfare/worker/pyrefly.toml --python-interpreter-path {{ffd_python}}
     {{parent_directory(ffd_python)}}/pyrefly check --config scripts/pyrefly.toml --python-interpreter-path {{ffd_python}}
+    {{parent_directory(ffd_python)}}/pyrefly check --config crates/adapters/web/tests/browser/pyrefly.toml --python-interpreter-path {{ffd_python}}
 
 # The real Python worker: its own unit tests, then through FanFicFare against its offline
 # test site and a fake fanfold-browser (no network).
@@ -57,6 +58,30 @@ integration: test-postgres test-worker e2e
 
 # --- the UI -----------------------------------------------------------------------
 
+# Download the self-hosted scripts the vendor lock names and fill in their hashes (after
+# changing a `version` line in crates/adapters/web/assets/vendor/vendor.toml).
+vendor:
+    python3 -I scripts/vendor.py sync
+
+# The vendored files are exactly the locked ones (offline).
+vendor-check:
+    python3 -I scripts/vendor.py check
+
+# Compile app.css from app.src.css and the classes in the Rust views (the locked Tailwind,
+# downloaded once into target/tools). Commit the result.
+css:
+    python3 -I scripts/vendor.py css
+
+# The UI in a real browser (Playwright from the venv, needs `just venv` and a Chromium):
+# search, suggestions, filters, live updates, no CSP violations.
+test-ui-browser:
+    cargo build -p fanfold-adapter-web --example demo
+    {{ffd_python}} -I -B -m unittest discover -s crates/adapters/web/tests/browser
+
+# The committed app.css is what `just css` would build.
+css-check:
+    python3 -I scripts/vendor.py css --check
+
 # The real UI over realistic in-memory data: http://127.0.0.1:8099 (add `-- --degraded` for the outage state).
 demo *args:
     cargo run -p fanfold-adapter-web --example demo {{args}}
@@ -70,7 +95,7 @@ live-mail:
 
 # Mutation testing of the logic crates. Slow; surviving mutants are test gaps.
 mutants *args:
-    cargo mutants -p fanfold-domain -p fanfold-app -p fanfold-adapter-web {{args}}
+    cargo mutants -p fanfold-domain -p fanfold-app -p fanfold-adapter-web -p fanfold-adapter-search {{args}}
 
 # Fuzz one target (needs nightly): just fuzz work_url 60
 fuzz target seconds="60":
@@ -78,13 +103,13 @@ fuzz target seconds="60":
 
 # Every fuzz target for a short time.
 fuzz-all seconds="30":
-    for t in work_url mail_links book_file_name worker_output config ini_render discord_sanitize form_ids csrf event_payload html_escape jmap_email sender_filter; do \
+    for t in work_url mail_links book_file_name worker_output config ini_render discord_sanitize form_ids csrf event_payload html_escape jmap_email sender_filter search_query; do \
         just fuzz $t {{seconds}}; \
     done
 
 # --- everything -------------------------------------------------------------------
 
-ci: fmt-check lint lint-python test test-browser integration
+ci: fmt-check lint lint-python vendor-check css-check test test-browser test-ui-browser integration
 
 fmt-check:
     cargo fmt --all -- --check

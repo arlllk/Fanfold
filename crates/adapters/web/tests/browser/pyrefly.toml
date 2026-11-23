@@ -1,0 +1,4 @@
+# Pyrefly for the browser tests (`just lint-python`, and CI), against the venv's Playwright.
+project-includes = ["*.py"]
+python-version = "3.13"
+preset = "default"

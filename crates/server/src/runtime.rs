@@ -426,6 +426,11 @@ pub async fn start_web(
         catalog: Arc::<PgStore>::clone(store),
         metadata: Arc::<PgStore>::clone(store),
         listing: Arc::<PgStore>::clone(store),
+        // The library's search index lives in memory, rebuilt when the library changes.
+        browser: Arc::new(fanfold_app::browse::LibraryBrowser::new(
+            Arc::<PgStore>::clone(store),
+            Arc::new(fanfold_adapter_search::TantivyIndexer),
+        )),
         admin: Arc::new(JobAdmin::new(
             Arc::<PgStore>::clone(store),
             Arc::clone(&clock),

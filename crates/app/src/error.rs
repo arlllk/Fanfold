@@ -29,6 +29,11 @@ pub enum StoreError {
     Io(String),
 }
 
+/// The search index could not be built or read: a bug, or the machine is out of memory.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("search index failure: {0}")]
+pub struct SearchError(pub String);
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("notification failed: {0}")]
 pub struct NotifyError(pub String);

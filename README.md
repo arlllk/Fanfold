@@ -301,18 +301,35 @@ through; when it does not, use fanfold-browser.
 | Page | What it is for |
 |---|---|
 | **Dashboard** | Site health, an add-a-link form, a strip of recent results (one colour per job, oldest to newest), what needs attention, what is running, and the latest results. |
-| **Library** | Every book you have, as a shelf of covers: title, author, fandom, rating, chapters, length, series and kudos. Search by title, author, tag or series; show only complete or in-progress works; order by update, title, author or length. |
-| **Book** | One work in full: its summary, every tag, statistics, chapters and series, where the file is, and buttons to open it on AO3, check it for updates or delete it. |
+| **Library** | Every book you have, as a shelf of covers, and the same books by **Series**, **Authors** or **Fandoms** (tabs). One search box for all of them, searching as you type: it forgives typos, suggests authors, series, tags and books, and shows what it understood as chips you can remove. A filter panel narrows by completion, rating, length, language and warnings (show only, or hide). Order by best match, update, title, author, length or kudos. |
+| **Series** | Every part in order, the ones not in your library too, with a button to download each, or all of them. |
+| **Book** | One work in full: its summary, every tag (each a link to the books that share it), statistics, chapters and series, where the file is, and buttons to open it on AO3, check it for updates or delete it. |
 | **History** | Every job, filtered by state, with paging. Tick failed jobs and use **Retry selected**, or **Retry all failed**. A failed job that a later job for the same work fixed shows as **Resolved** and links to that job. |
 | **Job** | The title, state, failure reason and a log split by attempt, with **Retry** or **Cancel**. |
 
+The search box also takes filters typed out, the same ones the panel and the suggestions
+write:
+
+| Type | Finds |
+|---|---|
+| `lighthouse keeper` | both words anywhere (title, author, series, tags, summary), a typo or two forgiven |
+| `"slow burn"` | the phrase |
+| `author:quill`, `series:`, `fandom:`, `ship:`, `char:`, `tag:`, `warn:`, `lang:`, `title:`, `summary:` | words in that field only |
+| `author:"quillandink"` | exactly that value (what picking a suggestion writes) |
+| `rating:e,m` | Explicit or Mature (`g`, `t`, `m`, `e`, `nr`) |
+| `words:>100k`, `words:10k..50k` | by length |
+| `is:complete`, `is:wip`, `is:restricted` | by state |
+| `-warn:mcd`, `-is:complete`, `-crossover` | leaves those out |
+
 Pages update live as jobs change. Everything also works with JavaScript turned off, without
-live refresh. It is laid out for phones as well as desktops, follows your light or dark
+live refresh or suggestions. It is laid out for phones as well as desktops, follows your light or dark
 setting, and never relies on colour alone.
 
 <p>
 <img src="docs/screenshots/desktop-dashboard.png" width="440" alt="Dashboard on a desktop">
 <img src="docs/screenshots/desktop-library.png" width="440" alt="The library on a desktop">
+<img src="docs/screenshots/desktop-search.png" width="440" alt="Searching, with suggestions">
+<img src="docs/screenshots/desktop-series.png" width="440" alt="The library by series">
 <img src="docs/screenshots/desktop-history.png" width="440" alt="History as a table">
 <img src="docs/screenshots/desktop-job.png" width="440" alt="A job with its log">
 </p>

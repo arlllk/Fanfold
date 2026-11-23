@@ -1,0 +1,77 @@
+# Renovate bumps a `version` line in the web UI's vendor lock
+# (crates/adapters/web/assets/vendor/vendor.toml); this downloads that version's files, fills in
+# their hashes and pushes them onto the same branch, so the PR carries the files it names.
+#
+# Why a workflow: the hosted Renovate app cannot run post-upgrade commands. Until this has pushed,
+# CI's vendor check fails on the PR, so an automerged update can never land without its files.
+#
+# The script runs with no token at all (the checkout keeps no credentials); only the push that
+# follows uses the repository's GitHub App, so CI runs on the new commit like on anyone's (the
+# Actions token's pushes trigger nothing). renovate.json lists the app's commit author in
+# gitIgnoredAuthors, so Renovate keeps rebasing the branch afterwards.
+name: vendor-sync
+
+on:
+  push:
+    branches:
+      - "renovate/**"
+    paths:
+      - crates/adapters/web/assets/vendor/vendor.toml
+
+concurrency:
+  group: vendor-sync-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # checkout only; the push uses the app's token
+    env:
+      BRANCH: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the locked versions
+        run: |
+          set -euo pipefail
+          python3 -I scripts/vendor.py sync
+          python3 -I scripts/vendor.py check
+          git status --short
+
+      - id: changed
+        run: |
+          if [ -n "$(git status --porcelain -- crates/adapters/web/assets/vendor)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Already in sync."
+          fi
+
+      - id: app
+        if: steps.changed.outputs.changed == 'true'
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
+      - name: Push the files
+        if: steps.changed.outputs.changed == 'true'
+        env:
+          TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git config user.name "fanfold-bot[bot]"
+          git config user.email "358558070+fanfold-bot[bot]@users.noreply.github.com"
+          git add -A -- crates/adapters/web/assets/vendor
+          git commit -m "Vendor the files the lock names"
+          # Only onto the branch as it was: if Renovate pushed meanwhile, this run is stale
+          # and the newer push has started its own.
+          git push "https://x-access-token:${TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${BRANCH}"

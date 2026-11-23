@@ -11,6 +11,7 @@ members = [
     "crates/adapters/discord",
     "crates/adapters/postgres",
     "crates/adapters/epub",
+    "crates/adapters/search",
     "crates/server",
     # cargo-fuzz targets; built with `just fuzz` (needs nightly).
     "fuzz",
@@ -39,6 +40,7 @@ fanfold-adapter-fanficfare = { path = "crates/adapters/fanficfare" }
 fanfold-adapter-discord = { path = "crates/adapters/discord" }
 fanfold-adapter-postgres = { path = "crates/adapters/postgres" }
 fanfold-adapter-epub = { path = "crates/adapters/epub" }
+fanfold-adapter-search = { path = "crates/adapters/search" }
 fanfold-adapter-web = { path = "crates/adapters/web" }
 fanfold-server = { path = "crates/server" }
 
@@ -79,6 +81,9 @@ zip = { version = "9.8.1", default-features = false, features = ["deflate"] }
 quick-xml = "0.42.0"
 resvg = { version = "0.50.0", default-features = false, features = ["text"] }
 ttf-parser = { version = "0.25.1", default-features = false, features = ["std"] }
+
+# library search: an in-memory index (no mmap, no compression: nothing is ever written to disk)
+tantivy = { version = "0.27.0", default-features = false }
 
 # testing
 proptest = "1.12.0"

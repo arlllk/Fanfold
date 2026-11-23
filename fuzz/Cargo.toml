@@ -118,5 +118,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "search_query"
+path = "fuzz_targets/search_query.rs"
+test = false
+doc = false
+bench = false
+
 [lints]
 workspace = true

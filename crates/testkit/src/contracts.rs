@@ -10,8 +10,8 @@ use fanfold_app::{
     error::RepoError,
     ports::{
         BookCatalog, BookRecord, CursorStore, EnqueueOutcome, Event, EventSource, JobCounts,
-        JobFilter, JobRepository, LibraryCatalog, LibraryPage, LibraryQuery, LibrarySort,
-        LibraryStatus, LibraryTotals, LogEntry, LogLevel, MetadataStore,
+        JobFilter, JobRepository, LibraryCatalog, LibraryRevision, LogEntry, LogLevel,
+        MetadataStore, SeriesShelf, SeriesWork,
     },
 };
 use fanfold_domain::{
@@ -730,9 +730,9 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = Arc<dyn LibraryFixture>>,
 {
-    the_library_lists_books_with_their_latest_metadata(&*make().await).await;
-    the_library_is_searched_filtered_sorted_and_paged(&*make().await).await;
-    equal_update_dates_put_the_newest_book_first(&*make().await).await;
+    the_shelf_has_every_book_with_its_latest_metadata(&*make().await).await;
+    the_revision_moves_whenever_the_shelf_may_have_changed(&*make().await).await;
+    the_series_shelf_has_followed_series_and_those_of_books(&*make().await).await;
 }
 
 fn book(n: u64, title: &str, at: i64) -> BookRecord {
@@ -745,11 +745,11 @@ fn book(n: u64, title: &str, at: i64) -> BookRecord {
 }
 
 /// Three books and one observed work without a book:
-/// 1 "Alpha Light" by zed: complete (3/3), 1,000 words, updated 2026-10-01, in a series,
-///   with a freeform tag (searchable, but not listed);
-/// 2 "beta tide" by Amy: in progress (2/?), 5,000 words, updated 2026-10-20;
+/// 1 "Alpha Light" by zed: complete (3/3), 1,000 words, updated 2026-10-01, part 1 of series
+///   77, with one more (freeform) tag;
+/// 2 "beta tide" by Amy: in progress (2/?), 5,000 words, updated 2026-10-20, in no series;
 /// 3 "Gamma (saved)": a book whose work was never observed;
-/// 4: observed, but never downloaded.
+/// 4: observed (in series 2000001), but never downloaded.
 async fn small_library(store: &dyn LibraryFixture) {
     let mut alpha = observed_work(1);
     alpha.facts.title = "Alpha Light".into();
@@ -758,6 +758,10 @@ async fn small_library(store: &dyn LibraryFixture) {
     alpha.facts.chapters_total = Some(3);
     alpha.facts.words = 1_000;
     alpha.facts.updated_on = Some(jiff_date(2026, 10, 1));
+    alpha.authors = vec![Author {
+        user: "zed".into(),
+        pseud: "Zed Writes".into(),
+    }];
     alpha.tags.push(Tag {
         kind: TagKind::Freeform,
         name: "Slow Burn".into(),
@@ -797,71 +801,50 @@ async fn small_library(store: &dyn LibraryFixture) {
     }
 }
 
-fn query(search: Option<&str>, status: LibraryStatus, sort: LibrarySort) -> LibraryQuery {
-    LibraryQuery {
-        search: search.map(Into::into),
-        status,
-        sort,
-        limit: 50,
-        offset: 0,
-    }
-}
-
-async fn listed(store: &dyn LibraryFixture, q: &LibraryQuery) -> Vec<u64> {
-    store
-        .library(q)
-        .await
-        .unwrap()
-        .entries
-        .iter()
-        .map(|e| e.book.work.get())
-        .collect()
-}
-
-async fn the_library_lists_books_with_their_latest_metadata(store: &dyn LibraryFixture) {
-    let empty = store
-        .library(&query(None, LibraryStatus::All, LibrarySort::Updated))
-        .await
-        .unwrap();
-    assert_eq!(empty, LibraryPage::default(), "an empty library");
+async fn the_shelf_has_every_book_with_its_latest_metadata(store: &dyn LibraryFixture) {
+    assert_eq!(store.shelf().await.unwrap(), vec![], "an empty library");
 
     small_library(store).await;
-    let page = store
-        .library(&query(None, LibraryStatus::All, LibrarySort::Updated))
-        .await
-        .unwrap();
+    let shelf = store.shelf().await.unwrap();
     assert_eq!(
-        page.totals,
-        LibraryTotals {
-            books: 3,
-            words: 6_000,
-            complete: 1
-        }
+        shelf.iter().map(|e| e.book.work.get()).collect::<Vec<_>>(),
+        [1, 2, 3],
+        "every book, in work order; work 4 has none"
     );
-    assert_eq!(page.matching, 3);
 
     let alpha = store.entry(work(1)).await.unwrap().expect("listed");
-    assert_eq!(alpha, page.entries[1], "entry() is the listed entry");
+    assert_eq!(alpha, shelf[0], "entry() is the shelf's entry");
     assert_eq!(alpha.book, book(1, "Alpha Light", 210));
     assert_eq!(alpha.title(), "Alpha Light");
     assert_eq!(alpha.complete(), Some(true));
     assert_eq!(
-        alpha.tags,
-        vec![
-            Tag {
-                kind: TagKind::Fandom,
-                name: "Original Work".into()
-            },
-            Tag {
-                kind: TagKind::Relationship,
-                name: "Ada Marsh/Ben Ward".into()
-            },
-        ],
-        "fandoms, relationships and warnings only, in AO3's order"
+        alpha.authors,
+        vec![Author {
+            user: "zed".into(),
+            pseud: "Zed Writes".into()
+        }]
+    );
+    let mut tags = observed_work(1).tags;
+    tags.push(Tag {
+        kind: TagKind::Freeform,
+        name: "Slow Burn".into(),
+    });
+    assert_eq!(alpha.tags, tags, "every current tag, in AO3's order");
+    assert_eq!(
+        alpha.tags_of(TagKind::Fandom).collect::<Vec<_>>(),
+        ["Original Work"]
     );
     assert_eq!(alpha.series[0].name, "A Test Saga");
     assert_eq!(alpha.stats.kudos, Some(9), "the latest counters");
     assert_eq!(alpha.last_checked, Some(t(200)));
+
+    let beta = &shelf[1];
+    assert_eq!(
+        beta.complete(),
+        Some(false),
+        "a total of \"?\" is in progress"
+    );
+    assert_eq!(beta.series, vec![]);
 
     let gamma = store.entry(work(3)).await.unwrap().expect("listed");
     assert_eq!(gamma.facts, None, "never observed");
@@ -871,6 +854,7 @@ async fn the_library_lists_books_with_their_latest_metadata(store: &dyn LibraryF
         "falls back to the book's title"
     );
     assert_eq!(gamma.complete(), None);
+    assert_eq!((gamma.authors.len(), gamma.tags.len()), (0, 0));
     assert_eq!(gamma.stats, WorkStats::default());
     assert_eq!(gamma.last_checked, None);
 
@@ -881,100 +865,126 @@ async fn the_library_lists_books_with_their_latest_metadata(store: &dyn LibraryF
     );
 }
 
-async fn the_library_is_searched_filtered_sorted_and_paged(store: &dyn LibraryFixture) {
-    use LibrarySort as S;
-    use LibraryStatus as St;
-    small_library(store).await;
+async fn the_revision_moves_whenever_the_shelf_may_have_changed(store: &dyn LibraryFixture) {
+    let first = store.revision().await.unwrap();
+    assert_eq!(
+        store.revision().await.unwrap(),
+        first,
+        "asking again changes nothing"
+    );
+    let mut seen = vec![first];
+    let mut moved = |r: LibraryRevision, what: &str| {
+        assert!(!seen.contains(&r), "the revision did not move: {what}");
+        seen.push(r);
+    };
 
-    // Sorting.
-    assert_eq!(
-        listed(store, &query(None, St::All, S::Updated)).await,
-        [2, 1, 3]
-    );
-    assert_eq!(
-        listed(store, &query(None, St::All, S::Title)).await,
-        [1, 2, 3],
-        "case-insensitive: alpha, beta, Gamma"
-    );
-    assert_eq!(
-        listed(store, &query(None, St::All, S::Author)).await,
-        [2, 1, 3],
-        "Amy, zed, then no byline"
-    );
-    assert_eq!(
-        listed(store, &query(None, St::All, S::Words)).await,
-        [2, 1, 3]
-    );
+    store.upsert(&book(1, "One", 10)).await.unwrap();
+    moved(store.revision().await.unwrap(), "a book saved");
+    store.upsert(&book(1, "One", 20)).await.unwrap();
+    moved(store.revision().await.unwrap(), "a book saved again");
 
-    // Filtering by completion.
-    assert_eq!(
-        listed(store, &query(None, St::Complete, S::Updated)).await,
-        [1]
-    );
-    assert_eq!(
-        listed(store, &query(None, St::InProgress, S::Updated)).await,
-        [2],
-        "a total of \"?\" is in progress; an unobserved work is neither"
-    );
+    let mut one = observed_work(1);
+    store.record_work(&one, t(30), None).await.unwrap();
+    moved(store.revision().await.unwrap(), "its work observed");
+    one.stats.kudos = Some(77);
+    store.record_work(&one, t(40), None).await.unwrap();
+    moved(store.revision().await.unwrap(), "only its counters moved");
 
-    // Searching: title, byline, any current tag, series names; case-insensitive.
-    for (needle, expect) in [
-        ("TIDE", vec![2]),
-        ("amy", vec![2]),
-        ("slow burn", vec![1]),
-        ("test saga", vec![1]),
-        ("gamma", vec![3]),
-        ("original work", vec![2, 1]),
-        ("zzz", vec![]),
-        ("%", vec![]),
-        ("_", vec![]),
-        ("   ", vec![2, 1, 3]),
-    ] {
-        assert_eq!(
-            listed(store, &query(Some(needle), St::All, S::Updated)).await,
-            expect,
-            "search {needle:?}"
-        );
-    }
-    let page = store
-        .library(&query(Some("tide"), St::All, S::Updated))
+    store
+        .follow_series(series_id(5), FollowSource::Manual, t(50))
         .await
         .unwrap();
-    assert_eq!(page.matching, 1);
-    assert_eq!(page.totals.books, 3, "totals ignore the query");
-    assert_eq!(
-        listed(store, &query(Some("original"), St::Complete, S::Updated)).await,
-        [1],
-        "search and filter combine"
-    );
+    moved(store.revision().await.unwrap(), "a series followed");
+    store
+        .record_series(
+            &SeriesMetadata {
+                series: series_id(5),
+                facts: SeriesFacts {
+                    name: "Five".into(),
+                    summary_html: String::new(),
+                    complete: Some(false),
+                    works: vec![work(1)],
+                },
+                raw: serde_json::json!({}),
+            },
+            t(60),
+            None,
+        )
+        .await
+        .unwrap();
+    moved(store.revision().await.unwrap(), "a series listed");
+    store.unfollow_series(series_id(5)).await.unwrap();
+    moved(store.revision().await.unwrap(), "a series unfollowed");
 
-    // Paging.
-    let mut q = query(None, St::All, S::Title);
-    q.limit = 2;
-    let first = store.library(&q).await.unwrap();
-    assert_eq!(first.entries.len(), 2);
-    assert_eq!(first.matching, 3);
-    q.offset = 2;
-    assert_eq!(listed(store, &q).await, [3]);
+    store.remove(work(1)).await.unwrap();
+    moved(store.revision().await.unwrap(), "a book deleted");
 }
 
-async fn equal_update_dates_put_the_newest_book_first(store: &dyn LibraryFixture) {
-    for (n, saved) in [(1, 300), (2, 400), (3, 100)] {
-        let mut w = observed_work(n);
-        w.facts.title = format!("Work {n}");
-        store.record_work(&w, t(50), None).await.unwrap();
-        store
-            .upsert(&book(n, &format!("Work {n}"), saved))
-            .await
-            .unwrap();
-    }
+async fn the_series_shelf_has_followed_series_and_those_of_books(store: &dyn LibraryFixture) {
+    assert_eq!(store.series_shelf().await.unwrap(), vec![]);
+    small_library(store).await;
+
+    // Series 2000001 is only named by work 4, which has no book: not on the shelf.
     assert_eq!(
-        listed(
-            store,
-            &query(None, LibraryStatus::All, LibrarySort::Updated)
+        store.series_shelf().await.unwrap(),
+        vec![SeriesShelf {
+            id: series_id(77),
+            name: "A Test Saga".into(),
+            summary_html: String::new(),
+            complete: None,
+            listed: vec![],
+            followed: false,
+        }],
+        "a book's series, never listed: named by the book's page"
+    );
+
+    store
+        .follow_series(series_id(2_000_001), FollowSource::Mail, t(300))
+        .await
+        .unwrap();
+    store
+        .record_series(
+            &SeriesMetadata {
+                series: series_id(2_000_001),
+                facts: SeriesFacts {
+                    name: "The Harbor Saga (listed)".into(),
+                    summary_html: "<p>Sea.</p>".into(),
+                    complete: Some(true),
+                    works: vec![work(4), work(1), work(9)],
+                },
+                raw: serde_json::json!({}),
+            },
+            t(310),
+            None,
         )
-        .await,
-        [2, 1, 3]
+        .await
+        .unwrap();
+    let shelf = store.series_shelf().await.unwrap();
+    assert_eq!(shelf.len(), 2);
+    assert_eq!(
+        shelf[1],
+        SeriesShelf {
+            id: series_id(2_000_001),
+            name: "The Harbor Saga (listed)".into(),
+            summary_html: "<p>Sea.</p>".into(),
+            complete: Some(true),
+            listed: vec![
+                SeriesWork {
+                    work: work(4),
+                    title: Some("The Keeper and the Logbook".into())
+                },
+                SeriesWork {
+                    work: work(1),
+                    title: Some("Alpha Light".into())
+                },
+                SeriesWork {
+                    work: work(9),
+                    title: None
+                },
+            ],
+            followed: true,
+        },
+        "followed and listed: its listing, with the titles of the works ever observed"
     );
 }
 

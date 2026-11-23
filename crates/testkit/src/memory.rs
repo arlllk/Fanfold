@@ -17,9 +17,8 @@ use fanfold_app::{
         BookCatalog, BookExtras, BookFinisher, BookRecord, Checkpoint, Clock, CursorStore,
         DownloadError, DownloadRequest, DownloadedBook, Downloader, EnqueueOutcome, Event,
         EventSource, FinishError, Jitter, JobCounts, JobFilter, JobRepository, LibraryCatalog,
-        LibraryEntry, LibraryPage, LibraryQuery, LibrarySort, LibraryStatus, LibraryStore,
-        LibraryTotals, LogEntry, MailBatch, MailSource, MetadataStore, Notifier, NotifyEvent,
-        Readiness, Recorded,
+        LibraryEntry, LibraryRevision, LibraryStore, LogEntry, MailBatch, MailSource,
+        MetadataStore, Notifier, NotifyEvent, Readiness, Recorded, SeriesShelf, SeriesWork,
     },
 };
 use fanfold_domain::{
@@ -27,8 +26,8 @@ use fanfold_domain::{
     failure::FailureKind,
     job::{Job, JobId, JobSource, JobState, Target},
     metadata::{
-        Author, Changes, FollowSource, SeriesFacts, SeriesMetadata, SeriesPart, Tag, TagKind,
-        WorkFacts, WorkMetadata, WorkState, WorkStats, WorkVersionChanges, plan_work_update,
+        Author, Changes, FollowSource, SeriesFacts, SeriesMetadata, SeriesPart, Tag, WorkFacts,
+        WorkMetadata, WorkState, WorkStats, WorkVersionChanges, plan_work_update,
     },
     timestamp,
     work::{SeriesId, WorkId},
@@ -491,14 +490,6 @@ impl BookCatalog for InMemoryJobs {
     }
 }
 
-/// The tags a library listing carries.
-const fn listed_tag(kind: TagKind) -> bool {
-    matches!(
-        kind,
-        TagKind::Fandom | TagKind::Relationship | TagKind::Warning
-    )
-}
-
 fn library_entry(state: &JobsState, book: &BookRecord) -> LibraryEntry {
     let history = state.works.get(&book.work);
     LibraryEntry {
@@ -506,12 +497,8 @@ fn library_entry(state: &JobsState, book: &BookRecord) -> LibraryEntry {
         facts: history
             .and_then(|h| h.versions.last())
             .map(|v| v.facts.clone()),
-        tags: history.map_or_default(|h| {
-            open_items(&h.tags)
-                .into_iter()
-                .filter(|t| listed_tag(t.kind))
-                .collect()
-        }),
+        authors: history.map_or_default(|h| open_items(&h.authors)),
+        tags: history.map_or_default(|h| open_items(&h.tags)),
         series: history.map_or_default(|h| open_items(&h.series)),
         // The latest observation; on equal times the one recorded last (as the database).
         stats: history
@@ -527,106 +514,110 @@ fn library_entry(state: &JobsState, book: &BookRecord) -> LibraryEntry {
     }
 }
 
-/// Whether an entry matches a (lower-cased) search, as `LibraryQuery::search` defines it.
-fn library_matches(state: &JobsState, entry: &LibraryEntry, needle: &str) -> bool {
-    let has = |s: &str| s.to_lowercase().contains(needle);
-    if has(entry.title()) || entry.facts.as_ref().is_some_and(|f| has(&f.byline)) {
-        return true;
+/// The name a series is known by: its latest listing's, else the latest a work's page gave.
+fn series_name(state: &JobsState, id: SeriesId) -> Option<String> {
+    if let Some((_, facts)) = state.series.get(&id).and_then(|s| s.versions.last()) {
+        return Some(facts.name.clone());
     }
-    state.works.get(&entry.book.work).is_some_and(|h| {
-        open_items(&h.tags).iter().any(|t| has(&t.name))
-            || open_items(&h.series).iter().any(|s| has(&s.name))
-    })
+    state
+        .works
+        .values()
+        .flat_map(|w| w.series.iter())
+        .filter(|s| s.item.id == id)
+        .max_by_key(|s| s.added_in)
+        .map(|s| s.item.name.clone())
 }
 
-fn library_order(sort: LibrarySort, a: &LibraryEntry, b: &LibraryEntry) -> std::cmp::Ordering {
-    use std::cmp::{Ordering, Reverse};
-    let lower = |e: &LibraryEntry| e.title().to_lowercase();
-    // `None` sorts last, ascending or descending, as `NULLS LAST` does.
-    let byline = |e: &LibraryEntry| {
-        e.facts
-            .as_ref()
-            .map(|f| f.byline.to_lowercase())
-            .map_or((1, String::new()), |b| (0, b))
-    };
-    let work = |e: &LibraryEntry| e.book.work;
-    let ordering: Ordering = match sort {
-        LibrarySort::Updated => {
-            let updated = |e: &LibraryEntry| e.facts.as_ref().and_then(|f| f.updated_on);
-            (updated(a).is_none(), Reverse(updated(a)))
-                .cmp(&(updated(b).is_none(), Reverse(updated(b))))
-                .then_with(|| b.book.updated_at.cmp(&a.book.updated_at))
-                .then_with(|| work(b).cmp(&work(a)))
-        }
-        LibrarySort::Title => lower(a).cmp(&lower(b)).then_with(|| work(a).cmp(&work(b))),
-        LibrarySort::Author => byline(a)
-            .cmp(&byline(b))
-            .then_with(|| lower(a).cmp(&lower(b)))
-            .then_with(|| work(a).cmp(&work(b))),
-        LibrarySort::Words => {
-            let words = |e: &LibraryEntry| e.facts.as_ref().map(|f| f.words);
-            (words(a).is_none(), Reverse(words(a)))
-                .cmp(&(words(b).is_none(), Reverse(words(b))))
-                .then_with(|| work(a).cmp(&work(b)))
-        }
-    };
-    ordering
+fn as_i64(n: impl TryInto<i64>) -> i64 {
+    n.try_into().unwrap_or(i64::MAX)
 }
 
 #[async_trait]
 impl LibraryCatalog for InMemoryJobs {
-    async fn library(&self, query: &LibraryQuery) -> Result<LibraryPage, RepoError> {
+    async fn revision(&self) -> Result<LibraryRevision, RepoError> {
         let state = self.metadata_state()?;
-        let all: Vec<LibraryEntry> = state
-            .books
-            .values()
+        // Everything a listing shows, summed up: any change moves at least one number.
+        let mut parts = vec![as_i64(state.books.len()), as_i64(state.next_version)];
+        let mut books: Vec<&BookRecord> = state.books.values().collect();
+        books.sort_by_key(|b| b.work);
+        for b in books {
+            parts.push(b.work.to_i64());
+            parts.push(timestamp::to_millis(b.updated_at));
+        }
+        let mut works: Vec<(&WorkId, &MemWork)> = state.works.iter().collect();
+        works.sort_by_key(|(id, _)| **id);
+        for (id, w) in works {
+            parts.push(id.to_i64());
+            parts.push(as_i64(w.stats.len()));
+            parts.push(w.last_checked.map_or(0, timestamp::to_millis));
+        }
+        let mut series: Vec<(&SeriesId, &MemSeries)> = state.series.iter().collect();
+        series.sort_by_key(|(id, _)| **id);
+        for (id, s) in series {
+            parts.push(id.to_i64());
+            parts.push(as_i64(s.versions.len()));
+            parts.push(i64::from(s.followed.is_some()));
+        }
+        Ok(LibraryRevision(parts))
+    }
+
+    async fn shelf(&self) -> Result<Vec<LibraryEntry>, RepoError> {
+        let state = self.metadata_state()?;
+        let mut books: Vec<&BookRecord> = state.books.values().collect();
+        books.sort_by_key(|b| b.work);
+        Ok(books
+            .into_iter()
             .map(|b| library_entry(&state, b))
-            .collect();
-        let totals = LibraryTotals {
-            books: all.len() as u64,
-            words: all
-                .iter()
-                .filter_map(|e| e.facts.as_ref())
-                .map(|f| f.words)
-                .sum(),
-            complete: all.iter().filter(|e| e.complete() == Some(true)).count() as u64,
-        };
-        let needle = query
-            .search
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_lowercase);
-        let mut matching: Vec<LibraryEntry> = all
-            .into_iter()
-            .filter(|e| match query.status {
-                LibraryStatus::All => true,
-                LibraryStatus::Complete => e.complete() == Some(true),
-                LibraryStatus::InProgress => e.complete() == Some(false),
-            })
-            .filter(|e| {
-                needle
-                    .as_deref()
-                    .is_none_or(|n| library_matches(&state, e, n))
-            })
-            .collect();
-        matching.sort_by(|a, b| library_order(query.sort, a, b));
-        let count = matching.len() as u64;
-        let entries = matching
-            .into_iter()
-            .skip(query.offset as usize)
-            .take(query.limit as usize)
-            .collect();
-        Ok(LibraryPage {
-            entries,
-            matching: count,
-            totals,
-        })
+            .collect())
     }
 
     async fn entry(&self, work: WorkId) -> Result<Option<LibraryEntry>, RepoError> {
         let state = self.metadata_state()?;
         Ok(state.books.get(&work).map(|b| library_entry(&state, b)))
+    }
+
+    async fn series_shelf(&self) -> Result<Vec<SeriesShelf>, RepoError> {
+        let state = self.metadata_state()?;
+        let mut ids: Vec<SeriesId> = state
+            .series
+            .iter()
+            .filter(|(_, s)| s.followed.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for book in state.books.values() {
+            if let Some(w) = state.works.get(&book.work) {
+                ids.extend(open_items(&w.series).iter().map(|p| p.id));
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids
+            .into_iter()
+            .map(|id| {
+                let mem = state.series.get(&id);
+                let listing = mem.and_then(|s| s.versions.last()).map(|(_, f)| f);
+                SeriesShelf {
+                    id,
+                    name: series_name(&state, id).unwrap_or_default(),
+                    summary_html: listing.map_or_else(String::new, |f| f.summary_html.clone()),
+                    complete: listing.and_then(|f| f.complete),
+                    listed: listing.map_or_else(Vec::new, |f| {
+                        f.works
+                            .iter()
+                            .map(|w| SeriesWork {
+                                work: *w,
+                                title: state
+                                    .works
+                                    .get(w)
+                                    .and_then(|h| h.versions.last())
+                                    .map(|v| v.facts.title.clone()),
+                            })
+                            .collect()
+                    }),
+                    followed: mem.is_some_and(|s| s.followed.is_some()),
+                }
+            })
+            .collect())
     }
 }
 

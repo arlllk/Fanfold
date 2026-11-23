@@ -17,6 +17,7 @@ dependencies = [
 [dependency-groups]
 dev = [
   "pyrefly==1.5.0", # type-checks the worker against FanFicFare (crates/adapters/fanficfare/worker)
+  "playwright==1.65.2", # drives the web UI in a real browser (`just test-ui-browser`)
 ]
 
 [tool.uv]
