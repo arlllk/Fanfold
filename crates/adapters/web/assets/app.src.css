@@ -1,0 +1,429 @@
+/*
+ * Fanfold's stylesheet: the source of app.css (`just css`; commit the result).
+ *
+ * Two materials. The machine side (downloads, logs, results) is printed on fanfold paper:
+ * the continuous, sprocket-punched, green-barred sheets that dot-matrix printers fed. The
+ * reader side (the library) is books: cloth covers in each fandom's colour, titles set in
+ * Literata, the typeface made for reading on screens and e-readers.
+ *
+ * Tailwind scans the Rust views for classes. Classes built at run time are listed below
+ * with @source inline(), or they would not exist.
+ */
+@import "tailwindcss" source(none);
+@source "../src";
+@source "./app.js";
+@source inline("hue-{0,1,2,3,4,5,6,7,8,9,10,11}");
+@source inline("tone-{ok,warn,err,info,muted,run}");
+
+@font-face {
+  font-family: "Literata";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 200 900;
+  src: url(/static/vendor/literata-latin.woff2) format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+    U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215,
+    U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Literata";
+  font-style: italic;
+  font-display: swap;
+  font-weight: 200 900;
+  src: url(/static/vendor/literata-latin-italic.woff2) format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+    U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215,
+    U+FEFF, U+FFFD;
+}
+
+@theme {
+  /* Printer paper, slightly cool; its green bars; slate ink; an indigo ribbon. */
+  --color-paper: #f3f6f3;
+  --color-sheet: #fbfcfb;
+  --color-bar: #e2ede3;
+  --color-ink: #1d2a2e;
+  --color-muted: #5a6a6e;
+  --color-rule: #cdd8d2;
+  --color-ribbon: #3c3cb4;
+  --color-ribbon-soft: #e4e4f8;
+  --color-ok: #2a7a4b;
+  --color-warn: #9a6200;
+  --color-err: #b0281e;
+  --color-run: #1f6fa8;
+
+  --font-display: "Literata", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Menlo, monospace;
+
+  --radius-cover: 3px 7px 7px 3px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-paper: #101517;
+    --color-sheet: #151c1e;
+    --color-bar: #17211b;
+    --color-ink: #dfe7e3;
+    --color-muted: #93a39d;
+    --color-rule: #2b3633;
+    --color-ribbon: #9ea2ff;
+    --color-ribbon-soft: #24264a;
+    --color-ok: #5cc48a;
+    --color-warn: #e0a640;
+    --color-err: #f07a6e;
+    --color-run: #6ab4ec;
+  }
+}
+
+@layer base {
+  html {
+    color-scheme: light dark;
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    @apply bg-paper text-ink font-sans antialiased;
+    font-size: 0.9375rem;
+    line-height: 1.5;
+  }
+  a {
+    @apply text-ribbon underline-offset-2 hover:underline;
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-ribbon);
+    outline-offset: 2px;
+    border-radius: 3px;
+  }
+  ::selection {
+    background: var(--color-ribbon-soft);
+  }
+  h1,
+  h2,
+  h3 {
+    @apply text-ink;
+  }
+  [x-cloak] {
+    display: none !important;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    ::before,
+    ::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  /* ----------------------------------------------------------------- page furniture */
+  .wrap {
+    @apply mx-auto w-full max-w-6xl px-4 sm:px-6;
+  }
+  .display {
+    @apply font-display tracking-tight;
+    font-optical-sizing: auto;
+  }
+  /* A section's label: small capitals in mono, with what it counts. */
+  .eyebrow {
+    @apply flex items-baseline gap-2 font-mono text-[0.7rem] font-semibold tracking-[0.12em] text-muted uppercase;
+  }
+  .eyebrow .count {
+    @apply rounded-sm bg-bar px-1.5 py-px text-ink tabular-nums;
+  }
+  .panel {
+    @apply rounded-lg border border-rule bg-sheet;
+  }
+  .soft {
+    @apply text-muted;
+  }
+  .mono {
+    @apply font-mono text-[0.8em];
+  }
+  .sr-only {
+    @apply absolute -m-px h-px w-px overflow-hidden border-0 p-0 whitespace-nowrap;
+    clip: rect(0 0 0 0);
+  }
+  .empty {
+    @apply rounded-lg border border-dashed border-rule px-4 py-6 text-center text-muted;
+  }
+
+  /* ---------------------------------------------------------------------- controls */
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-md border border-rule bg-sheet px-3 py-1.5 text-sm font-medium text-ink no-underline transition-colors select-none hover:border-ink/30 hover:bg-bar hover:no-underline disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply border-ribbon bg-ribbon text-sheet hover:border-ribbon hover:bg-ribbon/90;
+  }
+  .btn-danger {
+    @apply border-err/40 text-err hover:border-err hover:bg-err/10;
+  }
+  .field {
+    @apply w-full rounded-md border border-rule bg-sheet px-3 py-2 text-ink placeholder:text-muted/80 focus:border-ribbon focus:outline-none;
+  }
+  /* Links that act as one switch: the current one is pressed in. */
+  .seg {
+    @apply inline-flex rounded-md border border-rule bg-sheet p-0.5 text-sm;
+  }
+  .seg a {
+    @apply rounded px-2.5 py-1 text-muted no-underline hover:text-ink hover:no-underline;
+  }
+  .seg a[aria-current] {
+    @apply bg-bar font-medium text-ink;
+  }
+
+  /* Status colours: a tone sets --tone; chips and edges read it. */
+  .tone-ok {
+    --tone: var(--color-ok);
+  }
+  .tone-warn {
+    --tone: var(--color-warn);
+  }
+  .tone-err {
+    --tone: var(--color-err);
+  }
+  .tone-run {
+    --tone: var(--color-run);
+  }
+  .tone-info {
+    --tone: var(--color-ribbon);
+  }
+  .tone-muted {
+    --tone: var(--color-muted);
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full border px-2 py-px text-xs font-medium whitespace-nowrap;
+    color: var(--tone, var(--color-muted));
+    border-color: color-mix(in oklab, var(--tone, var(--color-muted)) 35%, transparent);
+    background: color-mix(in oklab, var(--tone, var(--color-muted)) 9%, transparent);
+  }
+  .chip-dot::before {
+    content: "";
+    @apply size-1.5 rounded-full;
+    background: var(--tone);
+  }
+  .tone-run.chip-dot::before {
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  /* A removable filter in the search. */
+  .filter-chip {
+    @apply inline-flex items-center gap-1.5 rounded-md border border-ribbon/30 bg-ribbon-soft py-0.5 pr-1 pl-2 text-xs text-ink no-underline hover:border-ribbon hover:no-underline;
+  }
+  .filter-chip.not {
+    @apply border-err/30 bg-err/8;
+  }
+  .filter-chip .x {
+    @apply grid size-4 place-items-center rounded text-muted;
+  }
+  .filter-chip:hover .x {
+    @apply bg-ink/10 text-ink;
+  }
+
+  /* ---------------------------------------------------------------- fanfold paper */
+  /* Sprocket holes down both margins, as on continuous printer paper. */
+  .sprockets {
+    --hole: radial-gradient(circle at center, var(--color-paper) 0 3.5px, transparent 4px);
+    background-image: var(--hole), var(--hole);
+    background-size: 14px 18px, 14px 18px;
+    background-position: left 2px top 4px, right 2px top 4px;
+    background-repeat: repeat-y;
+    @apply px-6;
+  }
+  /* Green bars every other band of lines. */
+  .greenbar {
+    background-image: repeating-linear-gradient(
+      to bottom,
+      var(--color-bar) 0 3em,
+      transparent 3em 6em
+    );
+  }
+  /*
+   * The results strip: one fold of paper per finished job, oldest first, folded like a
+   * fanfold stack (every other panel tilts the other way), punched along both edges.
+   */
+  .fanfold {
+    @apply flex items-stretch overflow-x-auto pb-1;
+    scrollbar-width: thin;
+  }
+  .fanfold li {
+    @apply flex;
+  }
+  .fanfold a {
+    @apply relative block h-16 w-6 shrink-0 sm:w-7;
+    background:
+      radial-gradient(circle at 50% 6px, var(--color-paper) 0 2.5px, transparent 3px),
+      radial-gradient(circle at 50% calc(100% - 6px), var(--color-paper) 0 2.5px, transparent 3px),
+      linear-gradient(to right, var(--fold-a), var(--fold-b));
+    border-top: 3px solid var(--tone);
+    transition: transform 160ms ease;
+  }
+  .fanfold li:nth-child(odd) a {
+    --fold-a: color-mix(in oklab, var(--color-sheet) 100%, transparent);
+    --fold-b: color-mix(in oklab, var(--color-bar) 80%, var(--color-sheet));
+  }
+  .fanfold li:nth-child(even) a {
+    --fold-a: color-mix(in oklab, var(--color-bar) 80%, var(--color-sheet));
+    --fold-b: color-mix(in oklab, var(--color-rule) 70%, var(--color-sheet));
+  }
+  .fanfold a::before {
+    /* the job's status, stamped on its fold */
+    content: "";
+    @apply absolute top-1/2 left-1/2 size-2 -translate-x-1/2 -translate-y-1/2 rounded-full;
+    background: var(--tone);
+  }
+  .fanfold a.tone-err::before {
+    @apply h-4 w-1.5 rounded-sm;
+  }
+  .fanfold a::after {
+    /* the crease */
+    content: "";
+    @apply absolute inset-y-0 right-0 w-px;
+    background: color-mix(in oklab, var(--color-ink) 12%, transparent);
+  }
+  .fanfold a:hover,
+  .fanfold a:focus-visible {
+    transform: translateY(-3px);
+  }
+
+  /* --------------------------------------------------------------------- the log */
+  .log {
+    @apply max-h-[70vh] overflow-auto rounded-md border border-rule bg-sheet font-mono text-xs leading-6;
+  }
+  .log .line {
+    @apply grid grid-cols-[4.5rem_3.25rem_1fr] gap-x-2 px-2;
+  }
+  .log pre {
+    @apply m-0 font-mono break-words whitespace-pre-wrap;
+  }
+  .lvl-warn {
+    @apply text-warn;
+  }
+  .lvl-error {
+    @apply text-err;
+  }
+
+  /* -------------------------------------------------------------------- the books */
+  /* A cloth cover in the fandom's colour; the title is set on it like a label. */
+  .cover {
+    --hue-l: 0.5;
+    @apply relative flex aspect-[2/3] w-full flex-col justify-between overflow-hidden p-2.5 text-left;
+    border-radius: var(--radius-cover);
+    color: oklch(0.97 0.02 var(--h));
+    background:
+      linear-gradient(to right, rgb(0 0 0 / 0.28) 0 5%, rgb(255 255 255 / 0.1) 5.5% 6%, transparent 7%),
+      repeating-linear-gradient(45deg, rgb(255 255 255 / 0.035) 0 2px, transparent 2px 4px),
+      linear-gradient(160deg, oklch(0.52 0.11 var(--h)), oklch(0.36 0.09 var(--h)));
+    box-shadow:
+      0 1px 0 rgb(255 255 255 / 0.15) inset,
+      0 6px 14px -8px rgb(0 0 0 / 0.55);
+  }
+  .cover .label {
+    @apply font-display text-[0.8rem] leading-tight font-semibold;
+    display: -webkit-box;
+    -webkit-line-clamp: 5;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    padding-left: 6%;
+    text-wrap: balance;
+  }
+  .cover .by {
+    @apply truncate text-[0.65rem] italic opacity-80;
+    padding-left: 6%;
+    font-family: var(--font-display);
+  }
+  .cover.big {
+    @apply w-36 p-4 sm:w-44;
+  }
+  .cover.big .label {
+    @apply text-lg;
+  }
+  .cover.big .by {
+    @apply text-xs;
+  }
+  /* A thumbnail: the colour and the cloth, no words (the title is beside it). */
+  .cover.mini {
+    @apply p-0;
+  }
+  /* A part of a series that is not in the library: the cover's outline only. */
+  .cover.absent {
+    @apply border-2 border-dashed border-rule text-muted shadow-none;
+    background: transparent;
+  }
+  .hue-0 { --h: 25; }
+  .hue-1 { --h: 55; }
+  .hue-2 { --h: 85; }
+  .hue-3 { --h: 120; }
+  .hue-4 { --h: 150; }
+  .hue-5 { --h: 180; }
+  .hue-6 { --h: 210; }
+  .hue-7 { --h: 240; }
+  .hue-8 { --h: 270; }
+  .hue-9 { --h: 300; }
+  .hue-10 { --h: 330; }
+  .hue-11 { --h: 0; }
+
+  .rating {
+    @apply inline-grid size-5 place-items-center rounded-sm text-[0.65rem] font-bold text-sheet;
+  }
+  .r-g { @apply bg-ok; }
+  .r-t { @apply bg-warn; }
+  .r-m { @apply bg-[#c2410c]; }
+  .r-e { @apply bg-err; }
+  .r-nr { @apply bg-muted; }
+
+  .summary p + p {
+    @apply mt-3;
+  }
+
+  /* -------------------------------------------------------------- the search box */
+  .listbox {
+    @apply absolute inset-x-0 top-full z-20 mt-1 max-h-80 overflow-auto rounded-lg border border-rule bg-sheet p-1 shadow-xl;
+  }
+  .listbox [role="option"] {
+    @apply flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm text-ink no-underline hover:no-underline;
+  }
+  .listbox [role="option"][aria-selected="true"],
+  .listbox [role="option"]:hover {
+    @apply bg-bar;
+  }
+  .listbox .kind {
+    @apply w-16 shrink-0 font-mono text-[0.65rem] tracking-wider text-muted uppercase;
+  }
+}
+
+/* Phones: fingers need room, and iOS zooms into inputs set smaller than 16px. */
+@media (pointer: coarse) {
+  .btn,
+  .seg a {
+    min-height: 44px;
+  }
+  .field {
+    font-size: 16px;
+  }
+}
+main {
+  padding-bottom: max(4rem, env(safe-area-inset-bottom));
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* The live dot in the header: on while the event stream is connected. */
+.livedot {
+  @apply size-2 rounded-full bg-muted/50 transition-colors;
+}
+html[data-live="on"] .livedot {
+  @apply bg-ok;
+}
+
+/* htmx: elements that show while a request is in flight (its own stylesheet is off). */
+.htmx-indicator {
+  opacity: 0;
+  transition: opacity 150ms ease 250ms;
+}
+.htmx-request .htmx-indicator,
+.htmx-request.htmx-indicator {
+  opacity: 1;
+}

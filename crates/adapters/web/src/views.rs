@@ -30,7 +30,8 @@ pub struct JobRow {
 }
 
 impl JobRow {
-    fn name(&self) -> String {
+    #[must_use]
+    pub fn name(&self) -> String {
         self.title.clone().unwrap_or_else(|| match self.job.target {
             Target::Work(w) => format!("Work #{w}"),
             Target::Series(s) => format!("Series #{s}"),
@@ -156,44 +157,63 @@ pub enum Nav {
     None,
 }
 
+/// The colour of a job's status (`format::Status::class`).
+const fn tone(status_class: &str) -> &'static str {
+    match status_class.as_bytes() {
+        b"done" | b"resolved" => "tone-ok",
+        b"retrying" => "tone-warn",
+        b"failed" => "tone-err",
+        b"running" => "tone-run",
+        b"queued" => "tone-info",
+        _ => "tone-muted",
+    }
+}
+
 fn pill(site: SiteStatus, now: Timestamp) -> Markup {
     let (class, text) = site_summary(site, now);
-    html! { div id="site" data-pill class=(format!("pill {class}")) role="status" { (text) } }
+    let tone = match class {
+        "ok" => "tone-ok",
+        "warn" => "tone-warn",
+        _ => "tone-err",
+    };
+    html! { div id="site" class=(format!("chip chip-dot {tone} pill {class}")) role="status" { (text) } }
 }
 
-/// What a live update returns: the site pill, which the script moves into place,
-/// followed by the page content.
-/// The row above the page content: the site status, and on the dashboard the add form
-/// beside it on a wide screen.
+/// The row above the page content: the site status, and on the dashboard the add form.
 fn bar(site: SiteStatus, now: Timestamp, extra: Option<Markup>) -> Markup {
-    html! { div class="bar" { (pill(site, now)) @if let Some(extra) = extra { (extra) } } }
-}
-
-fn live(site: SiteStatus, now: Timestamp, content: &Markup) -> Markup {
-    html! { (pill(site, now)) (content) }
+    html! {
+        div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between" {
+            div { (pill(site, now)) }
+            @if let Some(extra) = extra { (extra) }
+        }
+    }
 }
 
 fn notice_view(notice: Notice) -> Markup {
-    let (class, text, job) = match notice {
-        Notice::Added(id) => ("", "Added to the queue.", Some(id)),
+    let (tone, text, job) = match notice {
+        Notice::Added(id) => ("tone-ok", "Added to the queue.", Some(id)),
         Notice::AlreadyQueued(id) => (
-            "warn",
+            "tone-warn",
             "That work is already queued or downloading.",
             Some(id),
         ),
-        Notice::Retried(id) => ("", "Queued again.", Some(id)),
-        Notice::ForceRetried(id) => ("", "Queued to download again from scratch.", Some(id)),
-        Notice::Cancelled(id) => ("warn", "Cancelled.", Some(id)),
+        Notice::Retried(id) => ("tone-ok", "Queued again.", Some(id)),
+        Notice::ForceRetried(id) => (
+            "tone-ok",
+            "Queued to download again from scratch.",
+            Some(id),
+        ),
+        Notice::Cancelled(id) => ("tone-warn", "Cancelled.", Some(id)),
         Notice::DeletedBook(true) => (
-            "warn",
+            "tone-warn",
             "The book was deleted from the library. Its history is kept.",
             None,
         ),
-        Notice::DeletedBook(false) => ("warn", "There was no book to delete.", None),
-        Notice::Bulk { .. } | Notice::DeletedSeries { .. } => ("", "", None),
+        Notice::DeletedBook(false) => ("tone-warn", "There was no book to delete.", None),
+        Notice::Bulk { .. } | Notice::DeletedSeries { .. } => ("tone-ok", "", None),
     };
     html! {
-        p class=(format!("notice {class}")) role="status" {
+        p class=(format!("notice {tone} rounded-lg border border-[color-mix(in_oklab,var(--tone)_35%,transparent)] bg-[color-mix(in_oklab,var(--tone)_8%,transparent)] px-4 py-2.5 text-sm")) role="status" {
             @if let Notice::Bulk { retried, skipped } = notice {
                 "Queued " (retried) " again."
                 @if skipped > 0 { " Skipped " (skipped) " that could not be retried (already queued, or changed since you looked)." }
@@ -209,29 +229,79 @@ fn notice_view(notice: Notice) -> Markup {
 }
 
 fn nav_link(label: &str, href: &str, here: bool) -> Markup {
-    html! { a href=(href) aria-current=[here.then_some("page")] { (label) } }
+    html! {
+        a href=(href)
+          class="rounded-md px-2.5 py-1.5 text-sm font-medium text-muted no-underline hover:bg-bar hover:text-ink hover:no-underline aria-[current=page]:bg-bar aria-[current=page]:text-ink"
+          aria-current=[here.then_some("page")] { (label) }
+    }
 }
 
-/// Everything a full page needs besides its live content.
-#[derive(Debug, Clone, Copy)]
-pub struct Frame<'a> {
+/// What the live region listens for: every change, or one job's.
+fn live_trigger(job: Option<JobId>) -> String {
+    let changes = job.map_or_else(
+        || "refresh from:body delay:200ms".to_owned(),
+        |id| format!("job-{id} from:body delay:200ms"),
+    );
+    // A reconnect may have missed events; the timer keeps "5 min ago" honest.
+    format!(
+        "{changes}, resync from:body, htmx:sse:after:connection from:body delay:200ms, every 30s"
+    )
+}
+
+/// One page, as the router serves it: whole, or only its live region (a live update).
+#[derive(Debug)]
+pub struct Screen<'a> {
     pub title: &'a str,
     pub nav: Nav,
-    /// Set on a job page: live events for other jobs are ignored there.
+    /// Path and query the live region refreshes from: this page's own URL.
+    pub url: &'a str,
+    /// Set on a job page: only that job's changes refresh it.
     pub job: Option<JobId>,
-    pub notice: Option<Notice>,
+    pub site: SiteStatus,
+    pub now: Timestamp,
+    /// Above the live region (never disturbed by a refresh).
+    pub above: Markup,
+    /// The live region's content.
+    pub content: Markup,
+    /// Other parts of the page a live update replaces too: (target selector, content).
+    pub partials: Vec<(&'static str, Markup)>,
 }
 
-/// A complete page. `above` sits outside the live region (so a refresh never
-/// disturbs it); `content` is the live region's body, already containing the pill.
+/// The live region: re-fetched (and morphed in place, so focus, scroll positions and
+/// selections survive) whenever the event stream says something changed.
+fn live_region(screen: &Screen<'_>) -> Markup {
+    if screen.url.is_empty() {
+        return html! { div id="live" class="flex flex-col gap-6" { (screen.content) } };
+    }
+    html! {
+        div id="live" hx-get=(screen.url) hx-trigger=(live_trigger(screen.job)) hx-swap="outerMorph"
+            hx-sync="this:replace" hx-status:4xx="swap:none" hx-status:5xx="swap:none"
+            data-job=[screen.job.map(|j| j.to_string())] class="flex flex-col gap-6" {
+            (screen.content)
+        }
+    }
+}
+
+/// What a live update returns: the live region, and the parts it replaces elsewhere.
 #[must_use]
-pub fn page(frame: Frame<'_>, above: &Markup, content: &Markup) -> Markup {
-    let Frame {
-        title,
-        nav,
-        job,
-        notice,
-    } = frame;
+pub fn fragment(screen: &Screen<'_>) -> Markup {
+    html! {
+        (live_region(screen))
+        hx-partial hx-target="#site" hx-swap="outerHTML" { (pill(screen.site, screen.now)) }
+        @for (target, content) in &screen.partials {
+            hx-partial hx-target=(target) hx-swap="innerHTML" { (content) }
+        }
+    }
+}
+
+/// htmx's settings: its own indicator stylesheet off (the CSP allows no inline styles; ours
+/// is in app.css), only the extensions we ship, and Back/Forward reload the page (every
+/// page renders whole from its URL).
+const HTMX_CONFIG: &str = r#"{"includeIndicatorCSS":false,"extensions":"sse, alpine-compat","defaultSwap":"outerMorph","history":"reload"}"#;
+
+/// A complete page.
+#[must_use]
+pub fn full_page(screen: &Screen<'_>, notice: Option<Notice>) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" data-live="off" {
@@ -239,29 +309,37 @@ pub fn page(frame: Frame<'_>, above: &Markup, content: &Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover";
                 meta name="color-scheme" content="light dark";
-                meta name="theme-color" content="#eef1f5" media="(prefers-color-scheme: light)";
-                meta name="theme-color" content="#0f151c" media="(prefers-color-scheme: dark)";
-                title { (title) " · Fanfold" }
+                meta name="theme-color" content="#f3f6f3" media="(prefers-color-scheme: light)";
+                meta name="theme-color" content="#101517" media="(prefers-color-scheme: dark)";
+                meta name="htmx-config" content=(HTMX_CONFIG);
+                title { (screen.title) " · Fanfold" }
                 link rel="icon" type="image/svg+xml" href="/static/icon.svg";
+                link rel="preload" href="/static/vendor/literata-latin.woff2" as="font" type="font/woff2" crossorigin;
                 link rel="stylesheet" href="/static/app.css";
+                // In this order: htmx, its extensions, our components (registered before
+                // Alpine starts), Alpine.
+                script src="/static/vendor/htmx.min.js" defer {}
+                script src="/static/vendor/hx-sse.min.js" defer {}
+                script src="/static/vendor/hx-alpine-compat.min.js" defer {}
                 script src="/static/app.js" defer {}
+                script src="/static/vendor/alpine-csp.min.js" defer {}
             }
-            body {
-                header class="top" {
-                    div class="wrap" {
-                        a class="brand" href="/" { "Fanfold" }
+            body hx-sse:connect="/events" {
+                header class="sticky top-0 z-30 border-b border-rule bg-paper/85 backdrop-blur" {
+                    div class="wrap flex h-14 items-center gap-3" {
+                        a class="display text-xl font-semibold italic text-ink no-underline hover:no-underline" href="/" { "Fanfold" }
                         span class="livedot" title="Live updates" {}
-                        nav class="nav" aria-label="Main" {
-                            (nav_link("Dashboard", "/", nav == Nav::Dashboard))
-                            (nav_link("Library", "/library", nav == Nav::Library))
-                            (nav_link("History", "/jobs", nav == Nav::History))
+                        nav class="ml-auto flex gap-0.5" aria-label="Main" {
+                            (nav_link("Dashboard", "/", screen.nav == Nav::Dashboard))
+                            (nav_link("Library", "/library", screen.nav == Nav::Library))
+                            (nav_link("History", "/jobs", screen.nav == Nav::History))
                         }
                     }
                 }
-                main class="wrap" {
+                main class="wrap flex flex-col gap-6 py-6 pb-16" {
                     @if let Some(notice) = notice { (notice_view(notice)) }
-                    (above)
-                    div id="live" data-job=[job.map(|j| j.to_string())] { (content) }
+                    (screen.above)
+                    (live_region(screen))
                 }
             }
         }
@@ -274,18 +352,24 @@ fn when(now: Timestamp, ts: Timestamp) -> Markup {
     html! { time datetime=(iso(ts)) title=(iso(ts)) { (relative(now, ts)) } }
 }
 
-/// One tappable card. The whole card is the link.
+fn status_chip(job: &Job) -> Markup {
+    let status = status_of(job);
+    html! { span class=(format!("chip chip-dot {}", tone(status.class))) { (status.label) } }
+}
+
+/// One tappable card. The whole card is the link; its left edge carries the status colour.
 fn card(row: &JobRow, now: Timestamp) -> Markup {
     let status = status_of(&row.job);
     let job = &row.job;
     html! {
-        a class=(format!("job {}", status.class)) href=(format!("/jobs/{}", job.id)) {
-            span class="ribbon" aria-hidden="true" {}
-            span class="body" {
-                span class="title" { (row.name()) }
-                span class="meta" {
-                    span class="chip" { (status.label) }
-                    @if row.is_series() { span class="chip series" { "Series" } }
+        a class=(format!("job {} {} group flex gap-3 rounded-lg border border-rule bg-sheet p-3 text-ink no-underline transition-colors hover:border-ink/25 hover:no-underline", status.class, tone(status.class)))
+          href=(format!("/jobs/{}", job.id)) {
+            span class="w-1 shrink-0 self-stretch rounded-full bg-[var(--tone)]" aria-hidden="true" {}
+            span class="flex min-w-0 flex-1 flex-col gap-1" {
+                span class="title truncate font-medium group-hover:text-ribbon" { (row.name()) }
+                span class="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-muted" {
+                    (status_chip(job))
+                    @if row.is_series() { span class="chip tone-info" { "Series" } }
                     @if row.title.is_some() { span class="mono" { (row.id_label()) } }
                     @if job.attempt > 0 { span { "tried " (job.attempt) "×" } }
                     @match job.state {
@@ -294,7 +378,7 @@ fn card(row: &JobRow, now: Timestamp) -> Markup {
                     }
                 }
                 @if let Some(error) = job.last_error.as_deref().filter(|_| job.state != JobState::Succeeded) {
-                    span class="err" { (truncate(first_line(error), 200)) }
+                    span class="err line-clamp-2 font-mono text-xs break-words text-err" { (truncate(first_line(error), 200)) }
                 }
             }
         }
@@ -302,7 +386,16 @@ fn card(row: &JobRow, now: Timestamp) -> Markup {
 }
 
 fn card_list(rows: &[JobRow], now: Timestamp) -> Markup {
-    html! { ul class="jobs" { @for row in rows { li { (card(row, now)) } } } }
+    html! { ul class="jobs flex flex-col gap-2" { @for row in rows { li { (card(row, now)) } } } }
+}
+
+fn section_head(label: &str, count: Option<usize>, extra: Option<Markup>) -> Markup {
+    html! {
+        div class="mb-3 flex items-baseline justify-between gap-3" {
+            h2 class="eyebrow" { (label) @if let Some(n) = count.filter(|n| *n > 0) { span class="count" { (n) } } }
+            @if let Some(extra) = extra { (extra) }
+        }
+    }
 }
 
 // -------------------------------------------------------------------- dashboard
@@ -310,40 +403,42 @@ fn card_list(rows: &[JobRow], now: Timestamp) -> Markup {
 #[must_use]
 pub fn dashboard_content(m: &DashboardModel) -> Markup {
     html! {
-        section {
-            h2 { "Last " (m.shelf.len()) " results" }
+        section aria-labelledby="results-h" {
+            div class="mb-3 flex items-baseline justify-between gap-3" {
+                h2 id="results-h" class="eyebrow" { "Last " (m.shelf.len()) " results" }
+                @if !m.shelf.is_empty() { span class="shelf-note text-xs text-muted" { "Oldest on the left, newest on the right." } }
+            }
             @if m.shelf.is_empty() {
                 p class="empty" { "Nothing has finished yet. Paste an AO3 link above to get started." }
             } @else {
-                ul class="shelf" aria-label="Recent results, oldest first" {
+                ul class="shelf fanfold" aria-label="Recent results, oldest first" {
                     @for row in &m.shelf {
                         @let status = status_of(&row.job);
                         li {
-                            a class=(status.class) href=(format!("/jobs/{}", row.job.id))
+                            a class=(format!("{} {}", status.class, tone(status.class))) href=(format!("/jobs/{}", row.job.id))
                               title=(format!("{}: {}", row.name(), status.label))
                               aria-label=(format!("{}: {}", row.name(), status.label)) {}
                         }
                     }
                 }
-                p class="shelf-note" { "Oldest on the left, newest on the right." }
             }
         }
         // One column on a phone; on a wide screen the work queue sits beside the history.
-        div class="board" {
-            div class="board-main" {
+        div class="board grid grid-cols-1 gap-8 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]" {
+            div class="board-main flex min-w-0 flex-col gap-8" {
                 section {
-                    h2 { "Needs attention" @if !m.attention.is_empty() { span class="count" { (m.attention.len()) } } }
+                    (section_head("Needs attention", Some(m.attention.len()), None))
                     @if m.attention.is_empty() {
                         p class="empty" { "Nothing needs attention." }
                     } @else {
                         (card_list(&m.attention, m.now))
                         @if m.counts.failed > 0 {
-                            p { a href="/jobs?filter=failed" { "All " (m.counts.failed) " failed jobs →" } }
+                            p class="mt-3 text-sm" { a href="/jobs?filter=failed" { "All " (m.counts.failed) " failed jobs →" } }
                         }
                     }
                 }
                 section {
-                    h2 { "In progress" @if !m.in_progress.is_empty() { span class="count" { (m.in_progress.len()) } } }
+                    (section_head("In progress", Some(m.in_progress.len()), None))
                     @if m.in_progress.is_empty() {
                         p class="empty" { "No downloads are running or waiting." }
                     } @else {
@@ -351,9 +446,9 @@ pub fn dashboard_content(m: &DashboardModel) -> Markup {
                     }
                 }
             }
-            div class="board-side" {
+            div class="board-side min-w-0" {
                 section {
-                    h2 { "Recent" a class="more" href="/jobs" { "All history →" } }
+                    (section_head("Recent", None, Some(html! { a class="more text-sm" href="/jobs" { "All history →" } })))
                     @if m.recent.is_empty() {
                         p class="empty" { "No downloads yet." }
                     } @else {
@@ -370,51 +465,33 @@ pub fn dashboard_content(m: &DashboardModel) -> Markup {
 #[must_use]
 pub fn add_form() -> Markup {
     html! {
-        section class="add" {
-            form method="post" action="/jobs" {
-                label for="url" { "Add a work or a series" }
-                div class="field" {
+        section class="add w-full sm:max-w-xl" {
+            form method="post" action="/jobs" class="flex flex-col gap-1.5" {
+                label for="url" class="eyebrow" { "Add a work or a series" }
+                div class="field-row flex gap-2" {
                     input id="url" name="url" type="url" required inputmode="url" autocomplete="off"
-                          autocapitalize="off" spellcheck="false" placeholder="https://archiveofourown.org/works/… or /series/…";
-                    button class="btn primary" type="submit" { "Download" }
+                          autocapitalize="off" spellcheck="false" class="field font-mono text-sm"
+                          placeholder="https://archiveofourown.org/works/… or /series/…";
+                    button class="btn btn-primary shrink-0" type="submit" { "Download" }
                 }
             }
         }
     }
 }
 
-/// The dashboard as a live update.
 #[must_use]
-pub fn dashboard(m: &DashboardModel) -> Markup {
-    live(m.site, m.now, &dashboard_content(m))
-}
-
-/// History as a live update.
-#[must_use]
-pub fn history(m: &HistoryModel) -> Markup {
-    live(m.site, m.now, &history_content(m))
-}
-
-/// A job page as a live update.
-#[must_use]
-pub fn job_detail(m: &JobModel) -> Markup {
-    live(m.site, m.now, &job_content(m))
-}
-
-/// Dashboard as a full page.
-#[must_use]
-pub fn dashboard_page(m: &DashboardModel, notice: Option<Notice>) -> Markup {
-    let frame = Frame {
+pub fn dashboard_screen<'a>(m: &DashboardModel, url: &'a str) -> Screen<'a> {
+    Screen {
         title: "Dashboard",
         nav: Nav::Dashboard,
+        url,
         job: None,
-        notice,
-    };
-    page(
-        frame,
-        &bar(m.site, m.now, Some(add_form())),
-        &dashboard_content(m),
-    )
+        site: m.site,
+        now: m.now,
+        above: bar(m.site, m.now, Some(add_form())),
+        content: dashboard_content(m),
+        partials: Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------- history
@@ -449,26 +526,29 @@ const fn can_force(job: &Job) -> bool {
     )
 }
 
-/// One history row. A stacked card on a phone; on a wide screen the same cells line up
-/// as table columns under the header row.
+/// The columns of a history row on a wide screen.
+const HISTORY_GRID: &str =
+    "md:grid md:grid-cols-[1.75rem_7rem_minmax(0,1fr)_7rem_4rem_7rem] md:items-center md:gap-3";
+
+/// One history row: a stacked card on a phone, table columns on a wide screen.
 fn history_row(row: &JobRow, now: Timestamp) -> Markup {
     let status = status_of(&row.job);
     let job = &row.job;
+    let next_try = job.state == JobState::Queued && job.last_error.is_some();
     html! {
-        a class=(format!("job {}", status.class)) href=(format!("/jobs/{}", job.id)) {
-            span class="ribbon" aria-hidden="true" {}
-            span class="body cells" {
-                span class="c-title" { span class="title" { (row.name()) } }
-                span class="c-status" { span class="chip" { (status.label) } }
-                @if row.title.is_some() || row.is_series() { span class="c-id mono" { (row.id_label()) } }
-                @if job.attempt > 0 { span class="c-tries" { "tried " (job.attempt) "×" } }
-                span class="c-when" {
-                    @if job.state == JobState::Queued && job.last_error.is_some() { "next try " }
-                    (when(now, if job.state == JobState::Queued && job.last_error.is_some() { job.next_attempt_at } else { job.updated_at }))
-                }
+        a class=(format!("job {} {} contents text-ink no-underline hover:no-underline", status.class, tone(status.class))) href=(format!("/jobs/{}", job.id)) {
+            span class="c-status" { (status_chip(job)) }
+            span class="c-title min-w-0" {
+                span class="title block truncate font-medium hover:text-ribbon" { (row.name()) }
                 @if let Some(error) = job.last_error.as_deref().filter(|_| job.state != JobState::Succeeded) {
-                    span class="c-err err" { (truncate(first_line(error), 200)) }
+                    span class="c-err err block truncate font-mono text-xs text-err" { (truncate(first_line(error), 200)) }
                 }
+            }
+            span class="c-id mono text-muted" { @if row.title.is_some() || row.is_series() { (row.id_label()) } }
+            span class="c-tries text-xs text-muted" { @if job.attempt > 0 { "tried " (job.attempt) "×" } }
+            span class="c-when text-xs text-muted" {
+                @if next_try { "next try " }
+                (when(now, if next_try { job.next_attempt_at } else { job.updated_at }))
             }
         }
     }
@@ -485,46 +565,47 @@ pub fn history_content(m: &HistoryModel) -> Markup {
         _ => None,
     };
     html! {
-        h1 { "History" }
-        section {
-            ul class="filters" aria-label="Filter" {
+        div class="flex flex-wrap items-end justify-between gap-3" {
+            h1 class="display text-3xl font-semibold" { "History" }
+            nav class="filters seg" aria-label="Filter" {
                 @for (filter, label) in FILTERS {
-                    li {
-                        a href=(history_href(filter, 1)) aria-current=[(filter == m.filter).then_some("page")] {
-                            (label)
-                            @if let Some(n) = count_for(filter) { " " span class="mono" { (n) } }
-                        }
+                    a href=(history_href(filter, 1)) aria-current=[(filter == m.filter).then_some("page")] {
+                        (label)
+                        @if let Some(n) = count_for(filter) { " " span class="mono tabular-nums opacity-70" { (n) } }
                     }
                 }
             }
+        }
+        section {
             @if m.rows.is_empty() {
                 p class="empty" { "No jobs match this filter." }
             } @else {
-                form method="post" action="/jobs/retry" {
-                    // Column headers only appear on wide screens, where rows become a table.
-                    div class="thead" aria-hidden="true" {
-                        span { "Status" } span { "Work" } span { "ID" } span { "Tries" } span { "Updated" } span { "Last error" }
-                    }
-                    ul class="jobs hist" {
-                        @for row in &m.rows {
-                            @let pick = is_retryable(&row.job);
-                            li class="row" {
-                                @if pick {
-                                    label class="pick" {
-                                        input type="checkbox" name="id" value=(row.job.id.get());
-                                        span class="sr-only" { "Select " (row.name()) }
+                form method="post" action="/jobs/retry" class="flex flex-col gap-3" {
+                    div class="panel divide-y divide-rule overflow-hidden" {
+                        // Column headers only appear on wide screens, where rows become a table.
+                        div class="thead hidden px-3 py-2 eyebrow md:grid md:grid-cols-[1.75rem_7rem_minmax(0,1fr)_7rem_4rem_7rem] md:gap-3" aria-hidden="true" {
+                            span {} span { "Status" } span { "Work" } span { "ID" } span { "Tries" } span { "Updated" }
+                        }
+                        ul class="jobs hist divide-y divide-rule" {
+                            @for row in &m.rows {
+                                @let pick = is_retryable(&row.job);
+                                li class=(format!("row relative flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2.5 hover:bg-bar/50 {HISTORY_GRID}")) {
+                                    @if pick {
+                                        label class="pick grid size-7 place-items-center" {
+                                            input type="checkbox" name="id" value=(row.job.id.get()) class="size-4 accent-[var(--color-ribbon)]";
+                                            span class="sr-only" { "Select " (row.name()) }
+                                        }
+                                    } @else {
+                                        span class="pick-spacer hidden md:block" aria-hidden="true" {}
                                     }
-                                } @else {
-                                    // Keeps the columns aligned on wide screens; hidden on phones.
-                                    span class="pick-spacer" aria-hidden="true" {}
+                                    (history_row(row, m.now))
                                 }
-                                (history_row(row, m.now))
                             }
                         }
                     }
                     @if any_retryable || m.counts.failed > 0 {
-                        div class="bulkbar" {
-                            @if any_retryable { button class="btn primary" type="submit" { "Retry selected" } }
+                        div class="bulkbar sticky bottom-3 flex flex-wrap gap-2 self-start rounded-lg border border-rule bg-sheet/95 p-2 shadow-lg backdrop-blur" {
+                            @if any_retryable { button class="btn btn-primary" type="submit" { "Retry selected" } }
                             @if m.counts.failed > 0 {
                                 button class="btn" type="submit" formaction="/jobs/retry-failed" {
                                     "Retry all " (m.counts.failed) " failed"
@@ -533,24 +614,38 @@ pub fn history_content(m: &HistoryModel) -> Markup {
                         }
                     }
                 }
-                div class="pager" {
-                    @if m.page > 1 { a class="btn" href=(history_href(m.filter, m.page - 1)) { "← Newer" } } @else { span {} }
-                    @if m.has_next { a class="btn" href=(history_href(m.filter, m.page + 1)) { "Older →" } }
-                }
+                (pager(m.page, m.has_next, |p| history_href(m.filter, p)))
+            }
+        }
+    }
+}
+
+/// Previous and next links.
+fn pager(page: u32, has_next: bool, href: impl Fn(u32) -> String) -> Markup {
+    html! {
+        @if page > 1 || has_next {
+            nav class="pager mt-4 flex items-center justify-between gap-3" aria-label="Pages" {
+                @if page > 1 { a class="btn" rel="prev" href=(href(page - 1)) { "← Previous" } } @else { span {} }
+                span class="text-xs text-muted" { "Page " (page) }
+                @if has_next { a class="btn" rel="next" href=(href(page + 1)) { "Next →" } } @else { span {} }
             }
         }
     }
 }
 
 #[must_use]
-pub fn history_page(m: &HistoryModel, notice: Option<Notice>) -> Markup {
-    let frame = Frame {
+pub fn history_screen<'a>(m: &HistoryModel, url: &'a str) -> Screen<'a> {
+    Screen {
         title: "History",
         nav: Nav::History,
+        url,
         job: None,
-        notice,
-    };
-    page(frame, &bar(m.site, m.now, None), &history_content(m))
+        site: m.site,
+        now: m.now,
+        above: bar(m.site, m.now, None),
+        content: history_content(m),
+        partials: Vec::new(),
+    }
 }
 
 // ------------------------------------------------------------------- job detail
@@ -589,103 +684,110 @@ pub fn runs(logs: &[LogEntry]) -> Vec<&[LogEntry]> {
         .collect()
 }
 
+fn fact(label: &str, value: &Markup) -> Markup {
+    html! { div class="flex justify-between gap-4 py-1.5" { dt class="text-muted" { (label) } dd class="text-right" { (value) } } }
+}
+
 #[must_use]
 pub fn job_content(m: &JobModel) -> Markup {
     let job = &m.row.job;
     let status = status_of(job);
     let log_runs = runs(&m.logs);
-    let content = html! {
-        a class="back" href="/jobs" { "← All jobs" }
-        div class="jobgrid" {
-        div class="jobside" {
-        div class=(format!("head {}", status.class)) {
-            span class="ribbon" aria-hidden="true" {}
-            div class="body" {
-                h1 { (m.row.name()) }
-                p class="sub" {
-                    span class="chip" { (status.label) } " "
-                    @if m.row.title.is_some() {
-                        span class="mono" { (if m.row.is_series() { "" } else { "work " }) (m.row.id_label()) } " · "
-                    }
-                    a href=(job.target.canonical_url()) rel="noopener noreferrer" { "Open on AO3" }
-                }
-                dl class="facts" {
-                    div { dt { "Source" } dd { (source_label(job.source)) } }
-                    @if let Some(by) = job.resolved_by {
-                        div { dt { "Fixed by" } dd { a href=(format!("/jobs/{by}")) { "job #" (by) } } }
-                    }
-                    div { dt { "Failed attempts" } dd { (job.attempt) " of " (m.max_attempts) } }
-                    @if job.state == JobState::Queued {
-                        div { dt { "Next try" } dd { (when(m.now, job.next_attempt_at)) } }
-                    }
-                    @if job.force && job.state.is_active() {
-                        div { dt { "Download" } dd { "from scratch" } }
-                    }
-                    div { dt { "Updated" } dd { (when(m.now, job.updated_at)) } }
-                    div { dt { "Added" } dd { (when(m.now, job.created_at)) } }
-                    @if let Some(book) = &m.book { div { dt { "File" } dd class="mono" { (book.file_name) } } }
-                }
-                @if let Some(error) = job.last_error.as_deref().filter(|_| job.state != JobState::Succeeded) {
-                    p class="err" { (truncate(first_line(error), 400)) }
-                }
-                @if can_force(job) || job.state == JobState::Queued {
-                    div class="actions" {
-                        @if is_retryable(job) {
-                            form method="post" action=(format!("/jobs/{}/retry", job.id)) {
-                                button class="btn primary" type="submit" { "Retry" }
+    html! {
+        a class="back text-sm" href="/jobs" { "← All jobs" }
+        div class="jobgrid grid grid-cols-1 items-start gap-6 lg:grid-cols-[22rem_minmax(0,1fr)]" {
+            div class="jobside flex flex-col gap-4" {
+                div class=(format!("head {} {} panel overflow-hidden", status.class, tone(status.class))) {
+                    div class="h-1 bg-[var(--tone)]" aria-hidden="true" {}
+                    div class="flex flex-col gap-3 p-4" {
+                        h1 class="display text-2xl leading-tight font-semibold" { (m.row.name()) }
+                        p class="sub flex flex-wrap items-center gap-2 text-sm" {
+                            (status_chip(job))
+                            @if m.row.title.is_some() {
+                                span class="mono text-muted" { (if m.row.is_series() { "" } else { "work " }) (m.row.id_label()) }
+                            }
+                            a href=(job.target.canonical_url()) rel="noopener noreferrer" { "Open on AO3" }
+                        }
+                        dl class="facts divide-y divide-rule text-sm" {
+                            (fact("Source", &html! { (source_label(job.source)) }))
+                            @if let Some(by) = job.resolved_by {
+                                (fact("Fixed by", &html! { a href=(format!("/jobs/{by}")) { "job #" (by) } }))
+                            }
+                            (fact("Failed attempts", &html! { (job.attempt) " of " (m.max_attempts) }))
+                            @if job.state == JobState::Queued {
+                                (fact("Next try", &when(m.now, job.next_attempt_at)))
+                            }
+                            @if job.force && job.state.is_active() {
+                                (fact("Download", &html! { "from scratch" }))
+                            }
+                            (fact("Updated", &when(m.now, job.updated_at)))
+                            (fact("Added", &when(m.now, job.created_at)))
+                            @if let Some(book) = &m.book {
+                                (fact("File", &html! { span class="mono break-all" { (book.file_name) } }))
                             }
                         }
-                        @if can_force(job) {
-                            form method="post" action=(format!("/jobs/{}/force-retry", job.id)) {
-                                @if m.row.is_series() {
-                                    button class="btn" type="submit"
-                                        title="List the series again and queue every work in it that is not queued already." {
-                                        "List the series again"
+                        @if let Some(error) = job.last_error.as_deref().filter(|_| job.state != JobState::Succeeded) {
+                            p class="err rounded-md bg-err/8 p-2 font-mono text-xs break-words text-err" { (truncate(first_line(error), 400)) }
+                        }
+                        @if can_force(job) || job.state == JobState::Queued {
+                            div class="actions flex flex-wrap gap-2" {
+                                @if is_retryable(job) {
+                                    form method="post" action=(format!("/jobs/{}/retry", job.id)) {
+                                        button class="btn btn-primary" type="submit" { "Retry" }
                                     }
-                                } @else {
-                                    button class="btn" type="submit"
-                                        title="Ignore the stored book and download the whole work again. The file is replaced only if the download succeeds." {
-                                        "Re-download from scratch"
+                                }
+                                @if can_force(job) {
+                                    form method="post" action=(format!("/jobs/{}/force-retry", job.id)) {
+                                        @if m.row.is_series() {
+                                            button class="btn" type="submit"
+                                                title="List the series again and queue every work in it that is not queued already." {
+                                                "List the series again"
+                                            }
+                                        } @else {
+                                            button class="btn" type="submit"
+                                                title="Ignore the stored book and download the whole work again. The file is replaced only if the download succeeds." {
+                                                "Re-download from scratch"
+                                            }
+                                        }
+                                    }
+                                }
+                                @if job.state == JobState::Queued {
+                                    form method="post" action=(format!("/jobs/{}/cancel", job.id)) {
+                                        button class="btn btn-danger" type="submit" { "Cancel" }
                                     }
                                 }
                             }
                         }
-                        @if job.state == JobState::Queued {
-                            form method="post" action=(format!("/jobs/{}/cancel", job.id)) {
-                                button class="btn danger" type="submit" { "Cancel" }
+                    }
+                }
+                (delete_controls(m))
+            }
+            section class="min-w-0" {
+                (section_head("Log", None, (log_runs.len() > 1).then(|| html! { span class="hint text-xs text-muted" { "newest first" } })))
+                @if log_runs.is_empty() {
+                    p class="empty" { "No log lines yet." }
+                } @else {
+                    div class="log sprockets greenbar" tabindex="0" role="log" aria-label="Job log" {
+                        // Newest run first; lines within a run stay in order.
+                        @for (n, run) in log_runs.iter().enumerate().rev() {
+                            div class="run py-1" {
+                                h3 class="sticky top-0 bg-sheet/95 px-2 py-1 font-sans text-[0.7rem] font-semibold tracking-wider text-muted uppercase" {
+                                    "Run " (n + 1) @if let Some(first) = run.first() { " · " (when(m.now, first.at)) }
+                                }
+                                @for line in *run {
+                                    div class="line" {
+                                        time class="text-muted" datetime=(iso(line.at)) title=(iso(line.at)) { (clock(line.at)) }
+                                        span class=(format!("lvl {}", level_class(line.level))) { (line.level.as_str().to_uppercase()) }
+                                        pre { (line.message) }
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        }
-        (delete_controls(m))
-        section {
-            h2 { "Log" @if log_runs.len() > 1 { " " span class="hint" { "newest first" } } }
-            @if log_runs.is_empty() {
-                p class="empty" { "No log lines yet." }
-            } @else {
-                div class="log" tabindex="0" role="log" aria-label="Job log" {
-                    // Newest run first; lines within a run stay in order.
-                    @for (n, run) in log_runs.iter().enumerate().rev() {
-                        div class="run" {
-                            h3 { "Run " (n + 1) @if let Some(first) = run.first() { " · " (when(m.now, first.at)) } }
-                            @for line in *run {
-                                div class="line" {
-                                    time datetime=(iso(line.at)) title=(iso(line.at)) { (clock(line.at)) }
-                                    span class=(format!("lvl {}", level_class(line.level))) { (line.level.as_str().to_uppercase()) }
-                                    pre { (line.message) }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        }
-    };
-    content
+    }
 }
 
 /// "Delete…": a book that is in the library, or a series. Folded away, so a single slip of
@@ -705,28 +807,43 @@ fn delete_controls(m: &JobModel) -> Markup {
         ),
         Target::Work(_) => return html! {},
     };
+    danger_zone(
+        &action,
+        button,
+        explain,
+        &html! { input type="hidden" name="job" value=(job.id); },
+    )
+}
+
+/// A folded-away destructive action.
+fn danger_zone(action: &str, button: &str, explain: &str, hidden: &Markup) -> Markup {
     html! {
-        details class="danger" {
-            summary { "Delete…" }
-            p { (explain) }
-            form method="post" action=(action) {
-                input type="hidden" name="job" value=(job.id);
-                button class="btn danger" type="submit" { (button) }
+        details class="danger group rounded-lg border border-rule px-4 py-2 text-sm open:border-err/40" {
+            summary class="cursor-pointer text-muted select-none group-open:text-err" { "Delete…" }
+            div class="flex flex-col gap-3 py-2" {
+                p class="text-muted" { (explain) }
+                form method="post" action=(action) {
+                    (hidden)
+                    button class="btn btn-danger" type="submit" { (button) }
+                }
             }
         }
     }
 }
 
 #[must_use]
-pub fn job_page(m: &JobModel, notice: Option<Notice>) -> Markup {
-    let name = m.row.name();
-    let frame = Frame {
-        title: &name,
+pub fn job_screen<'a>(m: &JobModel, name: &'a str, url: &'a str) -> Screen<'a> {
+    Screen {
+        title: name,
         nav: Nav::None,
+        url,
         job: Some(m.row.job.id),
-        notice,
-    };
-    page(frame, &bar(m.site, m.now, None), &job_content(m))
+        site: m.site,
+        now: m.now,
+        above: bar(m.site, m.now, None),
+        content: job_content(m),
+        partials: Vec::new(),
+    }
 }
 
 // ----------------------------------------------------------------------- errors
@@ -734,17 +851,26 @@ pub fn job_page(m: &JobModel, notice: Option<Notice>) -> Markup {
 #[must_use]
 pub fn error_page(problem: &ProblemDetails) -> Markup {
     let content = html! {
-        h1 { (problem.title) }
-        @if let Some(detail) = &problem.detail { p { (detail) } }
-        p { a class="btn" href="/" { "Back to the dashboard" } }
+        div class="mx-auto flex max-w-md flex-col items-start gap-3 py-10" {
+            p class="eyebrow" { "Error " (problem.status) }
+            h1 class="display text-3xl font-semibold" { (problem.title) }
+            @if let Some(detail) = &problem.detail { p class="text-muted" { (detail) } }
+            a class="btn" href="/" { "Back to the dashboard" }
+        }
     };
-    let frame = Frame {
+    // A plain page: nothing on it changes, so there is nothing to refresh.
+    let screen = Screen {
         title: &problem.title,
         nav: Nav::None,
+        url: "",
         job: None,
-        notice: None,
+        site: SiteStatus::Healthy,
+        now: Timestamp::UNIX_EPOCH,
+        above: html! {},
+        content,
+        partials: Vec::new(),
     };
-    page(frame, &html! {}, &content)
+    full_page(&screen, None)
 }
 
 #[cfg(test)]

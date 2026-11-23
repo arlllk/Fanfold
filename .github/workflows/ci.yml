@@ -92,9 +92,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       # The self-hosted scripts are the ones the vendor lock names (a Renovate bump fails here
-      # until vendor-sync.yml has pushed its files).
+      # until vendor-sync.yml has pushed its files), and the committed app.css is what the
+      # locked Tailwind builds from the views.
       - name: Web assets
-        run: python3 -I scripts/vendor.py check
+        run: |
+          set -euo pipefail
+          python3 -I scripts/vendor.py check
+          python3 -I scripts/vendor.py css --check
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -134,6 +138,8 @@ jobs:
             --python-interpreter-path "$FFD_PYTHON"
           "$(dirname "$FFD_PYTHON")/pyrefly" check --config scripts/pyrefly.toml \
             --python-interpreter-path "$FFD_PYTHON"
+          "$(dirname "$FFD_PYTHON")/pyrefly" check --config crates/adapters/web/tests/browser/pyrefly.toml \
+            --python-interpreter-path "$FFD_PYTHON"
           "$FFD_PYTHON" -I -B -m unittest discover -s crates/adapters/fanficfare/worker
           "$FFD_PYTHON" -I -B -m unittest discover -s scripts
           cargo test --locked -p fanfold-adapter-fanficfare -- --ignored
@@ -145,6 +151,14 @@ jobs:
           set -euo pipefail
           python3 -I -B -m unittest discover -s browser
           uv lock --project browser --check
+
+      # The UI in a real browser (the runner's Google Chrome, Playwright from the venv): the
+      # parts a bump of htmx or Alpine could break without any Rust test noticing.
+      - name: Web UI in a browser
+        run: |
+          set -euo pipefail
+          cargo build --locked -p fanfold-adapter-web --example demo
+          "$FFD_PYTHON" -I -B -m unittest discover -s crates/adapters/web/tests/browser
 
       - name: Integration, end to end
         run: scripts/with-postgres.sh cargo test --locked -p fanfold-server --test e2e -- --ignored

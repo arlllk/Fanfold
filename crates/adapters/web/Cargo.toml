@@ -12,6 +12,7 @@ license.workspace = true
 fanfold-app = { workspace = true }
 fanfold-domain = { workspace = true }
 axum = { workspace = true, features = ["http1", "tokio"] }
+futures-util = { workspace = true }
 http = { workspace = true }
 jiff = { workspace = true }
 maud = { workspace = true }

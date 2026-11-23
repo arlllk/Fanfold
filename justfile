@@ -33,6 +33,7 @@ test-postgres:
 lint-python:
     {{parent_directory(ffd_python)}}/pyrefly check --config crates/adapters/fanficfare/worker/pyrefly.toml --python-interpreter-path {{ffd_python}}
     {{parent_directory(ffd_python)}}/pyrefly check --config scripts/pyrefly.toml --python-interpreter-path {{ffd_python}}
+    {{parent_directory(ffd_python)}}/pyrefly check --config crates/adapters/web/tests/browser/pyrefly.toml --python-interpreter-path {{ffd_python}}
 
 # The real Python worker: its own unit tests, then through FanFicFare against its offline
 # test site and a fake fanfold-browser (no network).
@@ -71,6 +72,12 @@ vendor-check:
 css:
     python3 -I scripts/vendor.py css
 
+# The UI in a real browser (Playwright from the venv, needs `just venv` and a Chromium):
+# search, suggestions, filters, live updates, no CSP violations.
+test-ui-browser:
+    cargo build -p fanfold-adapter-web --example demo
+    {{ffd_python}} -I -B -m unittest discover -s crates/adapters/web/tests/browser
+
 # The committed app.css is what `just css` would build.
 css-check:
     python3 -I scripts/vendor.py css --check
@@ -102,7 +109,7 @@ fuzz-all seconds="30":
 
 # --- everything -------------------------------------------------------------------
 
-ci: fmt-check lint lint-python vendor-check test test-browser integration
+ci: fmt-check lint lint-python vendor-check css-check test test-browser test-ui-browser integration
 
 fmt-check:
     cargo fmt --all -- --check

@@ -148,6 +148,8 @@ pub struct SeriesView {
     pub summary_html: String,
     pub complete: Option<bool>,
     pub followed: bool,
+    /// Whether AO3's series page was ever read: only then are its missing parts known.
+    pub listed: bool,
     /// In series order: the latest listing's, else by part number.
     pub parts: Vec<SeriesPartView>,
     /// Parts in the library.
@@ -337,6 +339,11 @@ impl LibraryBrowser {
             facets,
             totals: snapshot.totals,
         })
+    }
+
+    /// Totals over the whole library.
+    pub async fn totals(&self) -> Result<LibraryTotals, BrowseError> {
+        Ok(self.snapshot().await?.totals)
     }
 
     /// Every series with a book that matches `query` (with no query: every series, those
@@ -640,6 +647,7 @@ fn series_view(snapshot: &Snapshot, id: SeriesId, matches: impl Fn(WorkId) -> bo
         summary_html: shelf.map_or_else(String::new, |s| s.summary_html.clone()),
         complete: shelf.and_then(|s| s.complete),
         followed: shelf.is_some_and(|s| s.followed),
+        listed: shelf.is_some_and(|s| !s.listed.is_empty()),
         in_library: count32(books.len()),
         matching: count32(parts.iter().filter(|p| p.matches).count()),
         words: books

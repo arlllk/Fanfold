@@ -857,6 +857,7 @@ dependencies = [
  "fanfold-app",
  "fanfold-domain",
  "fanfold-testkit",
+ "futures-util",
  "http",
  "http-body-util",
  "jiff",

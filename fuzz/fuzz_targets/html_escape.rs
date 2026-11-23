@@ -9,7 +9,9 @@
 //! the web adapter's tests pins the reasoning.)
 #![no_main]
 
-use fanfold_adapter_web::views::{DashboardModel, JobModel, JobRow, dashboard, job_detail};
+use fanfold_adapter_web::views::{
+    DashboardModel, JobModel, JobRow, dashboard_content, job_content,
+};
 use fanfold_app::ports::{BookRecord, JobCounts, LogEntry, LogLevel, SiteStatus};
 use fanfold_domain::{
     Timestamp,
@@ -58,8 +60,8 @@ fn render(text: &str) -> Option<String> {
     };
     Some(format!(
         "{}{}",
-        dashboard(&dash).into_string(),
-        job_detail(&detail).into_string()
+        dashboard_content(&dash).into_string(),
+        job_content(&detail).into_string()
     ))
 }
 
