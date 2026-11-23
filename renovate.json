@@ -59,6 +59,29 @@
       "matchStrings": [
         "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+)\\s*\\n\\s*(?:version|syft-version|grype-version):\\s*\"?(?<currentValue>[^\\s\"]+)\"?"
       ]
+    },
+    {
+      "customType": "regex",
+      "description": "The web UI's self-hosted scripts (npm packages) in the vendor lock. Renovate edits only the `version` line; the vendor-sync workflow then downloads the files and fills in the hashes on the same branch (the hosted app cannot run post-upgrade commands).",
+      "managerFilePatterns": [
+        "/(^|/)crates/adapters/web/assets/vendor/vendor\\.toml$/"
+      ],
+      "matchStrings": [
+        "package = \"(?<depName>[^\"]+)\"\\nversion = \"(?<currentValue>[^\"]+)\""
+      ],
+      "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "description": "Tools in the vendor lock, released on GitHub with a `v` tag (the Tailwind CSS compiler). vendor-sync fills in each platform's sha256 from the release's sha256sums.txt.",
+      "managerFilePatterns": [
+        "/(^|/)crates/adapters/web/assets/vendor/vendor\\.toml$/"
+      ],
+      "matchStrings": [
+        "repository = \"(?<depName>[^\"]+)\"\\nversion = \"(?<currentValue>[^\"]+)\""
+      ],
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.+)$"
     }
   ],
   "packageRules": [
@@ -99,6 +122,27 @@
       "dependencyDashboardApproval": true
     },
     {
+      "description": "htmx 4 is published under npm's `next` tag (`latest` stays on 2.x until about 2027), so look past `latest` for htmx's updates.",
+      "matchDatasources": [
+        "npm"
+      ],
+      "matchPackageNames": [
+        "htmx.org"
+      ],
+      "respectLatest": false
+    },
+    {
+      "description": "A new major version of a vendored script or of Tailwind changes how the UI's markup behaves (htmx 2 to 4 renamed every event): never automerged, and proposed only once approved on the dependency dashboard.",
+      "matchFileNames": [
+        "crates/adapters/web/assets/vendor/vendor.toml"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "automerge": false,
+      "dependencyDashboardApproval": true
+    },
+    {
       "description": "Automerge patch updates of stable (>= 1.0) dependencies once the required `ci-ok` check passes (GitHub auto-merge, enforced by the main ruleset). Minor and major updates, and patches of anything still on 0.x (where a patch may break), run CI and wait for a human. Digest and pin updates: next rule. Last on purpose, so no rule above overrides it. Lock file maintenance automerges too (top-level lockFileMaintenance). Each merge is a patch release (release.yml).",
       "matchUpdateTypes": [
         "patch"
@@ -115,5 +159,8 @@
       ],
       "automerge": true
     }
+  ],
+  "gitIgnoredAuthors": [
+    "358558070+fanfold-bot[bot]@users.noreply.github.com"
   ]
 }

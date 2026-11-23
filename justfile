@@ -57,6 +57,24 @@ integration: test-postgres test-worker e2e
 
 # --- the UI -----------------------------------------------------------------------
 
+# Download the self-hosted scripts the vendor lock names and fill in their hashes (after
+# changing a `version` line in crates/adapters/web/assets/vendor/vendor.toml).
+vendor:
+    python3 -I scripts/vendor.py sync
+
+# The vendored files are exactly the locked ones (offline).
+vendor-check:
+    python3 -I scripts/vendor.py check
+
+# Compile app.css from app.src.css and the classes in the Rust views (the locked Tailwind,
+# downloaded once into target/tools). Commit the result.
+css:
+    python3 -I scripts/vendor.py css
+
+# The committed app.css is what `just css` would build.
+css-check:
+    python3 -I scripts/vendor.py css --check
+
 # The real UI over realistic in-memory data: http://127.0.0.1:8099 (add `-- --degraded` for the outage state).
 demo *args:
     cargo run -p fanfold-adapter-web --example demo {{args}}
@@ -84,7 +102,7 @@ fuzz-all seconds="30":
 
 # --- everything -------------------------------------------------------------------
 
-ci: fmt-check lint lint-python test test-browser integration
+ci: fmt-check lint lint-python vendor-check test test-browser integration
 
 fmt-check:
     cargo fmt --all -- --check
