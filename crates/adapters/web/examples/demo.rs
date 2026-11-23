@@ -337,6 +337,14 @@ fn library_admin(
     ))
 }
 
+/// The library pages, over the demo's books and the real (in-memory) index.
+fn browser(repo: &Arc<InMemoryJobs>) -> Arc<fanfold_app::browse::LibraryBrowser> {
+    Arc::new(fanfold_app::browse::LibraryBrowser::new(
+        repo.clone(),
+        Arc::new(fanfold_adapter_search::TantivyIndexer),
+    ))
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -425,6 +433,7 @@ async fn main() {
         catalog: repo.clone(),
         metadata: repo.clone(),
         listing: repo.clone(),
+        browser: browser(&repo),
         admin: Arc::new(JobAdmin::new(repo.clone(), clock.clone())),
         library: library_admin(&repo, &clock),
         events: repo.clone(),

@@ -7,6 +7,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -15,14 +16,17 @@ use fanfold_domain::{
     failure::FailureKind,
     job::{Job, JobId, JobSource, Target},
     metadata::{
-        Chapter, FollowSource, SeriesMetadata, SeriesPart, Tag, WorkFacts, WorkMetadata, WorkState,
-        WorkStats, WorkVersionChanges,
+        Author, Chapter, FollowSource, SeriesMetadata, SeriesPart, Tag, TagKind, WorkFacts,
+        WorkMetadata, WorkState, WorkStats, WorkVersionChanges,
     },
     work::{SeriesId, WorkId},
 };
 use tokio::sync::broadcast;
 
-use crate::error::{MailError, NotifyError, RepoError, StoreError};
+use crate::{
+    error::{MailError, NotifyError, RepoError, SearchError, StoreError},
+    search::{SearchQuery, TextField},
+};
 
 // ---------------------------------------------------------------- time, chance
 
@@ -247,87 +251,15 @@ pub trait BookCatalog: Send + Sync {
 
 // --------------------------------------------------------------------- library
 
-/// Which books a library listing shows, by completion.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub enum LibraryStatus {
-    #[default]
-    All,
-    /// Every chapter the author planned is posted.
-    Complete,
-    /// Known, and not complete (including works whose total AO3 shows as "?").
-    InProgress,
-}
-
-impl LibraryStatus {
-    pub const ALL: [Self; 3] = [Self::All, Self::Complete, Self::InProgress];
-
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::Complete => "complete",
-            Self::InProgress => "in_progress",
-        }
-    }
-
-    #[must_use]
-    pub fn parse(raw: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|s| s.as_str() == raw)
-    }
-}
-
-/// The order of a library listing. Every order ends with the work id, so it is total.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub enum LibrarySort {
-    /// AO3's "updated" date, newest first (works without one last), then the newest book.
-    #[default]
-    Updated,
-    /// By title, A to Z (lower-cased, by code point).
-    Title,
-    /// By byline, A to Z (lower-cased, by code point), then title.
-    Author,
-    /// Longest first.
-    Words,
-}
-
-impl LibrarySort {
-    pub const ALL: [Self; 4] = [Self::Updated, Self::Title, Self::Author, Self::Words];
-
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Updated => "updated",
-            Self::Title => "title",
-            Self::Author => "author",
-            Self::Words => "words",
-        }
-    }
-
-    #[must_use]
-    pub fn parse(raw: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|s| s.as_str() == raw)
-    }
-}
-
-/// One page of the library to list.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LibraryQuery {
-    /// Case-insensitive substring of the title, the byline, any current tag, or a series
-    /// name. Blank means everything.
-    pub search: Option<String>,
-    pub status: LibraryStatus,
-    pub sort: LibrarySort,
-    pub limit: u32,
-    pub offset: u32,
-}
-
 /// One book in the library, with what AO3 last said about its work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryEntry {
     pub book: BookRecord,
     /// The latest recorded facts; `None` for a book whose work was never observed.
     pub facts: Option<WorkFacts>,
-    /// The work's current fandom, relationship and warning tags, in AO3's order.
+    /// The work's current creators, in AO3's order.
+    pub authors: Vec<Author>,
+    /// Every current tag, in AO3's order.
     pub tags: Vec<Tag>,
     pub series: Vec<SeriesPart>,
     /// The latest counters.
@@ -349,31 +281,131 @@ impl LibraryEntry {
             .as_ref()
             .map(|f| f.chapters_total == Some(f.chapters_posted))
     }
+
+    /// The current tags of one kind, in AO3's order.
+    pub fn tags_of(&self, kind: TagKind) -> impl Iterator<Item = &str> {
+        self.tags
+            .iter()
+            .filter(move |t| t.kind == kind)
+            .map(|t| t.name.as_str())
+    }
 }
 
-/// Totals over the whole library, whatever the query.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LibraryTotals {
-    pub books: u64,
-    pub words: u64,
-    pub complete: u64,
+/// Changes whenever anything [`LibraryCatalog`] returns may have changed (a book saved or
+/// deleted, a work or series observed, a series followed). Opaque: only compared.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct LibraryRevision(pub Vec<i64>);
+
+/// One work of a series listing, with its title if it was ever observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesWork {
+    pub work: WorkId,
+    pub title: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LibraryPage {
-    pub entries: Vec<LibraryEntry>,
-    /// How many books match the query (all pages).
-    pub matching: u64,
-    pub totals: LibraryTotals,
+/// A series that a book in the library belongs to, or that is followed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesShelf {
+    pub id: SeriesId,
+    /// Its latest listing's name, else the name a member work's page gave it.
+    pub name: String,
+    /// From its latest listing (empty if it was never listed).
+    pub summary_html: String,
+    /// `None`: never listed, or the listing did not say.
+    pub complete: Option<bool>,
+    /// The works of its latest listing, in series order (empty if it was never listed).
+    pub listed: Vec<SeriesWork>,
+    pub followed: bool,
 }
 
-/// The library as a list: every book, with its work's latest metadata.
+/// The library, read whole: it is small enough (thousands of books at most), and every
+/// rule about searching, filtering and ordering it then lives in one place, the application.
 #[cfg_attr(any(test, feature = "mocks"), mockall::automock)]
 #[async_trait]
 pub trait LibraryCatalog: Send + Sync {
-    async fn library(&self, query: &LibraryQuery) -> Result<LibraryPage, RepoError>;
+    /// Cheap to ask: a listing is rebuilt only when it changes.
+    async fn revision(&self) -> Result<LibraryRevision, RepoError>;
+    /// Every book, in work order.
+    async fn shelf(&self) -> Result<Vec<LibraryEntry>, RepoError>;
     /// One book, as listed (`None` when the work has no book).
     async fn entry(&self, work: WorkId) -> Result<Option<LibraryEntry>, RepoError>;
+    /// Every series a book belongs to or that is followed, in id order.
+    async fn series_shelf(&self) -> Result<Vec<SeriesShelf>, RepoError>;
+}
+
+// ---------------------------------------------------------------------- search
+
+/// One book a search found, with its relevance (higher is better; equal for pure filters).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Hit {
+    pub work: WorkId,
+    pub score: f32,
+}
+
+/// What a suggestion would add to a search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SuggestionKind {
+    Author,
+    Series,
+    Fandom,
+    Relationship,
+    Character,
+    Tag,
+    Warning,
+    Language,
+    /// A book: picking it opens it.
+    Book,
+}
+
+impl SuggestionKind {
+    /// The field a picked suggestion filters on (`None` for a book).
+    #[must_use]
+    pub const fn field(self) -> Option<TextField> {
+        Some(match self {
+            Self::Author => TextField::Author,
+            Self::Series => TextField::Series,
+            Self::Fandom => TextField::Fandom,
+            Self::Relationship => TextField::Relationship,
+            Self::Character => TextField::Character,
+            Self::Tag => TextField::Tag,
+            Self::Warning => TextField::Warning,
+            Self::Language => TextField::Language,
+            Self::Book => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suggestion {
+    pub kind: SuggestionKind,
+    /// As shown: "quillandink", "The Harbor Saga".
+    pub label: String,
+    /// The exact value a picked suggestion filters on (lower-cased).
+    pub value: String,
+    /// How many books have it.
+    pub books: u32,
+    /// The book, for [`SuggestionKind::Book`].
+    pub work: Option<WorkId>,
+}
+
+/// The library as a search index, built from [`LibraryCatalog::shelf`].
+#[async_trait]
+pub trait SearchIndexer: Send + Sync {
+    async fn build(&self, shelf: &[LibraryEntry]) -> Result<Arc<dyn SearchIndex>, SearchError>;
+}
+
+/// One built index. Read-only, so any number of requests use it at once.
+pub trait SearchIndex: Send + Sync + std::fmt::Debug {
+    /// Every book the query matches, best first. The order of equal scores is unspecified.
+    fn find(&self, query: &SearchQuery) -> Result<Vec<Hit>, SearchError>;
+    /// Values of `field` (any field, for [`TextField::Any`], books included) that start
+    /// like `partial` or are close to it, most books first.
+    fn suggest(
+        &self,
+        field: TextField,
+        partial: &str,
+        limit: usize,
+    ) -> Result<Vec<Suggestion>, SearchError>;
 }
 
 /// The folder the e-reader syncs from.

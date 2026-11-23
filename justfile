@@ -88,7 +88,7 @@ live-mail:
 
 # Mutation testing of the logic crates. Slow; surviving mutants are test gaps.
 mutants *args:
-    cargo mutants -p fanfold-domain -p fanfold-app -p fanfold-adapter-web {{args}}
+    cargo mutants -p fanfold-domain -p fanfold-app -p fanfold-adapter-web -p fanfold-adapter-search {{args}}
 
 # Fuzz one target (needs nightly): just fuzz work_url 60
 fuzz target seconds="60":
@@ -96,7 +96,7 @@ fuzz target seconds="60":
 
 # Every fuzz target for a short time.
 fuzz-all seconds="30":
-    for t in work_url mail_links book_file_name worker_output config ini_render discord_sanitize form_ids csrf event_payload html_escape jmap_email sender_filter; do \
+    for t in work_url mail_links book_file_name worker_output config ini_render discord_sanitize form_ids csrf event_payload html_escape jmap_email sender_filter search_query; do \
         just fuzz $t {{seconds}}; \
     done
 

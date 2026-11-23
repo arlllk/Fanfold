@@ -8,9 +8,11 @@
 //! in this crate knows about Postgres, JMAP, Python or Discord.
 
 pub mod admin;
+pub mod browse;
 pub mod error;
 pub mod ingest;
 pub mod library;
 pub mod ports;
+pub mod search;
 pub mod stats;
 pub mod worker;

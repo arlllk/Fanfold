@@ -27,10 +27,12 @@ use axum::{
 };
 use fanfold_app::{
     admin::{AdminError, JobAdmin},
+    browse::{BrowseError, LibraryBrowser, LibrarySort},
     ports::{
         BookCatalog, Clock, Event, EventSource, JobFilter, JobRepository, LibraryCatalog,
-        LibraryQuery, LibrarySort, LibraryStatus, MetadataStore, Readiness, SiteStatusSource,
+        MetadataStore, Readiness, SiteStatusSource,
     },
+    search::{Clause, Flag, SearchQuery, Token},
     stats::{MailStats, WorkerStats},
 };
 use fanfold_domain::{
@@ -66,8 +68,10 @@ pub struct WebDeps {
     pub admin: Arc<JobAdmin>,
     /// The delete buttons.
     pub library: Arc<fanfold_app::library::LibraryAdmin>,
-    /// The library page: every book with its metadata.
+    /// One book's page.
     pub listing: Arc<dyn LibraryCatalog>,
+    /// The library pages: search, series, authors, fandoms.
+    pub browser: Arc<LibraryBrowser>,
     pub events: Arc<dyn EventSource>,
     pub site: Arc<dyn SiteStatusSource>,
     pub clock: Arc<dyn Clock>,
@@ -320,8 +324,31 @@ async fn library_page(
     }
 }
 
-/// Longest search accepted; anything longer is cut (nobody types a 200-character title).
-const MAX_SEARCH_CHARS: usize = 200;
+/// Longest search accepted; anything longer is cut (nobody types a 500-character search).
+const MAX_SEARCH_CHARS: usize = 500;
+
+fn browse_problem(error: &BrowseError) -> ProblemDetails {
+    internal(error)
+}
+
+/// The search in a library URL: `q`, plus the completion filter of older links (`status`).
+fn library_query(pairs: &[(String, String)]) -> SearchQuery {
+    let text: String = forms::first(pairs, "q")
+        .unwrap_or("")
+        .chars()
+        .take(MAX_SEARCH_CHARS)
+        .collect();
+    let query = SearchQuery::parse(&text);
+    let legacy = match forms::first(pairs, "status") {
+        Some("complete") => Some(Flag::Complete),
+        Some("in_progress") => Some(Flag::InProgress),
+        _ => None,
+    };
+    match legacy {
+        Some(flag) => query.with(Token::new(Clause::Is(flag)), |_| false),
+        None => query,
+    }
+}
 
 async fn library_inner(
     deps: &WebDeps,
@@ -334,29 +361,21 @@ async fn library_inner(
         .filter(|p| *p >= 1)
         .unwrap_or(1);
     let size = deps.page_size.max(1);
-    let library_query = LibraryQuery {
-        search: forms::first(&pairs, "q")
-            .map(|q| q.trim().chars().take(MAX_SEARCH_CHARS).collect::<String>())
-            .filter(|q| !q.is_empty()),
-        status: forms::first(&pairs, "status")
-            .and_then(LibraryStatus::parse)
-            .unwrap_or_default(),
-        sort: forms::first(&pairs, "sort")
-            .and_then(LibrarySort::parse)
-            .unwrap_or_default(),
-        limit: size,
-        offset: (page - 1).saturating_mul(size),
-    };
+    let offset = (page - 1).saturating_mul(size);
+    let search = library_query(&pairs);
+    let sort = forms::first(&pairs, "sort").and_then(LibrarySort::parse);
     let result = deps
-        .listing
-        .library(&library_query)
+        .browser
+        .books(&search, sort, offset, size)
         .await
-        .map_err(|e| internal(&e))?;
+        .map_err(|e| browse_problem(&e))?;
     let model = views::library::LibraryModel {
         now: deps.clock.now(),
         site: deps.site.site_status(),
-        query: library_query,
+        query: search,
+        sort,
         page,
+        offset,
         result,
     };
     let notice = Notice::from_query(&pairs);

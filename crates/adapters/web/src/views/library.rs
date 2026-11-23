@@ -3,8 +3,10 @@
 //! Covers are drawn in CSS (no images, nothing inline: the CSP forbids it). Each one takes a
 //! stable colour from its first fandom (`.hue-N`), so a fandom's books look alike.
 
-use fanfold_app::ports::{
-    LibraryEntry, LibraryPage, LibraryQuery, LibrarySort, LibraryStatus, SiteStatus,
+use fanfold_app::{
+    browse::{BookList, LibrarySort},
+    ports::{LibraryEntry, SiteStatus},
+    search::{Clause, Flag, SearchQuery, Token},
 };
 use fanfold_domain::{
     Timestamp,
@@ -19,19 +21,41 @@ use crate::format::{day, grouped, hue, rating_badge, short, summary_paragraphs};
 pub struct LibraryModel {
     pub now: Timestamp,
     pub site: SiteStatus,
-    pub query: LibraryQuery,
+    pub query: SearchQuery,
+    /// The order asked for in the URL (`None`: the natural one, see `LibrarySort::effective`).
+    pub sort: Option<LibrarySort>,
     /// 1-based.
     pub page: u32,
-    pub result: LibraryPage,
+    /// Books before this page.
+    pub offset: u32,
+    pub result: BookList,
 }
 
 impl LibraryModel {
     fn has_next(&self) -> bool {
-        u64::from(self.query.offset) + (self.result.entries.len() as u64) < self.result.matching
+        u64::from(self.offset) + (self.result.entries.len() as u64) < self.result.matching
     }
 
-    fn search(&self) -> &str {
-        self.query.search.as_deref().map_or("", str::trim)
+    /// The query as the search box shows it.
+    fn search(&self) -> String {
+        self.query.render().trim_end().to_owned()
+    }
+
+    /// The completion filter the query has (`None`: all).
+    fn status(&self) -> Option<Flag> {
+        self.query.tokens.iter().find_map(|t| match t.clause {
+            Clause::Is(flag @ (Flag::Complete | Flag::InProgress)) if !t.negated => Some(flag),
+            _ => None,
+        })
+    }
+}
+
+/// The query with this completion filter (`None`: none) instead of the one it had.
+fn with_status(query: &SearchQuery, status: Option<Flag>) -> SearchQuery {
+    let completion = |t: &Token| matches!(t.clause, Clause::Is(Flag::Complete | Flag::InProgress));
+    match status {
+        Some(flag) => query.with(Token::new(Clause::Is(flag)), completion),
+        None => query.without(completion),
     }
 }
 
@@ -44,29 +68,30 @@ pub struct BookModel {
     pub state: Option<WorkState>,
 }
 
-const STATUS_LABELS: [(LibraryStatus, &str); 3] = [
-    (LibraryStatus::All, "All"),
-    (LibraryStatus::Complete, "Complete"),
-    (LibraryStatus::InProgress, "In progress"),
+const STATUS_LABELS: [(Option<Flag>, &str); 3] = [
+    (None, "All"),
+    (Some(Flag::Complete), "Complete"),
+    (Some(Flag::InProgress), "In progress"),
 ];
 
-const SORT_LABELS: [(LibrarySort, &str); 4] = [
+const SORT_LABELS: [(LibrarySort, &str); 6] = [
+    (LibrarySort::Relevance, "Best match"),
     (LibrarySort::Updated, "Recently updated"),
     (LibrarySort::Title, "Title"),
     (LibrarySort::Author, "Author"),
     (LibrarySort::Words, "Longest"),
+    (LibrarySort::Kudos, "Most kudos"),
 ];
 
 /// A link to the library with these settings; defaults are left out of the URL.
-fn library_href(search: &str, status: LibraryStatus, sort: LibrarySort, page: u32) -> String {
+fn library_href(query: &SearchQuery, sort: Option<LibrarySort>, page: u32) -> String {
     let mut parts: Vec<String> = Vec::new();
+    let search = query.render();
+    let search = search.trim_end();
     if !search.is_empty() {
         parts.push(format!("q={}", form_encode(search)));
     }
-    if status != LibraryStatus::All {
-        parts.push(format!("status={}", status.as_str()));
-    }
-    if sort != LibrarySort::Updated {
+    if let Some(sort) = sort {
         parts.push(format!("sort={}", sort.as_str()));
     }
     if page > 1 {
@@ -213,7 +238,7 @@ fn shelf_item(entry: &LibraryEntry) -> Markup {
 pub fn library_content(m: &LibraryModel) -> Markup {
     let totals = m.result.totals;
     let search = m.search();
-    let filtered = !search.is_empty() || m.query.status != LibraryStatus::All;
+    let filtered = !m.query.is_empty();
     html! {
         p class="lib-stats" {
             span { strong { (grouped(totals.books)) } (if totals.books == 1 { " book" } else { " books" }) }
@@ -222,8 +247,8 @@ pub fn library_content(m: &LibraryModel) -> Markup {
         }
         nav class="seg" aria-label="Completion" {
             @for (status, label) in STATUS_LABELS {
-                a href=(library_href(search, status, m.query.sort, 1))
-                  aria-current=[(status == m.query.status).then_some("page")] { (label) }
+                a href=(library_href(&with_status(&m.query, status), m.sort, 1))
+                  aria-current=[(status == m.status()).then_some("page")] { (label) }
             }
         }
         @if filtered {
@@ -244,11 +269,11 @@ pub fn library_content(m: &LibraryModel) -> Markup {
         @if m.page > 1 || m.has_next() {
             nav class="pager" aria-label="Pages" {
                 @if m.page > 1 {
-                    a class="btn" rel="prev" href=(library_href(search, m.query.status, m.query.sort, m.page - 1)) { "← Newer" }
+                    a class="btn" rel="prev" href=(library_href(&m.query, m.sort, m.page - 1)) { "← Previous" }
                 }
                 span { "Page " (m.page) }
                 @if m.has_next() {
-                    a class="btn" rel="next" href=(library_href(search, m.query.status, m.query.sort, m.page + 1)) { "Older →" }
+                    a class="btn" rel="next" href=(library_href(&m.query, m.sort, m.page + 1)) { "Next →" }
                 }
             }
         }
@@ -261,16 +286,13 @@ fn library_tools(m: &LibraryModel) -> Markup {
     html! {
         h1 class="lib-title" { "Library" }
         form class="lib-tools" method="get" action="/library" role="search" {
-            @if m.query.status != LibraryStatus::All {
-                input type="hidden" name="status" value=(m.query.status.as_str());
-            }
             label class="sr-only" for="q" { "Search the library" }
             input id="q" name="q" type="search" value=(m.search()) autocomplete="off"
                   placeholder="Title, author, tag or series";
             label class="sr-only" for="sort" { "Order" }
             select id="sort" name="sort" {
                 @for (sort, label) in SORT_LABELS {
-                    option value=(sort.as_str()) selected[sort == m.query.sort] { (label) }
+                    option value=(sort.as_str()) selected[sort == m.result.sort] { (label) }
                 }
             }
             button class="btn primary" type="submit" { "Search" }
@@ -465,13 +487,14 @@ mod tests {
 
     #[test]
     fn library_links_leave_defaults_out() {
+        assert_eq!(library_href(&SearchQuery::default(), None, 1), "/library");
         assert_eq!(
-            library_href("", LibraryStatus::All, LibrarySort::Updated, 1),
-            "/library"
-        );
-        assert_eq!(
-            library_href("ada & ben", LibraryStatus::Complete, LibrarySort::Words, 2),
-            "/library?q=ada+%26+ben&status=complete&sort=words&page=2"
+            library_href(
+                &SearchQuery::parse("ada & is:complete"),
+                Some(LibrarySort::Words),
+                2
+            ),
+            "/library?q=ada+%26+is%3Acomplete&sort=words&page=2"
         );
         assert_eq!(form_encode("é/?"), "%C3%A9%2F%3F");
     }

@@ -75,6 +75,10 @@ fn rig_with_page_size(page_size: u32) -> Rig {
         catalog: jobs.clone(),
         metadata: jobs.clone(),
         listing: jobs.clone(),
+        browser: Arc::new(fanfold_app::browse::LibraryBrowser::new(
+            jobs.clone(),
+            Arc::new(fanfold_adapter_search::TantivyIndexer),
+        )),
         admin: Arc::new(JobAdmin::new(jobs.clone(), clock.clone())),
         library: Arc::new(fanfold_app::library::LibraryAdmin::new(
             jobs.clone(),
@@ -1573,8 +1577,8 @@ async fn the_library_lists_every_book_with_what_ao3_said() {
     assert!(complete.contains("Alpha Light") && !complete.contains("Beta Tide"));
     assert!(complete.contains("1 of 3 books"));
     assert!(
-        complete.contains(r#"name="status" value="complete""#),
-        "searching keeps the filter"
+        complete.contains(r#"value="is:complete""#),
+        "an old link's filter becomes part of the search, so searching keeps it"
     );
 
     let search = get(&rig.ui, "/library?q=beta").await.body;
