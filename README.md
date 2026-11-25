@@ -128,7 +128,7 @@ password = { file = "/run/secrets/x" } # a file (a trailing newline is ignored)
 | `[retry]` | `max_attempts` (5), `base` (`1m`), `cap` (`1h`) | A failing job is retried with a doubling delay (with `1m`/`1h`: 1, 2, 4, 8... minutes, then hourly), AO3 outages and rate limits included, so a struggling AO3 is asked ever more rarely. Only failures that are the work's own fault use up attempts; AO3 being down does not. |
 | `[breaker]` | `failure_threshold` (3), `open_for` (`2m`), `max_open_for` (`1h`) | After this many site-wide failures in a row, Fanfold pauses downloads and probes now and then. |
 | `[worker]` | `poll_interval` (`5s`), `concurrency` (1) | Keep concurrency at 1: AO3 rate-limits. |
-| `[web]` | `listen` (`0.0.0.0:8080`), `ops_listen` (`0.0.0.0:9090`), `page_size` (20) | The interface, and the health and metrics port. |
+| `[web]` | `listen` (`0.0.0.0:8080`), `ops_listen` (`0.0.0.0:9090`), `page_size` (20), `moon_reader_button` (`"android"`) | The interface, and the health and metrics port. `moon_reader_button` is when book pages offer "Open in Moon+ Reader" (needs the [fanfold-moonbridge](https://github.com/arlllk/fanfold-moonbridge) Android app): `"android"`, `"always"` or `"never"`. |
 | `[mail]` | see [Adding works](#adding-works) | Optional. Queue works from AO3 emails. |
 | `[discord]` | `webhook`, `failures_webhook`, `ui_url` | Optional. Rich messages for new books, new chapters and followed series go to `webhook`; failures (gave up, AO3 unhealthy, AO3 back) only to `failures_webhook`, if set (a muted channel works well). `ui_url` links each message to its job. |
 

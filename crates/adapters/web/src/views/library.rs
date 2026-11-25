@@ -999,6 +999,21 @@ pub struct BookModel {
     pub entry: LibraryEntry,
     /// Everything recorded about the work (all its tags, its chapters).
     pub state: Option<WorkState>,
+    pub moon_reader: MoonReaderButton,
+}
+
+/// When a book page offers "Open in Moon+ Reader", a `fanfold://` link only the Android
+/// bridge app (`fanfold-moonbridge`) can follow.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MoonReaderButton {
+    /// On Android browsers only (decided by a script; hidden without one).
+    #[default]
+    Android,
+    /// On every device: for a browser that hides being on Android.
+    Always,
+    /// Never: no bridge app on any device.
+    Never,
 }
 
 const TAG_SECTIONS: [(TagKind, &str, TextField); 6] = [
@@ -1022,8 +1037,8 @@ fn stat(label: &str, value: Option<String>) -> Markup {
     }
 }
 
-/// Cover, title, byline, badges and the two actions.
-fn work_head(entry: &LibraryEntry) -> Markup {
+/// Cover, title, byline, badges and the actions.
+fn work_head(entry: &LibraryEntry, moon_reader: MoonReaderButton) -> Markup {
     let work = entry.book.work;
     html! {
         header class="work-head flex flex-col gap-5 sm:flex-row sm:items-start" {
@@ -1051,10 +1066,17 @@ fn work_head(entry: &LibraryEntry) -> Markup {
                 div class="actions mt-2 flex flex-wrap gap-2" {
                     a class="btn" href=(work.canonical_url()) target="_blank" rel="noreferrer noopener" { "Open on AO3" }
                     (download_form(&work.canonical_url(), "Check for updates", true))
-                    // Shown by `androidOnly` on Android, where the Fanfold → Moon+ bridge app
-                    // opens the synced copy; hidden everywhere else and without scripts.
-                    a class="btn" href=(moon_reader_href(&entry.book.file_name)) hidden
-                        x-data="androidOnly" x-bind:hidden="hidden" { "Open in Moon+ Reader" }
+                    @match moon_reader {
+                        // `androidOnly` reveals it on Android; hidden elsewhere and without scripts.
+                        MoonReaderButton::Android => {
+                            a class="btn" href=(moon_reader_href(&entry.book.file_name)) hidden
+                                x-data="androidOnly" x-bind:hidden="hidden" { "Open in Moon+ Reader" }
+                        }
+                        MoonReaderButton::Always => {
+                            a class="btn" href=(moon_reader_href(&entry.book.file_name)) { "Open in Moon+ Reader" }
+                        }
+                        MoonReaderButton::Never => {}
+                    }
                 }
             }
         }
@@ -1111,7 +1133,7 @@ pub fn book_content(m: &BookModel) -> Markup {
     html! {
         a class="back text-sm" href="/library" { "← Library" }
         article class="work flex flex-col gap-8" {
-            (work_head(entry))
+            (work_head(entry, m.moon_reader))
 
             @if let Some(f) = facts {
                 @let paragraphs = summary_paragraphs(&f.summary_html);

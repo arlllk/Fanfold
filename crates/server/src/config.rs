@@ -8,6 +8,7 @@
 
 use std::{path::PathBuf, str::FromStr, time::Duration};
 
+use fanfold_adapter_web::views::library::MoonReaderButton;
 use secrecy::SecretString;
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
@@ -218,6 +219,8 @@ pub struct WebConfig {
     pub ops_listen: std::net::SocketAddr,
     /// Jobs per page on the history view.
     pub page_size: u32,
+    /// When book pages offer "Open in Moon+ Reader" (Android, through fanfold-moonbridge).
+    pub moon_reader_button: MoonReaderButton,
 }
 
 impl Default for WebConfig {
@@ -226,6 +229,7 @@ impl Default for WebConfig {
             listen: ([0, 0, 0, 0], 8080).into(),
             ops_listen: ([0, 0, 0, 0], 9090).into(),
             page_size: 20,
+            moon_reader_button: MoonReaderButton::default(),
         }
     }
 }

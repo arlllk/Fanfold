@@ -61,6 +61,9 @@ concurrency = 1             # AO3 is rate limited; keep this at 1 unless you kno
 listen = "0.0.0.0:8080"       # the UI: put your gateway's login in front of it
 ops_listen = "0.0.0.0:9090"   # /healthz /readyz /metrics: keep internal
 page_size = 20                # jobs per page in History
+# "Open in Moon+ Reader" on book pages, through the fanfold-moonbridge Android app:
+# "android" (Android browsers only), "always" or "never".
+moon_reader_button = "android"
 
 # Optional. Without it, works are queued by hand (the UI form, `fanfold enqueue`).
 [mail]

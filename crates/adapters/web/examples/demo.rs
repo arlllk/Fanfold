@@ -346,6 +346,7 @@ fn browser(repo: &Arc<InMemoryJobs>) -> Arc<fanfold_app::browse::LibraryBrowser>
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines, reason = "one demo script, mostly fixtures")]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let degraded = args.iter().any(|a| a == "--degraded");
@@ -445,6 +446,7 @@ async fn main() {
         shutdown: stopped,
         max_attempts: 5,
         page_size: 8,
+        moon_reader: fanfold_adapter_web::views::library::MoonReaderButton::default(),
         version: "demo",
     });
     let _ = (ops_router, JobState::Queued);

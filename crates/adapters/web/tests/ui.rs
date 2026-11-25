@@ -18,7 +18,7 @@ use axum::{
     body::Body,
     http::{HeaderMap, Method, Request, StatusCode, header},
 };
-use fanfold_adapter_web::{WebDeps, ops_router, ui_router};
+use fanfold_adapter_web::{WebDeps, ops_router, ui_router, views::library::MoonReaderButton};
 use fanfold_app::{
     admin::JobAdmin,
     ports::{
@@ -65,6 +65,10 @@ struct Rig {
 }
 
 fn rig_with_page_size(page_size: u32) -> Rig {
+    rig_with(page_size, MoonReaderButton::default())
+}
+
+fn rig_with(page_size: u32, moon_reader: MoonReaderButton) -> Rig {
     let jobs = Arc::new(InMemoryJobs::new());
     let clock = Arc::new(FakeClock::at_secs(NOW));
     let site = Arc::new(FixedSite(Mutex::new(SiteStatus::Healthy)));
@@ -96,6 +100,7 @@ fn rig_with_page_size(page_size: u32) -> Rig {
         shutdown: stopped,
         max_attempts: 5,
         page_size,
+        moon_reader,
         version: "test",
     });
     Rig {
@@ -1732,6 +1737,26 @@ async fn a_book_page_shows_everything_and_never_trusts_the_summary() {
         get(&rig.ui, "/library/abc").await.status,
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test]
+async fn the_moon_reader_button_follows_the_setting() {
+    let link = r#"href="fanfold://open?path=The%20Keeper%20and%20the%20Logbook%20%5B7%5D.epub""#;
+    for (setting, shown, android_only) in [
+        (MoonReaderButton::Android, true, true),
+        (MoonReaderButton::Always, true, false),
+        (MoonReaderButton::Never, false, false),
+    ] {
+        let rig = rig_with(20, setting);
+        rig.observed(7, |_| {}).await;
+        let page = get(&rig.ui, "/library/7").await;
+        assert_eq!(page.body.contains(link), shown, "{setting:?}: the link");
+        assert_eq!(
+            page.body.contains(r#"x-data="androidOnly""#),
+            android_only,
+            "{setting:?}: hidden off Android"
+        );
+    }
 }
 
 #[tokio::test]
