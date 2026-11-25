@@ -1451,7 +1451,7 @@ async fn filter_chips_show_the_right_counts() {
     }
     let body = get(&rig.ui, "/jobs").await.body;
     for (label, count) in [("Active", 9), ("Retrying", 4), ("Failed", 1), ("Done", 5)] {
-        let chip = format!(r#"{label} <span class="mono tabular-nums opacity-70">{count}</span>"#);
+        let chip = format!(r#"{label} <span class="mono tabular-nums">{count}</span>"#);
         assert!(body.contains(&chip), "expected {chip:?} in the filters");
     }
 }

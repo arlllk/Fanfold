@@ -579,7 +579,7 @@ pub fn history_content(m: &HistoryModel) -> Markup {
                 @for (filter, label) in FILTERS {
                     a href=(history_href(filter, 1)) aria-current=[(filter == m.filter).then_some("page")] {
                         (label)
-                        @if let Some(n) = count_for(filter) { " " span class="mono tabular-nums opacity-70" { (n) } }
+                        @if let Some(n) = count_for(filter) { " " span class="mono tabular-nums" { (n) } }
                     }
                 }
             }
