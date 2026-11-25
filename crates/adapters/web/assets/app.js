@@ -133,8 +133,14 @@
     get panelClass() { return this.open ? '' : 'max-lg:hidden'; },
   });
 
+  // Links only the Android bridge app can follow (fanfold://) stay hidden elsewhere.
+  const androidOnly = () => ({
+    hidden: !/Android/i.test(window.navigator.userAgent),
+  });
+
   document.addEventListener('alpine:init', () => {
     window.Alpine.data('search', search);
     window.Alpine.data('disclosure', disclosure);
+    window.Alpine.data('androidOnly', androidOnly);
   });
 })();

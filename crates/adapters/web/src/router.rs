@@ -88,6 +88,8 @@ pub struct WebDeps {
     /// Shown as "x of N" on a job page.
     pub max_attempts: u32,
     pub page_size: u32,
+    /// When book pages offer "Open in Moon+ Reader".
+    pub moon_reader: crate::views::library::MoonReaderButton,
     pub version: &'static str,
 }
 
@@ -554,6 +556,7 @@ async fn book_inner(
         site: deps.site.site_status(),
         entry,
         state,
+        moon_reader: deps.moon_reader,
     };
     let notice = Notice::from_query(&query_pairs(query));
     Ok(respond(headers, &library::book_screen(&model, url), notice))

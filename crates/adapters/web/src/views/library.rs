@@ -999,6 +999,21 @@ pub struct BookModel {
     pub entry: LibraryEntry,
     /// Everything recorded about the work (all its tags, its chapters).
     pub state: Option<WorkState>,
+    pub moon_reader: MoonReaderButton,
+}
+
+/// When a book page offers "Open in Moon+ Reader", a `fanfold://` link only the Android
+/// bridge app (`fanfold-moonbridge`) can follow.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MoonReaderButton {
+    /// On Android browsers only (decided by a script; hidden without one).
+    #[default]
+    Android,
+    /// On every device: for a browser that hides being on Android.
+    Always,
+    /// Never: no bridge app on any device.
+    Never,
 }
 
 const TAG_SECTIONS: [(TagKind, &str, TextField); 6] = [
@@ -1022,8 +1037,8 @@ fn stat(label: &str, value: Option<String>) -> Markup {
     }
 }
 
-/// Cover, title, byline, badges and the two actions.
-fn work_head(entry: &LibraryEntry) -> Markup {
+/// Cover, title, byline, badges and the actions.
+fn work_head(entry: &LibraryEntry, moon_reader: MoonReaderButton) -> Markup {
     let work = entry.book.work;
     html! {
         header class="work-head flex flex-col gap-5 sm:flex-row sm:items-start" {
@@ -1051,10 +1066,31 @@ fn work_head(entry: &LibraryEntry) -> Markup {
                 div class="actions mt-2 flex flex-wrap gap-2" {
                     a class="btn" href=(work.canonical_url()) target="_blank" rel="noreferrer noopener" { "Open on AO3" }
                     (download_form(&work.canonical_url(), "Check for updates", true))
+                    @match moon_reader {
+                        // `androidOnly` reveals it on Android; hidden elsewhere and without scripts.
+                        MoonReaderButton::Android => {
+                            a class="btn" href=(moon_reader_href(&entry.book.file_name)) hidden
+                                x-data="androidOnly" x-bind:hidden="hidden" { "Open in Moon+ Reader" }
+                        }
+                        MoonReaderButton::Always => {
+                            a class="btn" href=(moon_reader_href(&entry.book.file_name)) { "Open in Moon+ Reader" }
+                        }
+                        MoonReaderButton::Never => {}
+                    }
                 }
             }
         }
     }
+}
+
+/// A link the Fanfold → Moon+ bridge app (`fanfold-moonbridge`) handles: it joins the library
+/// path with the device's library folder and opens that file in Moon+ Reader. Spaces are
+/// `%20`, not `+`, so the value survives any URI decoder.
+fn moon_reader_href(library_path: &str) -> String {
+    format!(
+        "fanfold://open?path={}",
+        form_encode(library_path).replace('+', "%20")
+    )
 }
 
 /// Every current tag, by kind, each a link to the books that have it; and the chapters.
@@ -1097,7 +1133,7 @@ pub fn book_content(m: &BookModel) -> Markup {
     html! {
         a class="back text-sm" href="/library" { "← Library" }
         article class="work flex flex-col gap-8" {
-            (work_head(entry))
+            (work_head(entry, m.moon_reader))
 
             @if let Some(f) = facts {
                 @let paragraphs = summary_paragraphs(&f.summary_html);
@@ -1198,6 +1234,14 @@ mod tests {
             "/library/series?q=x"
         );
         assert_eq!(form_encode("é/?"), "%C3%A9%2F%3F");
+    }
+
+    #[test]
+    fn moon_reader_links_carry_the_library_path() {
+        assert_eq!(
+            moon_reader_href("single/quill+ink/The Keeper 10000001.epub"),
+            "fanfold://open?path=single%2Fquill%2Bink%2FThe%20Keeper%2010000001.epub"
+        );
     }
 
     #[test]
