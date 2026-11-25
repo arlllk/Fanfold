@@ -15,14 +15,21 @@
   "automergeStrategy": "merge-commit",
   "minimumReleaseAge": "3 days",
   "internalChecksFilter": "strict",
+  "reviewers": [
+    "arlllk"
+  ],
   "osvVulnerabilityAlerts": true,
   "vulnerabilityAlerts": {
-    "description": "Security fixes skip the cool-down (Renovate's default for vulnerability alerts), are never merged without a person, and carry release:now, so merging one releases at once (release.yml) instead of waiting for the weekly release.",
+    "description": "A fix for a known vulnerability (GitHub's alerts and OSV) is opened at once, without the cool-down (Renovate's default for vulnerability alerts), assigned to the owner, and labelled with its severity and release:now, so merging it releases at once (release.yml) instead of waiting for the weekly release.",
     "labels": [
       "security",
+      "severity:{{{vulnerabilitySeverity}}}",
       "release:now"
     ],
-    "automerge": false
+    "assignees": [
+      "arlllk"
+    ],
+    "prCreation": "immediate"
   },
   "hostRules": [
     {
@@ -94,6 +101,13 @@
   ],
   "packageRules": [
     {
+      "description": "Nothing merges by itself: every PR is merged by automerge.yml once the owner has approved its latest commit and CI has passed (Renovate's own automerge would merge without that approval). Renovate asks the owner for a review instead (reviewers, above).",
+      "matchPackageNames": [
+        "*"
+      ],
+      "automerge": false
+    },
+    {
       "description": "Base images: the Rust image and the Python image move independently of Cargo/pip, so keep them out of the dependency PRs.",
       "matchManagers": [
         "dockerfile"
@@ -151,43 +165,20 @@
       "dependencyDashboardApproval": true
     },
     {
-      "description": "Automerge patch updates of stable (>= 1.0) dependencies once they are 3 days old (minimumReleaseAge: most malicious releases are found and yanked by then) and the required `ci-ok` check passes (GitHub auto-merge, enforced by the main ruleset). Minor and major updates, and patches of anything still on 0.x (where a patch may break), run CI and wait for a human. Merged updates go out with the weekly release (release.yml). The exceptions come after it, so that they override it.",
-      "matchUpdateTypes": [
-        "patch"
-      ],
-      "matchCurrentVersion": "!/^v?0\\./",
-      "automerge": true
-    },
-    {
-      "description": "Digest and pin updates automerge too, at any version: the tag or version stays the same, only the digest it is pinned to changes (a rebuilt base image). Not for GitHub Actions or the build tooling: see the next rules.",
-      "matchUpdateTypes": [
-        "digest",
-        "pin",
-        "pinDigest"
-      ],
-      "automerge": true
-    },
-    {
-      "description": "GitHub Actions are never automerged, not even a digest update: a tag moved to another commit is exactly how tj-actions/changed-files was compromised (March 2025), and actions run in the jobs that hold the GitHub App's key, the signing identity and the registry token. Commit dates (the release age Renovate sees) can be forged, so the cool-down is no help here.",
-      "matchManagers": [
-        "github-actions"
-      ],
-      "automerge": false
-    },
-    {
-      "description": "BuildKit and the Dockerfile frontend build every image, and BuildKit runs privileged on the runner, next to the registry login: reviewed by a person, like the actions.",
-      "matchDepNames": [
-        "moby/buildkit",
-        "docker/dockerfile"
-      ],
-      "automerge": false
-    },
-    {
       "description": "Container registries do not always give a release time (ghcr.io, dhi.io): without this, minimumReleaseAge would hold those updates back forever. Images that have one still wait.",
       "matchDatasources": [
         "docker"
       ],
       "minimumReleaseAgeBehaviour": "timestamp-optional"
+    },
+    {
+      "description": "GitHub Actions run in the jobs that hold the GitHub App's key, the signing identity and the registry token, and a tag moved to another commit is how tj-actions/changed-files was compromised (March 2025). A reminder for the review.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "prBodyNotes": [
+        "⚠️ An action runs with this repository's tokens. Before approving, check that each new commit is the one the action's release points at (a digest update for an unchanged tag means the tag moved), and skim its diff."
+      ]
     }
   ],
   "gitIgnoredAuthors": [

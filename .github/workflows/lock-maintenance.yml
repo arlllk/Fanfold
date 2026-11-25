@@ -7,8 +7,8 @@
 # The update runs with no token at all and builds nothing: resolving runs no dependency code
 # (cargo never runs build scripts to resolve, and uv runs with --no-build). Only the steps after
 # it use the repository's GitHub App, to push the branch and open the pull request, so CI runs
-# on it like on anyone's. The PR merges itself once `ci-ok` passes (GitHub auto-merge), and goes
-# out with the next scheduled release (release.yml).
+# on it like on anyone's. The PR is assigned to the owner, and merges once they approve it and
+# `ci-ok` passes (automerge.yml); it goes out with the next weekly release (release.yml).
 #
 # `--publish-time` is unstable in cargo, so the resolution uses a nightly cargo (only to
 # resolve; nothing is compiled with it).
@@ -94,6 +94,7 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           GH_REPO: ${{ github.repository }}
           REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
           branch="deps/lock-maintenance-$(date -u +%Y-%m-%d-%H%M)"
@@ -109,10 +110,9 @@ jobs:
             gh pr close "$old" --delete-branch --comment "Superseded by a newer lock file maintenance run."
           done
 
+          # Assigned to the owner, whose approval merges it (automerge.yml, once CI passes).
           url=$(gh pr create --base main --head "$branch" --label release:patch \
+                  --assignee "$OWNER" --reviewer "$OWNER" \
                   --title "Lock file maintenance (releases at least $DAYS days old)" \
                   --body-file "$RUNNER_TEMP/summary.md")
           echo "Opened $url"
-          # Merges once ci-ok passes (the main ruleset still applies).
-          gh pr merge "$url" --auto --merge \
-            || echo "::warning::could not enable auto-merge on $url; merge it by hand once CI passes"

@@ -14,9 +14,24 @@ Those PRs are opened, and merged, by the repository's GitHub App (secrets `RELEA
 `RELEASE_APP_PRIVATE_KEY`), so CI and the release start by themselves. A PR or merge by the
 built-in Actions token would trigger nothing.
 
-The maintainer's pull requests merge themselves once CI passes (`automerge.yml`). To stop that,
-make the PR a draft or add the `no-automerge` label. Pull requests from forks are merged by
-hand.
+### Merging: approve, and it merges once CI passes
+
+A pull request merges itself (`automerge.yml`) once **the maintainer has approved its latest
+commit and `ci-ok` passed on it**, in either order. Approving from the phone is enough. The
+approval is for one commit: after a new push, approve again. Nothing else merges anything by
+itself, Renovate included.
+
+- It applies to every PR from a branch of this repository: Renovate's, the lock file
+  maintenance's, and the ones `pr.yml` opens for your pushes (those are opened by the GitHub
+  App, so you can approve them). GitHub does not let anyone approve their own PR, so one you
+  open yourself (`gh pr create`) is merged by hand.
+- To keep an approved PR from merging, make it a draft or add the `no-automerge` label.
+- Pull requests from forks are merged by hand.
+
+How it works: a submitted approval starts `review.yml`, which does nothing but end, and that
+(like the end of a CI run) starts `automerge.yml`. A review event would run the PR's own copy
+of a workflow, which the PR may have changed; `automerge.yml` always runs from `main`, so the
+GitHub App's key never meets a workflow file a PR can edit.
 
 ## Dependencies
 
@@ -24,20 +39,20 @@ Nothing new is taken until it is **3 days old**. Most malicious releases (a hija
 maintainer account, a moved tag) are found and yanked within hours to a few days, and CI cannot
 tell one from a real release: it passes either way.
 
-- **Renovate** (`renovate.json`) proposes updates once they are 3 days old. Patch updates of
-  dependencies at 1.0 or later, and digest updates of base images, merge themselves once CI
-  passes. Everything else waits for review: minor and major updates, anything on 0.x, every
-  GitHub Action (they run next to the GitHub App's key and the signing identity, and a digest
-  update is what a hijacked tag looks like), BuildKit and the Dockerfile frontend.
+- **Renovate** (`renovate.json`) proposes updates once they are 3 days old and asks you for a
+  review. Each merges once you approve it. Updates of GitHub Actions carry a reminder in the PR:
+  they run next to the GitHub App's key and the signing identity, and a digest update for an
+  unchanged tag is what a hijacked tag looks like.
 - **Lock files** (`lock-maintenance.yml`, Mondays) move to the newest releases that are 3 days
   old, through `scripts/lock_cooldown.py`: `cargo generate-lockfile --publish-time` (unstable,
   so on a nightly cargo, for resolving only) and `uv lock --exclude-newer`. Nothing locked ever
-  goes back, so a security fix newer than that stays. Its PR merges itself once CI passes. By
-  hand: `RUSTUP_TOOLCHAIN=nightly python3 -I scripts/lock_cooldown.py` (it needs a nightly
-  toolchain and uv).
-- **Security fixes** skip the wait: Renovate opens them at once (GitHub's alerts and
-  [OSV](https://osv.dev)), labelled `security` and `release:now`. They are never merged
-  without a person; merging one releases at once.
+  goes back, so a security fix newer than that stays. Its PR is assigned to you and merges once
+  you approve it. By hand: `RUSTUP_TOOLCHAIN=nightly python3 -I scripts/lock_cooldown.py` (it
+  needs a nightly toolchain and uv).
+- **Security fixes** skip the wait: as soon as a vulnerability in a dependency is known
+  (GitHub's alerts and [OSV](https://osv.dev)), Renovate opens the PR that fixes it, assigns it
+  to you, and labels it `security`, `severity:<CRITICAL|HIGH|MODERATE|LOW>` and `release:now`.
+  Approving it merges it once CI passes, and the merge is released right away.
 
 ## Versions and releases
 
@@ -55,12 +70,12 @@ out with the next release.
 
 ### Urgent releases (a CVE, a bad bug)
 
-- **A security fix from Renovate**: review and merge its PR. It carries `release:now`, so the
-  merge is released right away.
-- **Any other PR**: add the `release:now` label before merging it, and its merge is
+- **A security fix from Renovate** (assigned to you): approve its PR. It merges once CI
+  passes, and carries `release:now`, so the merge is released right away.
+- **Any other PR**: add the `release:now` label before it merges, and its merge is
   released right away.
 - **Already on `main`** (merged earlier, waiting for Tuesday), such as a base image digest
-  update that brings a CVE fix (Renovate merges those by itself): release it now with
+  update that brings a CVE fix: release it now with
 
   ```sh
   gh workflow run release.yml

@@ -1,0 +1,28 @@
+# Relays an approval to automerge.yml, which starts when this run ends (workflow_run) and decides
+# there whether to merge.
+#
+# Why a relay: a review event runs the PR's own copy of a workflow file, and the PR may have
+# changed it. So this one holds nothing and does nothing (no token permissions, no secrets, no
+# checkout), and the decision and the GitHub App's key stay in main's copy of automerge.yml.
+# Only approvals start a run; other reviews are skipped here, which costs no runner.
+name: review
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+jobs:
+  relay:
+    if: github.event.review.state == 'approved'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 1
+    permissions: {}
+    steps:
+      - name: Approval
+        env:
+          REVIEWER: ${{ github.event.review.user.login }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.review.commit_id }}
+        run: echo "#$PR approved by $REVIEWER on $SHA; automerge.yml decides."
