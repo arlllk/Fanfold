@@ -246,6 +246,15 @@ SUBMIT_FORM = """([url, fields]) => {
 }"""
 
 CHALLENGE_TITLES = ("just a moment", "attention required", "un momento", "einen moment")
+TURNSTILE_HOST = "challenges.cloudflare.com"
+
+
+def is_turnstile_frame(url: str) -> bool:
+    """Whether a frame is Cloudflare's own challenge: https on exactly its host. A substring
+    test would also match a page that merely mentions the host in its path or query, or a
+    look-alike host such as challenges.cloudflare.com.example."""
+    parts = urllib.parse.urlsplit(url)
+    return parts.scheme == "https" and (parts.hostname or "").lower() == TURNSTILE_HOST
 
 
 def origin(url: str) -> str:
@@ -307,12 +316,12 @@ class CamoufoxDriver:
             return True
         if any(t in title for t in CHALLENGE_TITLES):
             return True
-        return page.locator("#challenge-form, #challenge-stage, iframe[src*='challenges.cloudflare.com']").count() > 0
+        return page.locator("#challenge-form, #challenge-stage, iframe[src^='https://challenges.cloudflare.com/']").count() > 0
 
     def try_click_turnstile(self, page) -> None:  # noqa: ANN001
         """Best effort: tick Cloudflare's checkbox when its challenge shows one."""
         for frame in page.frames:
-            if "challenges.cloudflare.com" in (frame.url or ""):
+            if is_turnstile_frame(frame.url or ""):
                 try:
                     box = frame.frame_element().bounding_box()
                     if box:
