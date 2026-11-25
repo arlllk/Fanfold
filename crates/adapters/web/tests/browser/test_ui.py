@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import shutil
 import socket
+import re
 import subprocess
 import time
 import unittest
@@ -124,6 +125,23 @@ class BrowserTests(unittest.TestCase):
         self.assertLess(self.books(), before)
         self.assertGreater(self.books(), 0)
         expect(page.locator("#suggest")).to_be_hidden()
+
+    def test_the_moon_reader_link_shows_on_android_only(self) -> None:
+        page = self.open("/library")
+        book = page.locator("ul.books > li a").first.get_attribute("href")
+        assert book is not None
+        link = self.open(book).get_by_role("link", name="Open in Moon+ Reader")
+        expect(link).to_be_hidden()
+
+        android = self.browser.new_page(user_agent="Mozilla/5.0 (Android 16; Mobile; rv:146.0) Gecko/146.0 Firefox/146.0")
+        try:
+            android.on("pageerror", lambda error: self.problems.append(str(error)))
+            android.goto(self.base + book)
+            link = android.get_by_role("link", name="Open in Moon+ Reader")
+            expect(link).to_be_visible()
+            expect(link).to_have_attribute("href", re.compile(r"^fanfold://open\?path=[^/?#]+\.epub$"))
+        finally:
+            android.close()
 
     def test_escape_closes_the_suggestions(self) -> None:
         page = self.open("/library")

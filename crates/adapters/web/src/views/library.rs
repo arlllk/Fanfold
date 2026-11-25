@@ -1051,10 +1051,24 @@ fn work_head(entry: &LibraryEntry) -> Markup {
                 div class="actions mt-2 flex flex-wrap gap-2" {
                     a class="btn" href=(work.canonical_url()) target="_blank" rel="noreferrer noopener" { "Open on AO3" }
                     (download_form(&work.canonical_url(), "Check for updates", true))
+                    // Shown by `androidOnly` on Android, where the Fanfold → Moon+ bridge app
+                    // opens the synced copy; hidden everywhere else and without scripts.
+                    a class="btn" href=(moon_reader_href(&entry.book.file_name)) hidden
+                        x-data="androidOnly" x-bind:hidden="hidden" { "Open in Moon+ Reader" }
                 }
             }
         }
     }
+}
+
+/// A link the Fanfold → Moon+ bridge app (`fanfold-moonbridge`) handles: it joins the library
+/// path with the device's library folder and opens that file in Moon+ Reader. Spaces are
+/// `%20`, not `+`, so the value survives any URI decoder.
+fn moon_reader_href(library_path: &str) -> String {
+    format!(
+        "fanfold://open?path={}",
+        form_encode(library_path).replace('+', "%20")
+    )
 }
 
 /// Every current tag, by kind, each a link to the books that have it; and the chapters.
@@ -1198,6 +1212,14 @@ mod tests {
             "/library/series?q=x"
         );
         assert_eq!(form_encode("é/?"), "%C3%A9%2F%3F");
+    }
+
+    #[test]
+    fn moon_reader_links_carry_the_library_path() {
+        assert_eq!(
+            moon_reader_href("single/quill+ink/The Keeper 10000001.epub"),
+            "fanfold://open?path=single%2Fquill%2Bink%2FThe%20Keeper%2010000001.epub"
+        );
     }
 
     #[test]
