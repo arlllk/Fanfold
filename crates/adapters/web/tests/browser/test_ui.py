@@ -25,7 +25,7 @@ import unittest
 import urllib.request
 from pathlib import Path
 
-from playwright.sync_api import Browser, ConsoleMessage, Page, expect, sync_playwright
+from playwright.sync_api import Browser, ConsoleMessage, Page, Route, expect, sync_playwright
 
 ROOT = Path(__file__).resolve().parents[5]
 DEMO = Path(os.environ.get("FANFOLD_DEMO", ROOT / "target" / "debug" / "examples" / "demo"))
@@ -164,6 +164,27 @@ class BrowserTests(unittest.TestCase):
         page.get_by_role("link", name="Clear all").click()
         expect(box).to_have_value("")
         expect(page.locator(".filter-chip")).to_have_count(0)
+
+    def test_a_live_refresh_never_cancels_a_search(self) -> None:
+        # The live region re-fetches its own (old) address on every event. If that refresh
+        # could replace a search still in flight, the page would fall back to the old results
+        # while the box showed the new query. Hold the search, refresh, then let it through.
+        page = self.open("/library?q=author%3A%22quillandink%22")
+        held: list[Route] = []
+        page.route(lambda url: "complete" in url, lambda route: held.append(route))
+        page.locator("aside").get_by_role("link", name="Complete").click()
+        while not held:
+            page.wait_for_timeout(10)
+        # `refresh from:body delay:200ms` is a timer; one of 300ms set after it always runs
+        # later, so the refresh has been sent (or dropped) by the time this returns.
+        page.evaluate("""() => {
+            document.body.dispatchEvent(new Event('refresh'));
+            return new Promise((done) => setTimeout(done, 300));
+        }""")
+        held[0].continue_()
+        page.unroute_all()
+        expect(page.locator(".filter-chip")).to_have_count(2)
+        expect(page.locator("#q")).to_have_value('author:"quillandink" is:complete ')
 
     def test_tabs_keep_the_search(self) -> None:
         page = self.open("/library?q=harbor")

@@ -269,13 +269,18 @@ pub struct Screen<'a> {
 
 /// The live region: re-fetched (and morphed in place, so focus, scroll positions and
 /// selections survive) whenever the event stream says something changed.
+///
+/// A refresh fetches the address the region was rendered for, so it gives way (`drop`) to
+/// any request already in flight on it: a search (which syncs on `#live` with `replace`)
+/// would otherwise be cancelled and the old results morphed back under the new query. A
+/// dropped refresh is caught up by the next event or the timer.
 fn live_region(screen: &Screen<'_>) -> Markup {
     if screen.url.is_empty() {
         return html! { div id="live" class="flex flex-col gap-6" { (screen.content) } };
     }
     html! {
         div id="live" hx-get=(screen.url) hx-trigger=(live_trigger(screen.job)) hx-swap="outerMorph"
-            hx-sync="this:replace" hx-status:4xx="swap:none" hx-status:5xx="swap:none"
+            hx-sync="this:drop" hx-status:4xx="swap:none" hx-status:5xx="swap:none"
             data-job=[screen.job.map(|j| j.to_string())] class="flex flex-col gap-6" {
             (screen.content)
         }
