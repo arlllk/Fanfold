@@ -1,5 +1,5 @@
-# Merges the owner's pull requests once CI has passed on their latest commit. The merge is a
-# push to main, which starts the release (release.yml).
+# Merges the owner's pull requests once CI has passed on their latest commit. The merge goes
+# out with the weekly release, or at once if the PR is labelled `release:now` (release.yml).
 #
 # Merged automatically: PRs from a branch of this repository (never a fork) that the owner
 # opened, or that pr.yml opened for the owner's push (assigned to them), are not drafts, and
@@ -75,4 +75,4 @@ jobs:
           # --match-head-commit: refuse if anything was pushed after the CI run we checked.
           # (The branch is deleted by the repository's "delete head branches" setting.)
           gh pr merge "$n" --merge --match-head-commit "$SHA"
-          echo "Merged #$n; the push to main starts the release."
+          echo "Merged #$n; it goes out with the next release (at once if labelled release:now)."

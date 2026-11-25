@@ -6,7 +6,8 @@
 # so the newest result replaces the last and fixed findings close by themselves).
 #
 # A finding with a fix is usually one Renovate update away (a base image digest, a crate, a
-# Python package); merging it makes a new release, whose scan closes the alert.
+# Python package); once it is merged and released (weekly, or at once: see CONTRIBUTING.md,
+# "Urgent releases"), the release's scan closes the alert.
 name: scan
 
 on:

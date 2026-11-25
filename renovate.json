@@ -13,6 +13,17 @@
     "custom.regex"
   ],
   "automergeStrategy": "merge-commit",
+  "minimumReleaseAge": "3 days",
+  "internalChecksFilter": "strict",
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "description": "Security fixes skip the cool-down (Renovate's default for vulnerability alerts), are never merged without a person, and carry release:now, so merging one releases at once (release.yml) instead of waiting for the weekly release.",
+    "labels": [
+      "security",
+      "release:now"
+    ],
+    "automerge": false
+  },
   "hostRules": [
     {
       "description": "dhi.io (Docker Hardened Images, the runtime base) serves only a logged-in Docker account. The two secrets are Renovate's own, set in the Mend developer portal for this repository (not the GitHub Actions secrets of the same names).",
@@ -22,11 +33,8 @@
     }
   ],
   "lockFileMaintenance": {
-    "enabled": true,
-    "automerge": true,
-    "schedule": [
-      "before 6am on monday"
-    ]
+    "description": "Done by lock-maintenance.yml instead, with a cool-down: Renovate's own refreshes every transitive dependency to whatever was published a minute ago (minimumReleaseAge does not apply to it).",
+    "enabled": false
   },
   "customManagers": [
     {
@@ -143,7 +151,7 @@
       "dependencyDashboardApproval": true
     },
     {
-      "description": "Automerge patch updates of stable (>= 1.0) dependencies once the required `ci-ok` check passes (GitHub auto-merge, enforced by the main ruleset). Minor and major updates, and patches of anything still on 0.x (where a patch may break), run CI and wait for a human. Digest and pin updates: next rule. Last on purpose, so no rule above overrides it. Lock file maintenance automerges too (top-level lockFileMaintenance). Each merge is a patch release (release.yml).",
+      "description": "Automerge patch updates of stable (>= 1.0) dependencies once they are 3 days old (minimumReleaseAge: most malicious releases are found and yanked by then) and the required `ci-ok` check passes (GitHub auto-merge, enforced by the main ruleset). Minor and major updates, and patches of anything still on 0.x (where a patch may break), run CI and wait for a human. Merged updates go out with the weekly release (release.yml). The exceptions come after it, so that they override it.",
       "matchUpdateTypes": [
         "patch"
       ],
@@ -151,13 +159,35 @@
       "automerge": true
     },
     {
-      "description": "Digest and pin updates automerge too, at any version: the tag or version stays the same, only the digest it is pinned to changes (a rebuilt base image, a GitHub Action pinned to the commit of its tag).",
+      "description": "Digest and pin updates automerge too, at any version: the tag or version stays the same, only the digest it is pinned to changes (a rebuilt base image). Not for GitHub Actions or the build tooling: see the next rules.",
       "matchUpdateTypes": [
         "digest",
         "pin",
         "pinDigest"
       ],
       "automerge": true
+    },
+    {
+      "description": "GitHub Actions are never automerged, not even a digest update: a tag moved to another commit is exactly how tj-actions/changed-files was compromised (March 2025), and actions run in the jobs that hold the GitHub App's key, the signing identity and the registry token. Commit dates (the release age Renovate sees) can be forged, so the cool-down is no help here.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "BuildKit and the Dockerfile frontend build every image, and BuildKit runs privileged on the runner, next to the registry login: reviewed by a person, like the actions.",
+      "matchDepNames": [
+        "moby/buildkit",
+        "docker/dockerfile"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "Container registries do not always give a release time (ghcr.io, dhi.io): without this, minimumReleaseAge would hold those updates back forever. Images that have one still wait.",
+      "matchDatasources": [
+        "docker"
+      ],
+      "minimumReleaseAgeBehaviour": "timestamp-optional"
     }
   ],
   "gitIgnoredAuthors": [

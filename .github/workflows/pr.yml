@@ -15,6 +15,7 @@ on:
     branches-ignore:
       - main
       - "renovate/**" # Renovate opens its own
+      - "deps/**" # lock-maintenance.yml opens its own
 
 permissions: {}
 

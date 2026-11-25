@@ -16,21 +16,63 @@ built-in Actions token would trigger nothing.
 
 The maintainer's pull requests merge themselves once CI passes (`automerge.yml`). To stop that,
 make the PR a draft or add the `no-automerge` label. Pull requests from forks are merged by
-hand. Renovate merges its own lock file maintenance, digest and pin updates, and patch updates
-of dependencies at 1.0 or later, once CI passes; everything else from Renovate waits for review
-(`renovate.json`).
+hand.
+
+## Dependencies
+
+Nothing new is taken until it is **3 days old**. Most malicious releases (a hijacked
+maintainer account, a moved tag) are found and yanked within hours to a few days, and CI cannot
+tell one from a real release: it passes either way.
+
+- **Renovate** (`renovate.json`) proposes updates once they are 3 days old. Patch updates of
+  dependencies at 1.0 or later, and digest updates of base images, merge themselves once CI
+  passes. Everything else waits for review: minor and major updates, anything on 0.x, every
+  GitHub Action (they run next to the GitHub App's key and the signing identity, and a digest
+  update is what a hijacked tag looks like), BuildKit and the Dockerfile frontend.
+- **Lock files** (`lock-maintenance.yml`, Mondays) move to the newest releases that are 3 days
+  old, through `scripts/lock_cooldown.py`: `cargo generate-lockfile --publish-time` (unstable,
+  so on a nightly cargo, for resolving only) and `uv lock --exclude-newer`. Nothing locked ever
+  goes back, so a security fix newer than that stays. Its PR merges itself once CI passes. By
+  hand: `RUSTUP_TOOLCHAIN=nightly python3 -I scripts/lock_cooldown.py` (it needs a nightly
+  toolchain and uv).
+- **Security fixes** skip the wait: Renovate opens them at once (GitHub's alerts and
+  [OSV](https://osv.dev)), labelled `security` and `release:now`. They are never merged
+  without a person; merging one releases at once.
 
 ## Versions and releases
 
-A merge into `main` that changes what the image is built from is a release (`release.yml`): the
-merge commit is tagged `vX.Y.Z`, a GitHub release is created with generated notes, and the
-image is published to `ghcr.io/arlllk/fanfold` as `X.Y.Z`, `X.Y`, `X` (from 1.0 on) and
-`latest`, for linux/amd64.
+Releases are made by `release.yml`: a commit of `main` is tagged `vX.Y.Z`, a GitHub release is
+created with generated notes, and the image is published to `ghcr.io/arlllk/fanfold` as `X.Y.Z`,
+`X.Y`, `X` (from 1.0 on) and `latest`, for linux/amd64.
 
-A merge that touches only CI, docs, Renovate's config, tests, test data, examples, fuzzing or
-the dev tooling is not released, since it would publish the same image again under a new
-version. It goes out with the next release. (Run the release workflow by hand with `force`
-to release anyway.)
+Merges are not released one by one. **Every Tuesday** `main` is released if anything the image
+is built from changed since the last release; everything merged that week goes out together,
+after the Monday lock file update and with every dependency through its cool-down.
+
+Nothing is released if only CI, docs, Renovate's config, tests, test data, examples, fuzzing
+or the dev tooling changed: that would be the same image under a new version. Those changes go
+out with the next release.
+
+### Urgent releases (a CVE, a bad bug)
+
+- **A security fix from Renovate**: review and merge its PR. It carries `release:now`, so the
+  merge is released right away.
+- **Any other PR**: add the `release:now` label before merging it, and its merge is
+  released right away.
+- **Already on `main`** (merged earlier, waiting for Tuesday), such as a base image digest
+  update that brings a CVE fix (Renovate merges those by itself): release it now with
+
+  ```sh
+  gh workflow run release.yml
+  ```
+
+  `-f sha=<commit>` releases an older commit of `main` instead of its head, and `-f force=true`
+  releases even if no image input changed. Every input is pinned, so a forced release of the
+  same commit is the same image under a new version; a fix always needs a change on `main`
+  first (if Renovate has not proposed it yet, bump the version or digest by hand in a PR).
+
+The daily scan (`scan.yml`) re-checks the latest release against new CVEs and lists what it
+finds in the Security tab: that is where to look for "is the release affected?".
 
 Choose the bump with a label on the pull request:
 

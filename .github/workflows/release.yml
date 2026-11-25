@@ -1,10 +1,23 @@
-# A merge into main that changes what goes into the image is a release: a new `vX.Y.Z` tag on
-# the merge commit, a GitHub release with generated notes, and the container image published as
-# X.Y.Z, X.Y, X (from 1.0) and latest (image.yml, linux/amd64, reproducible).
+# Releases: a new `vX.Y.Z` tag on a commit of main, a GitHub release with generated notes, and
+# the container image published as X.Y.Z, X.Y, X (from 1.0) and latest (image.yml, linux/amd64,
+# reproducible).
 #
-# A merge that changes nothing the image is built from (CI, docs, Renovate config, tests,
-# examples, fuzzing, dev tooling) is not released: it would only be the previous image again.
-# It is part of the next release instead. The `force` input releases anyway.
+# WHEN. Merges are batched, not released one by one:
+#  * weekly (schedule, Tuesdays): main's head, if anything the image is built from changed since
+#    the last release. Renovate's updates and the Monday lock file maintenance
+#    (lock-maintenance.yml) have had their cool-down by then, and the week's merges ship as one
+#    release instead of one release each;
+#  * at once, when a merged PR carries the `release:now` label: Renovate's security fixes get it
+#    (renovate.json, vulnerabilityAlerts), and so can any urgent PR, before or after merging (a
+#    label added after the merge takes effect with the next run: re-run, or run by hand);
+#  * by hand (workflow_dispatch): `gh workflow run release.yml` releases main's head now (or
+#    `-f sha=...`), e.g. a merged base image digest update with a CVE fix; `-f force=true`
+#    releases even if no image input changed. See CONTRIBUTING.md, "Urgent releases".
+# Every push to main still runs CI on main (warm-cache below), which fills the caches PRs read.
+#
+# A release only happens if something the image is built from changed (not for CI, docs,
+# Renovate config, tests, examples, fuzzing, dev tooling: that would only be the previous image
+# again; it is part of the next release instead). The `force` input releases anyway.
 #
 # The bump comes from the labels of every PR merged since the last release: `release:major`,
 # `release:minor`, or `release:patch`; no label means patch, and the biggest wins (so a minor
@@ -14,15 +27,16 @@
 # Versions live only in tags: nothing is committed back to main, so a release never puts open
 # PRs behind or in conflict. The image is built with the version passed in (FANFOLD_VERSION).
 #
-# Runs on every push to main (a merge by a person, by Renovate, or by automerge.yml's GitHub
-# App), and by hand (workflow_dispatch, e.g. with `force`). Re-running for an already tagged
-# commit does nothing. The tag and release are made with the Actions token on purpose: they
-# then trigger nothing, so image.yml's own tag trigger does not build the image a second time.
+# Re-running for an already tagged commit does nothing. The tag and release are made with the
+# Actions token on purpose: they then trigger nothing, so image.yml's own tag trigger does not
+# build the image a second time.
 name: release
 
 on:
   push:
     branches: [main]
+  schedule:
+    - cron: "41 5 * * 2" # Tuesdays
   workflow_dispatch:
     inputs:
       sha:
@@ -54,6 +68,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
       SHA: ${{ inputs.sha || github.sha }}
       FORCE: ${{ inputs.force || false }}
+      EVENT: ${{ github.event_name }}
       # What the image is built from (see the Dockerfile's COPY lines)...
       IMAGE_INPUTS: '^(Dockerfile|\.dockerignore|Cargo\.toml|Cargo\.lock|crates/|python/(pyproject\.toml|uv\.lock)|licenses/|LICENSE-|browser/(Dockerfile|fanfold_browser\.py|pyproject\.toml|uv\.lock))'
       # ...minus what never reaches the binary.
@@ -76,6 +91,18 @@ jobs:
           if existing=$(git tag --points-at "$SHA" | grep -E "$semver" | head -n1) && [ -n "$existing" ]; then
             echo "$SHA is already released as $existing."
             exit 0
+          fi
+
+          # A push releases only for a PR labelled `release:now`; the rest waits for Tuesday.
+          if [ "$EVENT" = push ]; then
+            now=$(gh api "repos/$GH_REPO/commits/$SHA/pulls" \
+                    --jq '[.[] | select(.merged_at != null) | .labels[].name] | any(. == "release:now")')
+            if [ "$now" != true ]; then
+              echo "No release:now label on the PR merged as $SHA: it goes out with the weekly release."
+              echo "(To release now: gh workflow run release.yml)"
+              exit 0
+            fi
+            echo "release:now: releasing $SHA."
           fi
 
           last=$(git tag --merged "$SHA" -l 'v*' | grep -E "$semver" | sort -V | tail -n1 || true)
@@ -165,25 +192,28 @@ jobs:
   #      gh attestation verify oci://ghcr.io/arlllk/fanfold:X.Y.Z -R arlllk/Fanfold
   #  * A vulnerability scan of the SBOM, uploaded to the repository's Security tab (code
   #    scanning). scan.yml re-scans the latest release daily, for CVEs published later.
+  #
+  # Two jobs, so that the third-party tools never share a runner with the powerful token: Syft
+  # and Grype are downloaded binaries, and any code in a job can read every token and secret
+  # that job holds (hosted runners have passwordless sudo, so the runner's memory too). `sbom`
+  # runs them with a read-only token; `publish-sbom` signs and uploads what they produced,
+  # with GitHub's own actions only (plus the registry login).
   sbom:
     needs: [tag, image]
     if: needs.image.outputs.digest != ''
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
-      contents: write # release assets
-      packages: write # attestations are pushed to the registry
-      id-token: write # Sigstore signing
-      attestations: write
-      security-events: write # code scanning upload
+      contents: read
+      packages: read
     env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
       VERSION: ${{ needs.tag.outputs.version }}
       DIGEST: ${{ needs.image.outputs.digest }}
     steps:
       - name: Image name
-        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out"
 
       # The released commit: its Dockerfile names the base image whose VEX the scan uses.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -204,7 +234,7 @@ jobs:
           syft-version: v1.57.2
           image: ${{ env.IMAGE }}@${{ env.DIGEST }}
           format: spdx-json
-          output-file: fanfold-${{ env.VERSION }}.spdx.json
+          output-file: ${{ runner.temp }}/out/fanfold-${{ env.VERSION }}.spdx.json
           upload-artifact: false
           upload-release-assets: false
 
@@ -215,12 +245,77 @@ jobs:
           syft-version: v1.57.2
           image: ${{ env.IMAGE }}@${{ env.DIGEST }}
           format: cyclonedx-json
-          output-file: fanfold-${{ env.VERSION }}.cdx.json
+          output-file: ${{ runner.temp }}/out/fanfold-${{ env.VERSION }}.cdx.json
           upload-artifact: false
           upload-release-assets: false
 
-      - name: Attach the SBOMs to the release
-        run: gh release upload "v$VERSION" "fanfold-$VERSION.spdx.json" "fanfold-$VERSION.cdx.json" --clobber
+      # Docker's VEX statements for the DHI base (scripts/dhi_vex.py), so what Docker found does
+      # not affect it stays out of the Security tab. Attached to the release as well: it is
+      # what explains every finding a scan of the SBOM reports that the Security tab does not.
+      - name: VEX for the base image
+        env:
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+        run: python3 -I -B scripts/dhi_vex.py --dockerfile Dockerfile --output "$RUNNER_TEMP/out/fanfold-$VERSION.openvex.json"
+
+      - name: Vulnerability scan
+        id: scan
+        uses: anchore/scan-action@11983a512817154c80a9db660c1a184be7513ed6 # v7.4.3
+        with:
+          # renovate: datasource=github-releases depName=anchore/grype
+          grype-version: v0.122.1
+          sbom: ${{ runner.temp }}/out/fanfold-${{ env.VERSION }}.spdx.json
+          vex: ${{ runner.temp }}/out/fanfold-${{ env.VERSION }}.openvex.json
+          fail-build: false
+          output-format: sarif
+
+      - name: Collect the scan
+        env:
+          SARIF: ${{ steps.scan.outputs.sarif }}
+        run: cp "$SARIF" "$RUNNER_TEMP/out/grype.sarif"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-sbom:
+    needs: [tag, image, sbom]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # release assets
+      packages: write # attestations are pushed to the registry
+      id-token: write # Sigstore signing
+      attestations: write
+      security-events: write # code scanning upload
+    env:
+      VERSION: ${{ needs.tag.outputs.version }}
+      DIGEST: ${{ needs.image.outputs.digest }}
+    steps:
+      - name: Image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sbom
+          path: sbom
+
+      - name: Attach the SBOMs and the VEX to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release upload "v$VERSION" "sbom/fanfold-$VERSION.spdx.json" "sbom/fanfold-$VERSION.cdx.json" \
+            "sbom/fanfold-$VERSION.openvex.json" --clobber
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -234,40 +329,20 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ env.DIGEST }}
-          sbom-path: fanfold-${{ env.VERSION }}.spdx.json
+          sbom-path: sbom/fanfold-${{ env.VERSION }}.spdx.json
           push-to-registry: true
-
-      # Docker's VEX statements for the DHI base (scripts/dhi_vex.py), so what Docker found does
-      # not affect it stays out of the Security tab. Attached to the release as well: it is
-      # what explains every finding a scan of the SBOM reports that the Security tab does not.
-      - name: VEX for the base image
-        env:
-          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
-          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
-        run: |
-          python3 -I -B scripts/dhi_vex.py --dockerfile Dockerfile --output "fanfold-$VERSION.openvex.json"
-          gh release upload "v$VERSION" "fanfold-$VERSION.openvex.json" --clobber
-
-      - name: Vulnerability scan
-        id: scan
-        uses: anchore/scan-action@11983a512817154c80a9db660c1a184be7513ed6 # v7.4.3
-        with:
-          # renovate: datasource=github-releases depName=anchore/grype
-          grype-version: v0.122.1
-          sbom: fanfold-${{ env.VERSION }}.spdx.json
-          vex: fanfold-${{ env.VERSION }}.openvex.json
-          fail-build: false
-          output-format: sarif
 
       - name: Upload to the Security tab
         uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
         with:
-          sarif_file: ${{ steps.scan.outputs.sarif }}
+          sarif_file: sbom/grype.sarif
           category: container-image
 
   # CI on main itself, beside the release (it does not gate it: the PR already passed). This is
   # what fills the Rust cache the PRs read; the image cache is filled by the publish above.
+  # Only for pushes: the weekly and hand-started runs release a main that CI has already run on.
   warm-cache:
+    if: github.event_name == 'push'
     permissions:
       contents: read
       packages: write # required by the called workflows, unused here
