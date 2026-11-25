@@ -42,14 +42,15 @@
   --color-sheet: #fbfcfb;
   --color-bar: #e2ede3;
   --color-ink: #1d2a2e;
-  --color-muted: #5a6a6e;
+  --color-muted: #4f5e62;
   --color-rule: #cdd8d2;
   --color-ribbon: #3c3cb4;
   --color-ribbon-soft: #e4e4f8;
-  --color-ok: #2a7a4b;
-  --color-warn: #9a6200;
+  /* Status tones: at least 4.5:1 as chip text on a 9% tint over paper, sheet or bar. */
+  --color-ok: #226a40;
+  --color-warn: #835300;
   --color-err: #b0281e;
-  --color-run: #1f6fa8;
+  --color-run: #1a5f92;
 
   --font-display: "Literata", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
   --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;

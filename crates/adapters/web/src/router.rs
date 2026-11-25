@@ -47,6 +47,7 @@ use tokio_stream::{
 };
 
 use crate::{
+    assets::{self, Lookup},
     forms, metrics,
     problem::ProblemDetails,
     security::{csrf_guard, security_headers},
@@ -856,76 +857,37 @@ async fn events(State(deps): State<Deps>) -> Response {
 
 // -------------------------------------------------------------------- assets
 
-fn asset(content_type: &'static str, body: &'static [u8]) -> Response {
-    let mut response = (StatusCode::OK, body).into_response();
-    let headers = response.headers_mut();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=300"),
+/// A file under `/static/`. Its current hashed name is cached for a year (`immutable`, by
+/// browsers and the CDN alike); a plain or stale name gets the current file to revalidate
+/// every time (`no-cache`), which a CDN does not store. See [`crate::assets`].
+async fn asset(headers: HeaderMap, Path(path): Path<String>) -> Response {
+    let (file, cache) = match assets::lookup(&path) {
+        Some(Lookup::Current(file)) => (file, "public, max-age=31536000, immutable"),
+        Some(Lookup::Moved(file)) => (file, "no-cache"),
+        None => return not_found(headers).await,
+    };
+    let fresh = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|tags| {
+            tags.split(',')
+                .any(|t| t.trim() == file.etag || t.trim() == "*")
+        });
+    let mut response = if fresh {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        (StatusCode::OK, file.body.as_slice()).into_response()
+    };
+    let out = response.headers_mut();
+    out.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(file.content_type),
     );
-    response
-}
-
-async fn css() -> Response {
-    asset(
-        "text/css; charset=utf-8",
-        include_bytes!("../assets/app.css"),
-    )
-}
-
-async fn js() -> Response {
-    asset(
-        "text/javascript; charset=utf-8",
-        include_bytes!("../assets/app.js"),
-    )
-}
-
-async fn icon() -> Response {
-    asset("image/svg+xml", include_bytes!("../assets/icon.svg"))
-}
-
-const JS: &str = "text/javascript; charset=utf-8";
-
-/// The self-hosted third-party files (assets/vendor, pinned by vendor.toml).
-const VENDOR: [(&str, &str, &[u8]); 6] = [
-    (
-        "htmx.min.js",
-        JS,
-        include_bytes!("../assets/vendor/htmx.min.js"),
-    ),
-    (
-        "hx-sse.min.js",
-        JS,
-        include_bytes!("../assets/vendor/hx-sse.min.js"),
-    ),
-    (
-        "hx-alpine-compat.min.js",
-        JS,
-        include_bytes!("../assets/vendor/hx-alpine-compat.min.js"),
-    ),
-    (
-        "alpine-csp.min.js",
-        JS,
-        include_bytes!("../assets/vendor/alpine-csp.min.js"),
-    ),
-    (
-        "literata-latin.woff2",
-        "font/woff2",
-        include_bytes!("../assets/vendor/literata-latin.woff2"),
-    ),
-    (
-        "literata-latin-italic.woff2",
-        "font/woff2",
-        include_bytes!("../assets/vendor/literata-latin-italic.woff2"),
-    ),
-];
-
-async fn vendor(headers: HeaderMap, Path(name): Path<String>) -> Response {
-    match VENDOR.iter().find(|(file, _, _)| *file == name) {
-        Some((_, content_type, body)) => asset(content_type, body),
-        None => not_found(headers).await,
+    out.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    if let Ok(etag) = HeaderValue::from_str(&file.etag) {
+        out.insert(header::ETAG, etag);
     }
+    response
 }
 
 async fn not_found(headers: HeaderMap) -> Response {
@@ -954,10 +916,7 @@ pub fn ui_router(deps: Deps) -> Router {
         .route("/works/{id}/delete", post(delete_work))
         .route("/series/{id}/delete", post(delete_series))
         .route("/events", get(events))
-        .route("/static/app.css", get(css))
-        .route("/static/app.js", get(js))
-        .route("/static/icon.svg", get(icon))
-        .route("/static/vendor/{file}", get(vendor))
+        .route("/static/{*path}", get(asset))
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn(csrf_guard))

@@ -186,6 +186,31 @@ class BrowserTests(unittest.TestCase):
         expect(page.locator(".filter-chip")).to_have_count(2)
         expect(page.locator("#q")).to_have_value('author:"quillandink" is:complete ')
 
+    def test_a_cdn_script_marked_with_the_nonce_runs_and_no_other_inline_script_does(self) -> None:
+        # What Cloudflare's JavaScript Detections do: append an inline script to the page,
+        # carrying the nonce from the page's CSP header. Only the page itself: the live
+        # region's own requests to /jobs pass through untouched.
+        def inject(route: Route) -> None:
+            if not route.request.is_navigation_request():
+                route.fallback()
+                return
+            response = route.fetch()
+            csp = response.headers["content-security-policy"]
+            nonce = csp.split("'nonce-")[1].split("'")[0]
+            body = response.text().replace(
+                "</body>",
+                f'<script nonce="{nonce}">document.documentElement.dataset.cdn = "ran"</script>'
+                '<script>document.documentElement.dataset.rogue = "ran"</script></body>',
+            )
+            route.fulfill(response=response, body=body)
+
+        self.page.route(lambda url: url.endswith("/jobs"), inject)
+        page = self.open("/jobs")
+        expect(page.locator("html")).to_have_attribute("data-cdn", "ran")
+        expect(page.locator("html")).not_to_have_attribute("data-rogue", "ran")
+        # The unmarked script is refused, which the browser reports; that one is expected.
+        self.problems = [p for p in self.problems if "Content Security Policy" not in p]
+
     def test_tabs_keep_the_search(self) -> None:
         page = self.open("/library?q=harbor")
         page.get_by_role("link", name="Series").click()

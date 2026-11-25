@@ -15,6 +15,7 @@ use fanfold_domain::{
 use maud::{DOCTYPE, Markup, html};
 
 use crate::{
+    assets,
     format::{clock, first_line, iso, relative, site_summary, status_of, truncate},
     problem::ProblemDetails,
 };
@@ -318,16 +319,18 @@ pub fn full_page(screen: &Screen<'_>, notice: Option<Notice>) -> Markup {
                 meta name="theme-color" content="#101517" media="(prefers-color-scheme: dark)";
                 meta name="htmx-config" content=(HTMX_CONFIG);
                 title { (screen.title) " · Fanfold" }
-                link rel="icon" type="image/svg+xml" href="/static/icon.svg";
-                link rel="preload" href="/static/vendor/literata-latin.woff2" as="font" type="font/woff2" crossorigin;
-                link rel="stylesheet" href="/static/app.css";
+                // Content-hashed addresses (`crate::assets`): cached for good, renamed by
+                // any release that changes them.
+                link rel="icon" type="image/svg+xml" href=(assets::url("icon.svg"));
+                link rel="preload" href=(assets::url("vendor/literata-latin.woff2")) as="font" type="font/woff2" crossorigin;
+                link rel="stylesheet" href=(assets::url("app.css"));
                 // In this order: htmx, its extensions, our components (registered before
                 // Alpine starts), Alpine.
-                script src="/static/vendor/htmx.min.js" defer {}
-                script src="/static/vendor/hx-sse.min.js" defer {}
-                script src="/static/vendor/hx-alpine-compat.min.js" defer {}
-                script src="/static/app.js" defer {}
-                script src="/static/vendor/alpine-csp.min.js" defer {}
+                script src=(assets::url("vendor/htmx.min.js")) defer {}
+                script src=(assets::url("vendor/hx-sse.min.js")) defer {}
+                script src=(assets::url("vendor/hx-alpine-compat.min.js")) defer {}
+                script src=(assets::url("app.js")) defer {}
+                script src=(assets::url("vendor/alpine-csp.min.js")) defer {}
             }
             body hx-sse:connect="/events" {
                 header class="sticky top-0 z-30 border-b border-rule bg-paper/85 backdrop-blur" {
@@ -576,7 +579,7 @@ pub fn history_content(m: &HistoryModel) -> Markup {
                 @for (filter, label) in FILTERS {
                     a href=(history_href(filter, 1)) aria-current=[(filter == m.filter).then_some("page")] {
                         (label)
-                        @if let Some(n) = count_for(filter) { " " span class="mono tabular-nums opacity-70" { (n) } }
+                        @if let Some(n) = count_for(filter) { " " span class="mono tabular-nums" { (n) } }
                     }
                 }
             }

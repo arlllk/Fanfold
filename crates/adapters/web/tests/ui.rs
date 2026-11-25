@@ -318,6 +318,55 @@ async fn every_response_carries_the_hardening_headers() {
 }
 
 #[tokio::test]
+async fn pages_carry_a_fresh_csp_nonce_and_files_never_do() {
+    let rig = rig();
+    let csp = |reply: &Reply| {
+        reply.headers[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    };
+    let nonce = |csp: &str| {
+        csp.split("'nonce-")
+            .nth(1)
+            .and_then(|rest| rest.split_once('\''))
+            .map(|(n, _)| n.to_owned())
+    };
+    let first = csp(&get(&rig.ui, "/").await);
+    let second = csp(&get(&rig.ui, "/").await);
+    let (a, b) = (nonce(&first).unwrap(), nonce(&second).unwrap());
+    assert_eq!(a.len(), 32, "{first}");
+    assert_ne!(a, b, "one nonce per response");
+    assert!(first.contains("script-src 'self' 'nonce-"), "{first}");
+    assert!(!first.contains("unsafe-inline"), "{first}");
+    let page = get(&rig.ui, "/").await.body;
+    assert!(
+        !page.contains("nonce="),
+        "Fanfold itself has no inline script to mark"
+    );
+    assert!(
+        nonce(&csp(&get(&rig.ui, "/nope").await)).is_some(),
+        "an HTML 404 is a page too"
+    );
+    let file = get(&rig.ui, "/static/app.js").await;
+    assert_eq!(nonce(&csp(&file)), None, "a cached file never carries one");
+    let problem = send(
+        &rig.ui,
+        Method::GET,
+        "/nope",
+        &[("accept", "application/json")],
+        "",
+    )
+    .await;
+    assert_eq!(
+        nonce(&csp(&problem)),
+        None,
+        "{:?}",
+        problem.headers[header::CONTENT_TYPE]
+    );
+}
+
+#[tokio::test]
 async fn pages_contain_nothing_the_csp_would_block() {
     let rig = rig();
     let job = rig.queue(1).await;
@@ -343,7 +392,15 @@ async fn pages_contain_nothing_the_csp_would_block() {
                 "{path}: only external scripts from here: {script:.60}"
             );
         }
-        assert!(body.contains(r#"<script src="/static/app.js" defer></script>"#));
+        assert!(
+            static_urls(&body)
+                .iter()
+                .any(|u| u.starts_with("/static/app.")
+                    && std::path::Path::new(u)
+                        .extension()
+                        .is_some_and(|e| e == "js")),
+            "{path}: our script"
+        );
         assert!(
             !body.contains("hx-on"),
             "{path}: htmx handlers would need eval"
@@ -1072,24 +1129,135 @@ async fn a_slow_reader_is_told_to_resync() {
 
 // ----------------------------------------------------------------- assets & ops
 
+/// Every `/static/` address a page names, in order.
+fn static_urls(page: &str) -> Vec<String> {
+    page.split(r#"="/static/"#)
+        .skip(1)
+        .filter_map(|rest| {
+            rest.split_once('"')
+                .map(|(path, _)| format!("/static/{path}"))
+        })
+        .collect()
+}
+
 #[tokio::test]
-async fn static_assets_are_served_with_the_right_types() {
+async fn pages_name_every_static_file_by_its_hash_and_it_is_cached_for_good() {
     let rig = rig();
-    for (path, ctype) in [
-        ("/static/app.css", "text/css; charset=utf-8"),
-        ("/static/app.js", "text/javascript; charset=utf-8"),
-        ("/static/icon.svg", "image/svg+xml"),
-    ] {
-        let reply = get(&rig.ui, path).await;
-        assert_eq!(reply.status, StatusCode::OK, "{path}");
-        assert_eq!(reply.headers[header::CONTENT_TYPE], ctype, "{path}");
+    let page = get(&rig.ui, "/").await.body;
+    let urls = static_urls(&page);
+    assert_eq!(
+        urls.len(),
+        8,
+        "icon, font, stylesheet, five scripts: {urls:?}"
+    );
+    for (url, ctype) in urls.iter().zip([
+        "image/svg+xml",
+        "font/woff2",
+        "text/css; charset=utf-8",
+        "text/javascript; charset=utf-8",
+        "text/javascript; charset=utf-8",
+        "text/javascript; charset=utf-8",
+        "text/javascript; charset=utf-8",
+        "text/javascript; charset=utf-8",
+    ]) {
+        let file = url.rsplit('/').next().unwrap();
+        let hash = file.split('.').rev().nth(1).unwrap();
         assert!(
-            reply.headers[header::CACHE_CONTROL]
-                .to_str()
-                .unwrap()
-                .starts_with("public")
+            hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{url}: no content hash"
         );
-        assert_ne!(reply.body, "");
+        let reply = get(&rig.ui, url).await;
+        assert_eq!(reply.status, StatusCode::OK, "{url}");
+        assert_eq!(reply.headers[header::CONTENT_TYPE], ctype, "{url}");
+        assert_eq!(
+            reply.headers[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable",
+            "{url}"
+        );
+        assert_eq!(reply.headers[header::ETAG], format!("\"{hash}\""), "{url}");
+        assert!(
+            !reply.headers.contains_key(header::SET_COOKIE),
+            "{url}: a CDN strips or skips it"
+        );
+        assert_ne!(reply.body, "", "{url}");
+    }
+    let css = urls
+        .iter()
+        .find(|u| u.contains("/app."))
+        .map(String::as_str);
+    let css = get(&rig.ui, css.unwrap_or_default()).await.body;
+    for font in static_urls(
+        &css.replace("url(/static/", "=\"/static/")
+            .replace(')', "\""),
+    ) {
+        assert_eq!(
+            get(&rig.ui, &font).await.headers[header::CONTENT_TYPE],
+            "font/woff2",
+            "{font}"
+        );
+    }
+    assert!(
+        css.contains("url(/static/vendor/literata-latin."),
+        "the stylesheet names hashed fonts"
+    );
+}
+
+#[tokio::test]
+async fn plain_and_stale_names_get_the_current_file_revalidated_every_time() {
+    let rig = rig();
+    let current = static_urls(&get(&rig.ui, "/").await.body)
+        .into_iter()
+        .find(|u| u.starts_with("/static/vendor/htmx.min."))
+        .unwrap();
+    let fresh = get(&rig.ui, &current).await;
+    for stale in [
+        "/static/vendor/htmx.min.js",
+        "/static/vendor/htmx.min.0123456789abcdef.js",
+    ] {
+        let reply = get(&rig.ui, stale).await;
+        assert_eq!(reply.status, StatusCode::OK, "{stale}");
+        assert_eq!(
+            reply.headers[header::CACHE_CONTROL],
+            "no-cache",
+            "{stale}: never stored by a CDN"
+        );
+        assert_eq!(
+            reply.headers[header::ETAG],
+            fresh.headers[header::ETAG],
+            "{stale}"
+        );
+        assert_eq!(reply.body, fresh.body, "{stale}");
+    }
+    let etag = fresh.headers[header::ETAG].to_str().unwrap();
+    let again = send(
+        &rig.ui,
+        Method::GET,
+        "/static/vendor/htmx.min.js",
+        &[("if-none-match", etag)],
+        "",
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::NOT_MODIFIED);
+    assert_eq!(again.body, "");
+    let changed = send(
+        &rig.ui,
+        Method::GET,
+        "/static/vendor/htmx.min.js",
+        &[("if-none-match", "\"old\"")],
+        "",
+    )
+    .await;
+    assert_eq!(changed.status, StatusCode::OK);
+    for missing in [
+        "/static/nope.js",
+        "/static/vendor/nope.0123456789abcdef.js",
+        "/static/",
+    ] {
+        assert_eq!(
+            get(&rig.ui, missing).await.status,
+            StatusCode::NOT_FOUND,
+            "{missing}"
+        );
     }
 }
 
@@ -1332,7 +1500,7 @@ async fn filter_chips_show_the_right_counts() {
     }
     let body = get(&rig.ui, "/jobs").await.body;
     for (label, count) in [("Active", 9), ("Retrying", 4), ("Failed", 1), ("Done", 5)] {
-        let chip = format!(r#"{label} <span class="mono tabular-nums opacity-70">{count}</span>"#);
+        let chip = format!(r#"{label} <span class="mono tabular-nums">{count}</span>"#);
         assert!(body.contains(&chip), "expected {chip:?} in the filters");
     }
 }
