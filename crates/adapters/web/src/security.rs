@@ -121,10 +121,10 @@ mod tests {
 
     #[test]
     fn the_nonce_only_widens_script_src() {
-        let csp = csp_with_nonce("00ff");
-        assert!(csp.contains("script-src 'self' 'nonce-00ff';"), "{csp}");
-        assert_eq!(csp.replace(" 'nonce-00ff'", ""), CSP);
         let n = nonce().unwrap_or_default();
+        let csp = csp_with_nonce(&n);
+        assert!(csp.contains(&format!("script-src 'self' 'nonce-{n}';")), "{csp}");
+        assert_eq!(csp.replace(&format!(" 'nonce-{n}'"), ""), CSP);
         assert_eq!(n.len(), 32);
         assert!(n.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_ne!(nonce(), nonce(), "one per response");

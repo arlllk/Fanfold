@@ -188,8 +188,12 @@ class BrowserTests(unittest.TestCase):
 
     def test_a_cdn_script_marked_with_the_nonce_runs_and_no_other_inline_script_does(self) -> None:
         # What Cloudflare's JavaScript Detections do: append an inline script to the page,
-        # carrying the nonce from the page's CSP header.
+        # carrying the nonce from the page's CSP header. Only the page itself: the live
+        # region's own requests to /jobs pass through untouched.
         def inject(route: Route) -> None:
+            if not route.request.is_navigation_request():
+                route.fallback()
+                return
             response = route.fetch()
             csp = response.headers["content-security-policy"]
             nonce = csp.split("'nonce-")[1].split("'")[0]
@@ -204,7 +208,6 @@ class BrowserTests(unittest.TestCase):
         page = self.open("/jobs")
         expect(page.locator("html")).to_have_attribute("data-cdn", "ran")
         expect(page.locator("html")).not_to_have_attribute("data-rogue", "ran")
-        page.unroute_all()
         # The unmarked script is refused, which the browser reports; that one is expected.
         self.problems = [p for p in self.problems if "Content Security Policy" not in p]
 
