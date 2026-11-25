@@ -87,6 +87,22 @@ class RefusedTest(unittest.TestCase):
         self.assertIsNone(fb.refused(outcome(200, b'<div id="main">I may be a robot, said the android</div>')))
 
 
+class TurnstileFrameTest(unittest.TestCase):
+    def test_only_cloudflare_s_own_host_counts(self) -> None:
+        self.assertTrue(fb.is_turnstile_frame("https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/if/ov2"))
+        self.assertTrue(fb.is_turnstile_frame("https://Challenges.Cloudflare.com/x"))
+        for url in (
+            "https://evil.example/?next=https://challenges.cloudflare.com/",
+            "https://evil.example/challenges.cloudflare.com",
+            "https://challenges.cloudflare.com.evil.example/",
+            "https://challenges.cloudflare.com@evil.example/",
+            "http://challenges.cloudflare.com/",
+            "about:blank",
+            "",
+        ):
+            self.assertFalse(fb.is_turnstile_frame(url), url)
+
+
 class PacerTest(unittest.TestCase):
     def test_requests_start_at_least_the_interval_apart(self) -> None:
         clock = FakeClock()
