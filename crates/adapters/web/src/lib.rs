@@ -7,6 +7,7 @@
 //!
 //! [RFC 9457]: https://www.rfc-editor.org/rfc/rfc9457
 
+pub mod assets;
 pub mod format;
 pub mod forms;
 pub mod metrics;
