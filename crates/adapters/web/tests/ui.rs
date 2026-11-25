@@ -318,6 +318,55 @@ async fn every_response_carries_the_hardening_headers() {
 }
 
 #[tokio::test]
+async fn pages_carry_a_fresh_csp_nonce_and_files_never_do() {
+    let rig = rig();
+    let csp = |reply: &Reply| {
+        reply.headers[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    };
+    let nonce = |csp: &str| {
+        csp.split("'nonce-")
+            .nth(1)
+            .and_then(|rest| rest.split_once('\''))
+            .map(|(n, _)| n.to_owned())
+    };
+    let first = csp(&get(&rig.ui, "/").await);
+    let second = csp(&get(&rig.ui, "/").await);
+    let (a, b) = (nonce(&first).unwrap(), nonce(&second).unwrap());
+    assert_eq!(a.len(), 32, "{first}");
+    assert_ne!(a, b, "one nonce per response");
+    assert!(first.contains("script-src 'self' 'nonce-"), "{first}");
+    assert!(!first.contains("unsafe-inline"), "{first}");
+    let page = get(&rig.ui, "/").await.body;
+    assert!(
+        !page.contains("nonce="),
+        "Fanfold itself has no inline script to mark"
+    );
+    assert!(
+        nonce(&csp(&get(&rig.ui, "/nope").await)).is_some(),
+        "an HTML 404 is a page too"
+    );
+    let file = get(&rig.ui, "/static/app.js").await;
+    assert_eq!(nonce(&csp(&file)), None, "a cached file never carries one");
+    let problem = send(
+        &rig.ui,
+        Method::GET,
+        "/nope",
+        &[("accept", "application/json")],
+        "",
+    )
+    .await;
+    assert_eq!(
+        nonce(&csp(&problem)),
+        None,
+        "{:?}",
+        problem.headers[header::CONTENT_TYPE]
+    );
+}
+
+#[tokio::test]
 async fn pages_contain_nothing_the_csp_would_block() {
     let rig = rig();
     let job = rig.queue(1).await;

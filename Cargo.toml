@@ -49,7 +49,6 @@ tokio = { version = "1.54", default-features = false }
 async-trait = "0.1.92"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-sha2 = { version = "0.11.1", default-features = false }
 thiserror = "2.0.21"
 url = "2.5.8"
 http = "1"
@@ -64,6 +63,9 @@ maud = "0.27.0"
 tokio-stream = { version = "0.1.19", default-features = false }
 tower = { version = "0.5.3", default-features = false }
 http-body-util = "0.1.5"
+# static file names (content hashes) and the per-page CSP nonce
+sha2 = { version = "0.11.1", default-features = false }
+getrandom = { version = "0.4.3", default-features = false }
 
 # mail
 # Stalwart's own JMAP client. No websockets: we only need HTTP and the event stream.
