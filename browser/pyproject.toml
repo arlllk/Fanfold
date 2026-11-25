@@ -18,3 +18,6 @@ dependencies = [
 
 [tool.uv]
 package = false
+# Wheels only, for every uv command here (CI, the image, uv lock, and Renovate's own runs on its
+# servers): a source distribution would run its build code just by being installed or locked.
+no-build = true

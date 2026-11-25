@@ -1,0 +1,118 @@
+# Weekly lock file maintenance, with a cool-down: Cargo.lock, python/uv.lock and
+# browser/uv.lock move to the newest releases that are at least 3 days old
+# (scripts/lock_cooldown.py), and nothing locked goes back. It replaces Renovate's own lock
+# file maintenance, which refreshes every transitive dependency to whatever was published a
+# minute ago (Renovate's minimumReleaseAge only covers the direct dependencies it updates).
+#
+# The update runs with no token at all and builds nothing: resolving runs no dependency code
+# (cargo never runs build scripts to resolve, and uv runs with --no-build). Only the steps after
+# it use the repository's GitHub App, to push the branch and open the pull request, so CI runs
+# on it like on anyone's. The PR is assigned to the owner, and merges once they approve it and
+# `ci-ok` passes (automerge.yml); it goes out with the next weekly release (release.yml).
+#
+# `--publish-time` is unstable in cargo, so the resolution uses a nightly cargo (only to
+# resolve; nothing is compiled with it).
+name: lock-maintenance
+
+on:
+  schedule:
+    - cron: "23 4 * * 1" # Mondays; the weekly release is on Tuesdays (release.yml)
+  workflow_dispatch:
+    inputs:
+      days:
+        description: Minimum age of a release, in days.
+        type: string
+        default: "3"
+
+concurrency:
+  group: lock-maintenance
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  update:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read # checkout only; the push and the PR use the app's token
+    env:
+      DAYS: ${{ inputs.days || '3' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Nightly cargo
+        run: rustup toolchain install nightly --profile minimal --no-self-update
+
+      # The same uv as CI and the image (Renovate moves them together).
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          # renovate: datasource=docker depName=ghcr.io/astral-sh/uv
+          version: "0.13.9"
+          require-checksums: true
+          enable-cache: false
+
+      - name: Update the lock files (resolution only)
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+        run: |
+          set -euo pipefail
+          [[ "$DAYS" =~ ^[0-9]+$ ]] || { echo "::error::days must be a whole number"; exit 1; }
+          python3 -I -B scripts/lock_cooldown.py --days "$DAYS" --summary "$RUNNER_TEMP/summary.md"
+
+      - id: changed
+        run: |
+          set -euo pipefail
+          other=$(git status --porcelain | grep -vE '^ M (Cargo\.lock|python/uv\.lock|browser/uv\.lock)$' || true)
+          if [ -n "$other" ]; then
+            printf '::error::the update changed more than the lock files:\n%s\n' "$other"
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Every lock file is already up to date (for releases at least $DAYS days old)."
+          fi
+
+      - id: app
+        if: steps.changed.outputs.changed == 'true'
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      # A new branch per run (never a force push). An older run's PR that is still open is
+      # superseded: closed, and its branch deleted.
+      - name: Push and open the pull request
+        if: steps.changed.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          branch="deps/lock-maintenance-$(date -u +%Y-%m-%d-%H%M)"
+          git config user.name "fanfold-bot[bot]"
+          git config user.email "358558070+fanfold-bot[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -q -m "Lock file maintenance (releases at least $DAYS days old)" \
+            -- Cargo.lock python/uv.lock browser/uv.lock
+          git push -q "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${branch}"
+
+          for old in $(gh pr list --state open --base main --json number,headRefName \
+                         --jq '.[] | select(.headRefName | startswith("deps/lock-maintenance-")) | .number'); do
+            gh pr close "$old" --delete-branch --comment "Superseded by a newer lock file maintenance run."
+          done
+
+          # Assigned to the owner, whose approval merges it (automerge.yml, once CI passes).
+          url=$(gh pr create --base main --head "$branch" --label release:patch \
+                  --assignee "$OWNER" --reviewer "$OWNER" \
+                  --title "Lock file maintenance (releases at least $DAYS days old)" \
+                  --body-file "$RUNNER_TEMP/summary.md")
+          echo "Opened $url"

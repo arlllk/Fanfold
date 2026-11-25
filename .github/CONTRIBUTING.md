@@ -7,30 +7,110 @@ be green before anything merges.
 
 ## Branches and pull requests
 
-Push a branch and a pull request into `main` is opened for it (`pr.yml`), titled after the
-branch's first commit. You can also open one yourself; nothing is duplicated.
+Open pull requests by hand (`gh pr create`, or on GitHub). Choose the version bump with a
+`release:*` label (see "Versions and releases"); none means a patch.
 
-Those PRs are opened, and merged, by the repository's GitHub App (secrets `RELEASE_APP_ID` and
-`RELEASE_APP_PRIVATE_KEY`), so CI and the release start by themselves. A PR or merge by the
+### Merging: CI and the maintainer's approval
+
+A pull request merges itself (`automerge.yml`) once **both** hold for its latest commit:
+
+1. **CI passed**: the latest `ci-ok` on that commit is green.
+2. **The maintainer approved it**: a PR the maintainer opened counts as approved by being
+   theirs. Anyone else's (Renovate's, the lock file maintenance's, a contributor's) needs the
+   maintainer's approval of that very commit; after a new push, approve again. Approving from
+   the phone is enough, before or after CI finishes.
+
+Never merged by itself:
+
+- a **draft**. Drafts do not run CI at all; marking one ready for review starts it, and the PR
+  merges once it passes;
+- a PR with the **`draft` label** (CI still runs; removing the label merges it if CI passed and
+  it is approved);
+- a PR from a **fork**: merged by hand.
+
+The merge is made by the repository's GitHub App (secrets `RELEASE_APP_ID` and
+`RELEASE_APP_PRIVATE_KEY`), so the push to `main` starts the release workflow; a merge by the
 built-in Actions token would trigger nothing.
 
-The maintainer's pull requests merge themselves once CI passes (`automerge.yml`). To stop that,
-make the PR a draft or add the `no-automerge` label. Pull requests from forks are merged by
-hand. Renovate merges its own lock file maintenance, digest and pin updates, and patch updates
-of dependencies at 1.0 or later, once CI passes; everything else from Renovate waits for review
-(`renovate.json`).
+How it works: the end of a CI run, an approval or removing the `draft` label starts
+`automerge.yml`. The last two go through `relay.yml`, which does nothing but end: those events
+run the PR's own copy of a workflow, which the PR may have changed, while `automerge.yml`
+always runs from `main`, so the GitHub App's key never meets a workflow file a PR can edit.
+
+## Dependencies
+
+Nothing new is taken until it is **3 days old**. Most malicious releases (a hijacked
+maintainer account, a moved tag) are found and yanked within hours to a few days, and CI cannot
+tell one from a real release: it passes either way.
+
+- **Renovate** (`renovate.json`) proposes updates once they are 3 days old and asks you for a
+  review. Each merges once you approve it. Updates of GitHub Actions carry a reminder in the PR:
+  they run next to the GitHub App's key and the signing identity, and a digest update for an
+  unchanged tag is what a hijacked tag looks like.
+- **Lock files** (`lock-maintenance.yml`, Mondays) move to the newest releases that are 3 days
+  old, through `scripts/lock_cooldown.py`: `cargo generate-lockfile --publish-time` (unstable,
+  so on a nightly cargo, for resolving only) and `uv lock --exclude-newer`. Nothing locked ever
+  goes back, so a security fix newer than that stays. Its PR is assigned to you and merges once
+  you approve it. By hand: `RUSTUP_TOOLCHAIN=nightly python3 -I scripts/lock_cooldown.py` (it
+  needs a nightly toolchain and uv).
+- **Security fixes** skip the wait: as soon as a vulnerability in a dependency is known
+  (GitHub's alerts and [OSV](https://osv.dev)), Renovate opens the PR that fixes it, assigns it
+  to you, and labels it `security`, `severity:<CRITICAL|HIGH|MODERATE|LOW>` and `release:now`.
+  Approving it merges it once CI passes, and the merge is released right away.
+
+### Where dependency code runs, and what it could reach
+
+A new dependency runs in CI **before** anyone reviews it (CI tests the PR), so no job that
+runs dependency code holds a token or secret worth stealing. Keep it that way:
+
+| where | what runs | token and secrets |
+|---|---|---|
+| `ci.yml` `rust`, on the runner | build scripts, proc-macros and tests of every crate; FanFicFare, Playwright and any `.pth` start-up hook of the Python venv; Pyrefly; Tailwind | `contents: read` (a public repository: nothing private), no secrets. On `main` it can also write the Actions cache, which is why releases never read it |
+| `image.yml` / `browser-image.yml`, for a PR | the same dependencies, inside BuildKit's sandbox and the smoke-test containers | `contents: read` only (the workflows take their caller's token); the dhi.io pull token, which is not visible inside the build |
+| the same, for a release | the same, merged and approved by then | `packages: write`, built without the shared cache |
+| `lock-maintenance.yml` | nothing: resolution only (cargo runs no build scripts to resolve; uv is wheels only) | the GitHub App's key, only after the update step |
+| `vendor-sync.yml` | nothing: the npm tarballs are only read, never extracted or run | the GitHub App's key, only for the push |
+
+Python packages are installed from wheels only (`no-build = true` in both `pyproject.toml`
+files, and `--no-build` everywhere), so no `setup.py` runs, not even in Renovate's own `uv lock`
+on its servers. The images get no secrets either: no build secret or SSH mount, the only build
+argument is the version, and `.dockerignore` keeps `.env*`, `.git` and `config/` out of the
+context. The published images' environment holds only paths and versions.
 
 ## Versions and releases
 
-A merge into `main` that changes what the image is built from is a release (`release.yml`): the
-merge commit is tagged `vX.Y.Z`, a GitHub release is created with generated notes, and the
-image is published to `ghcr.io/arlllk/fanfold` as `X.Y.Z`, `X.Y`, `X` (from 1.0 on) and
-`latest`, for linux/amd64.
+Releases are made by `release.yml`: a commit of `main` is tagged `vX.Y.Z`, a GitHub release is
+created with generated notes, and the image is published to `ghcr.io/arlllk/fanfold` as `X.Y.Z`,
+`X.Y`, `X` (from 1.0 on) and `latest`, for linux/amd64.
 
-A merge that touches only CI, docs, Renovate's config, tests, test data, examples, fuzzing or
-the dev tooling is not released, since it would publish the same image again under a new
-version. It goes out with the next release. (Run the release workflow by hand with `force`
-to release anyway.)
+Merges are not released one by one. **Every Tuesday** `main` is released if anything the image
+is built from changed since the last release; everything merged that week goes out together,
+after the Monday lock file update and with every dependency through its cool-down.
+
+Nothing is released if only CI, docs, Renovate's config, tests, test data, examples, fuzzing
+or the dev tooling changed: that would be the same image under a new version. Those changes go
+out with the next release.
+
+### Urgent releases (a CVE, a bad bug)
+
+- **A security fix from Renovate** (assigned to you): approve its PR. It merges once CI
+  passes, and carries `release:now`, so the merge is released right away.
+- **Any other PR**: add the `release:now` label before it merges, and its merge is
+  released right away.
+- **Already on `main`** (merged earlier, waiting for Tuesday), such as a base image digest
+  update that brings a CVE fix: release it now with
+
+  ```sh
+  gh workflow run release.yml
+  ```
+
+  `-f sha=<commit>` releases an older commit of `main` instead of its head, and `-f force=true`
+  releases even if no image input changed. Every input is pinned, so a forced release of the
+  same commit is the same image under a new version; a fix always needs a change on `main`
+  first (if Renovate has not proposed it yet, bump the version or digest by hand in a PR).
+
+The daily scan (`scan.yml`) re-checks the latest release against new CVEs and lists what it
+finds in the Security tab: that is where to look for "is the release affected?".
 
 Choose the bump with a label on the pull request:
 

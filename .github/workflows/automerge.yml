@@ -1,20 +1,24 @@
-# Merges the owner's pull requests once CI has passed on their latest commit. The merge is a
-# push to main, which starts the release (release.yml).
+# Merges a pull request once both hold for its latest commit:
+#  * CI passed: `ci-ok` is green on that commit;
+#  * the repository owner approved it: a PR the owner opened counts as approved; anyone else's
+#    (Renovate's, lock-maintenance.yml's, a contributor's) needs the owner's most recent review
+#    to be an approval of that very commit (approve again after a push).
+# Never merged: a draft (which also runs no CI), a PR labelled `draft`, or one from a fork. The
+# ruleset on main still applies: `ci-ok` must be green or the merge is refused. The merge goes
+# out with the weekly release, or at once if the PR is labelled `release:now` (release.yml).
 #
-# Merged automatically: PRs from a branch of this repository (never a fork) that the owner
-# opened, or that pr.yml opened for the owner's push (assigned to them), are not drafts, and
-# do not carry the `no-automerge` label. Everything else (Renovate, contributors) waits for a
-# human. The ruleset on main still applies: `ci-ok` must be green or the merge is refused.
+# Started when a CI run ends, and when a relay.yml run ends (an approval, or the `draft` label
+# removed). Both are workflow_run events, so this always runs main's copy of this file, never a
+# PR's, and never checks out PR code: no file a PR can change ever sees the GitHub App's key.
 #
 # The merge is made with the repository's GitHub App (secrets RELEASE_APP_ID,
 # RELEASE_APP_PRIVATE_KEY): a merge by the Actions token would not trigger the push to main
-# that release.yml listens for. This runs on workflow_run, from main's copy of this file, and
-# never checks out PR code.
+# that release.yml listens for. Everything before it is read with the Actions token.
 name: automerge
 
 on:
   workflow_run:
-    workflows: [ci]
+    workflows: [ci, relay]
     types: [completed]
 
 permissions: {}
@@ -28,20 +32,70 @@ jobs:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
-      contains(fromJSON('["pull_request", "workflow_dispatch"]'), github.event.workflow_run.event) &&
+      contains(fromJSON('["pull_request", "pull_request_review", "workflow_dispatch"]'), github.event.workflow_run.event) &&
       github.event.workflow_run.head_branch != 'main'
     runs-on: ubuntu-26.04
     timeout-minutes: 5
-    permissions: {} # everything is done with the app's token
+    permissions:
+      checks: read # ci-ok on the PR's commit
+      pull-requests: read # the PR and its reviews
     env:
       GH_REPO: ${{ github.repository }}
       OWNER: ${{ github.repository_owner }}
       BRANCH: ${{ github.event.workflow_run.head_branch }}
       SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
+      - name: Eligible?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pr=$(gh pr list --head "$BRANCH" --base main --state open \
+                 --json number,headRefOid,isDraft,labels,isCrossRepository,author \
+                 --jq '.[0] // empty')
+          if [ -z "$pr" ]; then echo "No open PR into main for $BRANCH."; exit 0; fi
+          n=$(jq -r .number <<<"$pr")
+
+          why=$(jq -r --arg sha "$SHA" '
+            if .isCrossRepository then "it comes from a fork"
+            elif .headRefOid != $sha then "this run was for \($sha), but the PR is now at \(.headRefOid)"
+            elif .isDraft then "it is a draft"
+            elif any(.labels[]; .name == "draft") then "it is labelled draft"
+            else ""
+            end' <<<"$pr")
+          if [ -n "$why" ]; then echo "Not merging #$n: $why."; exit 0; fi
+
+          # CI: the latest ci-ok on exactly this commit, finished and green (a review can come
+          # before CI ends; a failed re-run counts, not an earlier success).
+          ci=$(gh api "repos/$GH_REPO/commits/$SHA/check-runs?check_name=ci-ok" \
+                 --jq '.check_runs | sort_by(.started_at) | last
+                       | if . == null then "not run yet" elif .status != "completed" then "still running"
+                         else .conclusion end')
+          if [ "$ci" != success ]; then echo "Not merging #$n: ci-ok is '$ci' on $SHA."; exit 0; fi
+
+          # Approval: the owner's own PR is approved by being theirs. Anyone else's needs the
+          # owner's latest approving/rejecting review to approve this commit. (Comments do not
+          # change it; a dismissed approval no longer counts.)
+          author=$(jq -r .author.login <<<"$pr")
+          if [ "$author" = "$OWNER" ]; then
+            echo "#$n is $OWNER's own PR and ci-ok passed on $SHA: merging."
+            echo "number=$n" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          last=$(gh api --paginate "repos/$GH_REPO/pulls/$n/reviews" \
+                   --jq ".[] | select(.user.login == \"$OWNER\" and (.state == \"APPROVED\" or .state == \"CHANGES_REQUESTED\" or .state == \"DISMISSED\")) | \"\(.state) \(.commit_id)\"" \
+                 | tail -n1)
+          if [ "$last" != "APPROVED $SHA" ]; then
+            echo "Not merging #$n: not approved by $OWNER on $SHA (latest review: ${last:-none})."
+            exit 0
+          fi
+          echo "number=$n" >> "$GITHUB_OUTPUT"
+
       # This repository only, only what merging needs (`workflows`: a PR may change files in
       # .github/workflows); expires in an hour, revoked when the job ends.
       - id: app
+        if: steps.check.outputs.number != ''
         uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           client-id: ${{ secrets.RELEASE_APP_ID }}
@@ -51,28 +105,14 @@ jobs:
           permission-pull-requests: write
           permission-workflows: write
 
-      - name: Merge if eligible
+      - name: Merge
+        if: steps.check.outputs.number != ''
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          N: ${{ steps.check.outputs.number }}
         run: |
           set -euo pipefail
-          pr=$(gh pr list --head "$BRANCH" --base main --state open \
-                 --json number,headRefOid,isDraft,author,assignees,labels,isCrossRepository \
-                 --jq '.[0] // empty')
-          if [ -z "$pr" ]; then echo "No open PR into main for $BRANCH."; exit 0; fi
-          n=$(jq -r .number <<<"$pr")
-
-          why=$(jq -r --arg sha "$SHA" --arg owner "$OWNER" '
-            if .isCrossRepository then "it comes from a fork"
-            elif .headRefOid != $sha then "CI ran on \($sha), but the PR is now at \(.headRefOid)"
-            elif .isDraft then "it is a draft"
-            elif any(.labels[]; .name == "no-automerge") then "it is labelled no-automerge"
-            elif (.author.login == $owner) or any(.assignees[]; .login == $owner) then ""
-            else "it is not the owner'"'"'s (author \(.author.login))"
-            end' <<<"$pr")
-          if [ -n "$why" ]; then echo "Not merging #$n: $why."; exit 0; fi
-
-          # --match-head-commit: refuse if anything was pushed after the CI run we checked.
+          # --match-head-commit: refuse if anything was pushed after the commit checked above.
           # (The branch is deleted by the repository's "delete head branches" setting.)
-          gh pr merge "$n" --merge --match-head-commit "$SHA"
-          echo "Merged #$n; the push to main starts the release."
+          gh pr merge "$N" --merge --match-head-commit "$SHA"
+          echo "Merged #$N; it goes out with the next release (at once if labelled release:now)."

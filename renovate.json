@@ -13,6 +13,24 @@
     "custom.regex"
   ],
   "automergeStrategy": "merge-commit",
+  "minimumReleaseAge": "3 days",
+  "internalChecksFilter": "strict",
+  "reviewers": [
+    "arlllk"
+  ],
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "description": "A fix for a known vulnerability (GitHub's alerts and OSV) is opened at once, without the cool-down (Renovate's default for vulnerability alerts), assigned to the owner, and labelled with its severity and release:now, so merging it releases at once (release.yml) instead of waiting for the weekly release.",
+    "labels": [
+      "security",
+      "severity:{{{vulnerabilitySeverity}}}",
+      "release:now"
+    ],
+    "assignees": [
+      "arlllk"
+    ],
+    "prCreation": "immediate"
+  },
   "hostRules": [
     {
       "description": "dhi.io (Docker Hardened Images, the runtime base) serves only a logged-in Docker account. The two secrets are Renovate's own, set in the Mend developer portal for this repository (not the GitHub Actions secrets of the same names).",
@@ -22,11 +40,8 @@
     }
   ],
   "lockFileMaintenance": {
-    "enabled": true,
-    "automerge": true,
-    "schedule": [
-      "before 6am on monday"
-    ]
+    "description": "Done by lock-maintenance.yml instead, with a cool-down: Renovate's own refreshes every transitive dependency to whatever was published a minute ago (minimumReleaseAge does not apply to it).",
+    "enabled": false
   },
   "customManagers": [
     {
@@ -86,6 +101,13 @@
   ],
   "packageRules": [
     {
+      "description": "Nothing merges by itself: every PR is merged by automerge.yml once the owner has approved its latest commit and CI has passed (Renovate's own automerge would merge without that approval). Renovate asks the owner for a review instead (reviewers, above).",
+      "matchPackageNames": [
+        "*"
+      ],
+      "automerge": false
+    },
+    {
       "description": "Base images: the Rust image and the Python image move independently of Cargo/pip, so keep them out of the dependency PRs.",
       "matchManagers": [
         "dockerfile"
@@ -143,21 +165,20 @@
       "dependencyDashboardApproval": true
     },
     {
-      "description": "Automerge patch updates of stable (>= 1.0) dependencies once the required `ci-ok` check passes (GitHub auto-merge, enforced by the main ruleset). Minor and major updates, and patches of anything still on 0.x (where a patch may break), run CI and wait for a human. Digest and pin updates: next rule. Last on purpose, so no rule above overrides it. Lock file maintenance automerges too (top-level lockFileMaintenance). Each merge is a patch release (release.yml).",
-      "matchUpdateTypes": [
-        "patch"
+      "description": "Container registries do not always give a release time (ghcr.io, dhi.io): without this, minimumReleaseAge would hold those updates back forever. Images that have one still wait.",
+      "matchDatasources": [
+        "docker"
       ],
-      "matchCurrentVersion": "!/^v?0\\./",
-      "automerge": true
+      "minimumReleaseAgeBehaviour": "timestamp-optional"
     },
     {
-      "description": "Digest and pin updates automerge too, at any version: the tag or version stays the same, only the digest it is pinned to changes (a rebuilt base image, a GitHub Action pinned to the commit of its tag).",
-      "matchUpdateTypes": [
-        "digest",
-        "pin",
-        "pinDigest"
+      "description": "GitHub Actions run in the jobs that hold the GitHub App's key, the signing identity and the registry token, and a tag moved to another commit is how tj-actions/changed-files was compromised (March 2025). A reminder for the review.",
+      "matchManagers": [
+        "github-actions"
       ],
-      "automerge": true
+      "prBodyNotes": [
+        "⚠️ An action runs with this repository's tokens. Before approving, check that each new commit is the one the action's release points at (a digest update for an unchanged tag means the tag moved), and skim its diff."
+      ]
     }
   ],
   "gitIgnoredAuthors": [

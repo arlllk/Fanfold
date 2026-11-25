@@ -4,6 +4,19 @@
 #
 # Called by ci.yml when browser/ changed (build + smoke test, nothing published) and by
 # release.yml (publish version X.Y.Z). One platform, linux/amd64, like the main image.
+#
+# PERMISSIONS: none declared here on purpose, so each run gets exactly what its caller's job
+# grants. A pull request's CI (ci.yml) grants `contents: read` only, so the job that builds a
+# PR's new dependencies (in BuildKit, and runs them in the smoke test) holds no token that can
+# push an image; only release.yml grants `packages: write`. (A job declaring `packages: write`
+# would need every caller to grant it, PRs included.) For the same reason this workflow has no
+# trigger of its own: release from release.yml (`gh workflow run release.yml`).
+#
+# CACHE. Releases do not read the GitHub Actions cache: any job on main can write it, and
+# main's CI (release.yml, warm-cache) runs every dependency's build scripts and tests on the
+# runner, so a malicious dependency could plant cache entries that a release would then
+# build from. A release builds everything from scratch (once a week) and then writes the cache
+# for pull requests, which only ever read it.
 name: browser-image
 
 on:
@@ -17,22 +30,13 @@ on:
       digest:
         description: The published image's digest (empty when nothing was published).
         value: ${{ jobs.image.outputs.digest }}
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (X.Y.Z). Empty: build and test only."
-        type: string
-        default: ""
 
-permissions: {}
+# No `permissions:` (see PERMISSIONS above): the caller's job decides.
 
 jobs:
   image:
     runs-on: ubuntu-26.04
     timeout-minutes: 30
-    permissions:
-      contents: read
-      packages: write # releases only
     outputs:
       digest: ${{ steps.publish.outputs.digest }}
     steps:
@@ -82,7 +86,9 @@ jobs:
           load: true
           tags: fanfold-browser:ci
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=browser
+          # Pull requests read the cache; releases never do (see CACHE above), and are the only
+          # ones that write it.
+          cache-from: ${{ steps.version.outputs.publish != 'true' && 'type=gha,scope=browser' || '' }}
           cache-to: ${{ steps.version.outputs.publish == 'true' && 'type=gha,scope=browser,mode=max' || '' }}
 
       # Hardened, as deployed: the service must start, and answer /health, which never touches
@@ -124,4 +130,3 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=browser
