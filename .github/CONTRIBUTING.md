@@ -58,6 +58,25 @@ tell one from a real release: it passes either way.
   to you, and labels it `security`, `severity:<CRITICAL|HIGH|MODERATE|LOW>` and `release:now`.
   Approving it merges it once CI passes, and the merge is released right away.
 
+### Where dependency code runs, and what it could reach
+
+A new dependency runs in CI **before** anyone reviews it (CI tests the PR), so no job that
+runs dependency code holds a token or secret worth stealing. Keep it that way:
+
+| where | what runs | token and secrets |
+|---|---|---|
+| `ci.yml` `rust`, on the runner | build scripts, proc-macros and tests of every crate; FanFicFare, Playwright and any `.pth` start-up hook of the Python venv; Pyrefly; Tailwind | `contents: read` (a public repository: nothing private), no secrets. On `main` it can also write the Actions cache, which is why releases never read it |
+| `image.yml` / `browser-image.yml`, for a PR | the same dependencies, inside BuildKit's sandbox and the smoke-test containers | `contents: read` only (the workflows take their caller's token); the dhi.io pull token, which is not visible inside the build |
+| the same, for a release | the same, merged and approved by then | `packages: write`, built without the shared cache |
+| `lock-maintenance.yml` | nothing: resolution only (cargo runs no build scripts to resolve; uv is wheels only) | the GitHub App's key, only after the update step |
+| `vendor-sync.yml` | nothing: the npm tarballs are only read, never extracted or run | the GitHub App's key, only for the push |
+
+Python packages are installed from wheels only (`no-build = true` in both `pyproject.toml`
+files, and `--no-build` everywhere), so no `setup.py` runs, not even in Renovate's own `uv lock`
+on its servers. The images get no secrets either: no build secret or SSH mount, the only build
+argument is the version, and `.dockerignore` keeps `.env*`, `.git` and `config/` out of the
+context. The published images' environment holds only paths and versions.
+
 ## Versions and releases
 
 Releases are made by `release.yml`: a commit of `main` is tagged `vX.Y.Z`, a GitHub release is

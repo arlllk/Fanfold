@@ -171,9 +171,10 @@ jobs:
     needs: changes
     # As a string: outside workflow_call the input is null, and null == false in expressions.
     if: needs.changes.outputs.code == 'true' && format('{0}', inputs.image) != 'false'
+    # Read-only: the image built here contains this PR's dependencies, and the called workflow
+    # gets exactly this token (it declares no permissions of its own).
     permissions:
       contents: read
-      packages: write # not used without a version; required by the called workflow
     uses: ./.github/workflows/image.yml
     secrets:
       DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
@@ -184,7 +185,6 @@ jobs:
     if: needs.changes.outputs.browser == 'true' && format('{0}', inputs.image) != 'false'
     permissions:
       contents: read
-      packages: write # not used without a version; required by the called workflow
     uses: ./.github/workflows/browser-image.yml
 
   ci-ok:

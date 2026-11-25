@@ -28,8 +28,11 @@
 # PRs behind or in conflict. The image is built with the version passed in (FANFOLD_VERSION).
 #
 # Re-running for an already tagged commit does nothing. The tag and release are made with the
-# Actions token on purpose: they then trigger nothing, so image.yml's own tag trigger does not
-# build the image a second time.
+# Actions token on purpose: they then trigger nothing.
+#
+# The image jobs below are the only ones granted `packages: write` (image.yml and
+# browser-image.yml declare no permissions and take their caller's), so a pull request's CI,
+# which builds and runs that PR's dependencies, never holds a token that can push an image.
 name: release
 
 on:
@@ -345,7 +348,6 @@ jobs:
     if: github.event_name == 'push'
     permissions:
       contents: read
-      packages: write # required by the called workflows, unused here
     uses: ./.github/workflows/ci.yml
     with:
       image: false

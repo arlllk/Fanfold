@@ -4,17 +4,31 @@
 # the digest this outputs.)
 #
 # Called by ci.yml (build + smoke test, nothing published) and by release.yml (publish
-# version X.Y.Z). A `vX.Y.Z` tag pushed by hand publishes too. Images are only ever tagged
-# with semver (X.Y.Z, X.Y, and X once X >= 1) plus `latest`, and only for linux/amd64.
+# version X.Y.Z). Images are only ever tagged with semver (X.Y.Z, X.Y, and X once X >= 1) plus
+# `latest`, and only for linux/amd64.
+#
+# PERMISSIONS: none declared here on purpose, so each run gets exactly what its caller's job
+# grants. A pull request's CI (ci.yml) grants `contents: read` only, so the job that builds a
+# PR's new dependencies (in BuildKit, and runs them in the smoke test) holds no token that can
+# push an image; only release.yml grants `packages: write`. (A job declaring `packages: write`
+# would need every caller to grant it, PRs included.) For the same reason this workflow has no
+# trigger of its own: release from release.yml (`gh workflow run release.yml`).
+#
+# CACHE. Releases do not read the GitHub Actions cache: any job on main can write it, and
+# main's CI (release.yml, warm-cache) runs every dependency's build scripts and tests on the
+# runner, so a malicious dependency could plant cache entries that a release would then
+# build from. A release builds everything from scratch (once a week) and then writes the cache
+# for pull requests, which only ever read it.
 #
 # Cost control, in order of effect:
 #  * the Dockerfile separates the dependency build from our own code (cargo-chef), and every
-#    layer is exported to the GitHub Actions cache by releases, so a source change recompiles
-#    only our crates and a dependency change is the only expensive build;
+#    layer is exported to the GitHub Actions cache by releases, so for a pull request a source
+#    change recompiles only our crates and a dependency change is the only expensive build;
 #  * pull requests read that cache but never write it (no cache churn, and a PR cannot
 #    poison it);
 #  * one runner, one platform (linux/amd64: emulated arm64 is ~10x slower), and the publish
-#    step re-uses the layers the test step just built, so nothing is compiled twice.
+#    step re-uses the layers the test step just built (the builder's own cache, in the same
+#    job), so nothing is compiled twice.
 name: image
 
 on:
@@ -33,36 +47,23 @@ on:
       digest:
         description: The published image's digest (empty when nothing was published).
         value: ${{ jobs.image.outputs.digest }}
-  push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (X.Y.Z). Empty: build and test only."
-        type: string
-        default: ""
 
-permissions: {}
+# No `permissions:` (see PERMISSIONS above): the caller's job decides.
 
 jobs:
   image:
     runs-on: ubuntu-26.04
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      packages: write # releases only; read-only for forks automatically
+    timeout-minutes: 45 # a release builds every dependency from scratch
     outputs:
       digest: ${{ steps.publish.outputs.digest }}
     steps:
-      # The version to publish: the caller's input, or the tag a hand-pushed tag run is for.
+      # The version to publish: the caller's input (empty: build and test only).
       - name: Version
         id: version
         env:
           INPUT_VERSION: ${{ inputs.version }}
-          TAG: ${{ github.event_name == 'push' && github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
-          v="${INPUT_VERSION:-$TAG}"
-          v="${v#v}"
+          v="${INPUT_VERSION#v}"
           if [ -n "$v" ] && ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::not a semver release version: '$v'"
             exit 1
@@ -142,8 +143,9 @@ jobs:
           tags: fanfold:ci
           labels: ${{ steps.meta.outputs.labels }}
           build-args: FANFOLD_VERSION=${{ steps.version.outputs.version }}
-          cache-from: type=gha,scope=image
-          # Only releases write the cache: pull requests read it and never write it.
+          # Pull requests read the cache; releases never do (see CACHE above), and are the only
+          # ones that write it.
+          cache-from: ${{ steps.version.outputs.publish != 'true' && 'type=gha,scope=image' || '' }}
           cache-to: ${{ steps.version.outputs.publish == 'true' && 'type=gha,scope=image,mode=max,ignore-error=true' || '' }}
 
       # The image has to work the way it is meant to be deployed: read-only root, no
@@ -262,4 +264,3 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: FANFOLD_VERSION=${{ steps.version.outputs.version }}
-          cache-from: type=gha,scope=image
