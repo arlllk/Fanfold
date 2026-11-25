@@ -1,0 +1,33 @@
+# Tells automerge.yml that a pull request may have become mergeable without a CI run: it was
+# approved, or its `draft` label was removed. automerge.yml starts when this run ends
+# (workflow_run) and decides there.
+#
+# Why a relay: these events run the PR's own copy of a workflow file, and the PR may have
+# changed it. So this one holds nothing and does nothing (no token permissions, no secrets, no
+# checkout), and the decision and the GitHub App's key stay in main's copy of automerge.yml.
+# Other reviews and labels are skipped here, which costs no runner.
+name: relay
+
+on:
+  pull_request_review:
+    types: [submitted]
+  pull_request:
+    types: [unlabeled]
+
+permissions: {}
+
+jobs:
+  relay:
+    if: >-
+      (github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
+      (github.event_name == 'pull_request' && github.event.label.name == 'draft')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 1
+    permissions: {}
+    steps:
+      - name: Relay
+        env:
+          EVENT: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          PR: ${{ github.event.pull_request.number }}
+        run: echo "#$PR, $EVENT by $ACTOR; automerge.yml decides."

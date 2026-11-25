@@ -7,31 +7,35 @@ be green before anything merges.
 
 ## Branches and pull requests
 
-Push a branch and a pull request into `main` is opened for it (`pr.yml`), titled after the
-branch's first commit. You can also open one yourself; nothing is duplicated.
+Open pull requests by hand (`gh pr create`, or on GitHub). Choose the version bump with a
+`release:*` label (see "Versions and releases"); none means a patch.
 
-Those PRs are opened, and merged, by the repository's GitHub App (secrets `RELEASE_APP_ID` and
-`RELEASE_APP_PRIVATE_KEY`), so CI and the release start by themselves. A PR or merge by the
+### Merging: CI and the maintainer's approval
+
+A pull request merges itself (`automerge.yml`) once **both** hold for its latest commit:
+
+1. **CI passed**: the latest `ci-ok` on that commit is green.
+2. **The maintainer approved it**: a PR the maintainer opened counts as approved by being
+   theirs. Anyone else's (Renovate's, the lock file maintenance's, a contributor's) needs the
+   maintainer's approval of that very commit; after a new push, approve again. Approving from
+   the phone is enough, before or after CI finishes.
+
+Never merged by itself:
+
+- a **draft**. Drafts do not run CI at all; marking one ready for review starts it, and the PR
+  merges once it passes;
+- a PR with the **`draft` label** (CI still runs; removing the label merges it if CI passed and
+  it is approved);
+- a PR from a **fork**: merged by hand.
+
+The merge is made by the repository's GitHub App (secrets `RELEASE_APP_ID` and
+`RELEASE_APP_PRIVATE_KEY`), so the push to `main` starts the release workflow; a merge by the
 built-in Actions token would trigger nothing.
 
-### Merging: approve, and it merges once CI passes
-
-A pull request merges itself (`automerge.yml`) once **the maintainer has approved its latest
-commit and `ci-ok` passed on it**, in either order. Approving from the phone is enough. The
-approval is for one commit: after a new push, approve again. Nothing else merges anything by
-itself, Renovate included.
-
-- It applies to every PR from a branch of this repository: Renovate's, the lock file
-  maintenance's, and the ones `pr.yml` opens for your pushes (those are opened by the GitHub
-  App, so you can approve them). GitHub does not let anyone approve their own PR, so one you
-  open yourself (`gh pr create`) is merged by hand.
-- To keep an approved PR from merging, make it a draft or add the `no-automerge` label.
-- Pull requests from forks are merged by hand.
-
-How it works: a submitted approval starts `review.yml`, which does nothing but end, and that
-(like the end of a CI run) starts `automerge.yml`. A review event would run the PR's own copy
-of a workflow, which the PR may have changed; `automerge.yml` always runs from `main`, so the
-GitHub App's key never meets a workflow file a PR can edit.
+How it works: the end of a CI run, an approval or removing the `draft` label starts
+`automerge.yml`. The last two go through `relay.yml`, which does nothing but end: those events
+run the PR's own copy of a workflow, which the PR may have changed, while `automerge.yml`
+always runs from `main`, so the GitHub App's key never meets a workflow file a PR can edit.
 
 ## Dependencies
 

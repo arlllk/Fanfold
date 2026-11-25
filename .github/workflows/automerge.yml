@@ -1,18 +1,15 @@
-# Merges a pull request once the repository owner has approved it and CI has passed, whichever
-# comes last. Both must be about the PR's latest commit: `ci-ok` green on it, and the owner's
-# most recent review an approval of it (an approval of an older commit does not count: approve
-# again after a push). The merge goes out with the weekly release, or at once if the PR is
-# labelled `release:now` (release.yml).
+# Merges a pull request once both hold for its latest commit:
+#  * CI passed: `ci-ok` is green on that commit;
+#  * the repository owner approved it: a PR the owner opened counts as approved; anyone else's
+#    (Renovate's, lock-maintenance.yml's, a contributor's) needs the owner's most recent review
+#    to be an approval of that very commit (approve again after a push).
+# Never merged: a draft (which also runs no CI), a PR labelled `draft`, or one from a fork. The
+# ruleset on main still applies: `ci-ok` must be green or the merge is refused. The merge goes
+# out with the weekly release, or at once if the PR is labelled `release:now` (release.yml).
 #
-# Any PR from a branch of this repository qualifies: Renovate's, lock-maintenance.yml's, and the
-# ones pr.yml opens for pushed branches. Never a fork's, a draft, or one labelled
-# `no-automerge`. (GitHub does not let anyone approve their own PR. pr.yml's PRs are opened by
-# the GitHub App, so the owner can approve those; a PR the owner opened by hand is merged by
-# hand.) The ruleset on main still applies: `ci-ok` must be green or the merge is refused.
-#
-# Started when a CI run ends, and when a review.yml run ends (a submitted approval starts one).
-# Both are workflow_run events, so this always runs main's copy of this file, never a PR's, and
-# never checks out PR code: no file a PR can change ever sees the GitHub App's key.
+# Started when a CI run ends, and when a relay.yml run ends (an approval, or the `draft` label
+# removed). Both are workflow_run events, so this always runs main's copy of this file, never a
+# PR's, and never checks out PR code: no file a PR can change ever sees the GitHub App's key.
 #
 # The merge is made with the repository's GitHub App (secrets RELEASE_APP_ID,
 # RELEASE_APP_PRIVATE_KEY): a merge by the Actions token would not trigger the push to main
@@ -21,7 +18,7 @@ name: automerge
 
 on:
   workflow_run:
-    workflows: [ci, review]
+    workflows: [ci, relay]
     types: [completed]
 
 permissions: {}
@@ -55,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           pr=$(gh pr list --head "$BRANCH" --base main --state open \
-                 --json number,headRefOid,isDraft,labels,isCrossRepository \
+                 --json number,headRefOid,isDraft,labels,isCrossRepository,author \
                  --jq '.[0] // empty')
           if [ -z "$pr" ]; then echo "No open PR into main for $BRANCH."; exit 0; fi
           n=$(jq -r .number <<<"$pr")
@@ -64,18 +61,28 @@ jobs:
             if .isCrossRepository then "it comes from a fork"
             elif .headRefOid != $sha then "this run was for \($sha), but the PR is now at \(.headRefOid)"
             elif .isDraft then "it is a draft"
-            elif any(.labels[]; .name == "no-automerge") then "it is labelled no-automerge"
+            elif any(.labels[]; .name == "draft") then "it is labelled draft"
             else ""
             end' <<<"$pr")
           if [ -n "$why" ]; then echo "Not merging #$n: $why."; exit 0; fi
 
-          # CI: a green ci-ok on exactly this commit (a review can come before CI ends).
+          # CI: the latest ci-ok on exactly this commit, finished and green (a review can come
+          # before CI ends; a failed re-run counts, not an earlier success).
           ci=$(gh api "repos/$GH_REPO/commits/$SHA/check-runs?check_name=ci-ok" \
-                 --jq '[.check_runs[].conclusion] | if any(. == "success") then "success" else (.[0] // "not run yet") end')
+                 --jq '.check_runs | sort_by(.started_at) | last
+                       | if . == null then "not run yet" elif .status != "completed" then "still running"
+                         else .conclusion end')
           if [ "$ci" != success ]; then echo "Not merging #$n: ci-ok is '$ci' on $SHA."; exit 0; fi
 
-          # Approval: the owner's latest approving/rejecting review, which must approve this commit.
-          # (Comments do not change it; a dismissed approval no longer counts.)
+          # Approval: the owner's own PR is approved by being theirs. Anyone else's needs the
+          # owner's latest approving/rejecting review to approve this commit. (Comments do not
+          # change it; a dismissed approval no longer counts.)
+          author=$(jq -r .author.login <<<"$pr")
+          if [ "$author" = "$OWNER" ]; then
+            echo "#$n is $OWNER's own PR and ci-ok passed on $SHA: merging."
+            echo "number=$n" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           last=$(gh api --paginate "repos/$GH_REPO/pulls/$n/reviews" \
                    --jq ".[] | select(.user.login == \"$OWNER\" and (.state == \"APPROVED\" or .state == \"CHANGES_REQUESTED\" or .state == \"DISMISSED\")) | \"\(.state) \(.commit_id)\"" \
                  | tail -n1)
