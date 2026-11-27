@@ -91,6 +91,19 @@ demo *args:
 live-mail:
     cargo test -p fanfold-adapter-jmap --test live -- --ignored --nocapture --test-threads=1
 
+# --- dependencies ----------------------------------------------------------------
+
+# Take a crate version younger than the 3-day cool-down (.cargo/config.toml), such as a
+# security fix: just cargo-update-now rustls 0.24.3. Anything new it pulls in may be just as
+# young: cargo lists each one with its age, so read the output before committing.
+cargo-update-now crate version:
+    CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p {{crate}} --precise {{version}}
+
+# The lock files, refreshed to the newest releases at least 3 days old (what
+# lock-maintenance.yml does every Monday). Needs uv.
+lock-refresh days="3":
+    python3 -I -B scripts/lock_cooldown.py --days {{days}}
+
 # --- deeper verification ---------------------------------------------------------
 
 # Mutation testing of the logic crates. Slow; surviving mutants are test gaps.

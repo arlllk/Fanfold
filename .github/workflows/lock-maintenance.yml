@@ -10,8 +10,8 @@
 # on it like on anyone's. The PR is assigned to the owner, and merges once they approve it and
 # `ci-ok` passes (automerge.yml); it goes out with the next weekly release (release.yml).
 #
-# `--publish-time` is unstable in cargo, so the resolution uses a nightly cargo (only to
-# resolve; nothing is compiled with it).
+# Cargo's cool-down is its own `registry.global-min-publish-age` (stable since Rust 1.100), so
+# the stable toolchain of rust-toolchain.toml resolves.
 name: lock-maintenance
 
 on:
@@ -43,9 +43,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Nightly cargo
-        run: rustup toolchain install nightly --profile minimal --no-self-update
-
       # The same uv as CI and the image (Renovate moves them together).
       - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
@@ -55,8 +52,6 @@ jobs:
           enable-cache: false
 
       - name: Update the lock files (resolution only)
-        env:
-          RUSTUP_TOOLCHAIN: nightly
         run: |
           set -euo pipefail
           [[ "$DAYS" =~ ^[0-9]+$ ]] || { echo "::error::days must be a whole number"; exit 1; }
