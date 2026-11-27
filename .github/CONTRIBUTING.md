@@ -48,15 +48,21 @@ tell one from a real release: it passes either way.
   they run next to the GitHub App's key and the signing identity, and a digest update for an
   unchanged tag is what a hijacked tag looks like.
 - **Lock files** (`lock-maintenance.yml`, Mondays) move to the newest releases that are 3 days
-  old, through `scripts/lock_cooldown.py`: `cargo generate-lockfile --publish-time` (unstable,
-  so on a nightly cargo, for resolving only) and `uv lock --exclude-newer`. Nothing locked ever
-  goes back, so a security fix newer than that stays. Its PR is assigned to you and merges once
-  you approve it. By hand: `RUSTUP_TOOLCHAIN=nightly python3 -I scripts/lock_cooldown.py` (it
-  needs a nightly toolchain and uv).
+  old, through `scripts/lock_cooldown.py`: `cargo generate-lockfile` under Cargo's own cool-down
+  and `uv lock --exclude-newer`. Nothing locked ever goes back, so a security fix newer than
+  that stays. Its PR is assigned to you and merges once you approve it. By hand: `just
+  lock-refresh` (needs uv).
+- **Cargo itself** waits too (`.cargo/config.toml`, `registry.global-min-publish-age`, Rust
+  1.100): `cargo add` and `cargo update` on your machine skip anything under 3 days old. A plain
+  `cargo update` under it also moves back locked versions that are younger, so refresh the whole
+  lock with `just lock-refresh` instead. To take a younger release on purpose (a security fix),
+  `just cargo-update-now <crate> <version>`.
 - **Security fixes** skip the wait: as soon as a vulnerability in a dependency is known
   (GitHub's alerts and [OSV](https://osv.dev)), Renovate opens the PR that fixes it, assigns it
   to you, and labels it `security`, `severity:<CRITICAL|HIGH|MODERATE|LOW>` and `release:now`.
-  Approving it merges it once CI passes, and the merge is released right away.
+  Approving it merges it once CI passes, and the merge is released right away. If Renovate's PR
+  reports an artifact update problem for `Cargo.lock` (its cargo refusing the fix under the
+  cool-down), check out its branch, run `just cargo-update-now <crate> <version>` and push.
 
 ### Where dependency code runs, and what it could reach
 

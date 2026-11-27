@@ -134,7 +134,10 @@ class UpdateCargo(unittest.TestCase):
 
             def run(argv: Sequence[str]) -> None:
                 ran.append(list(argv))
-                if argv[1] == "-Zunstable-options":  # the cut-off resolution
+                if argv[0] == "env":  # every resolution runs under the cool-down
+                    self.assertEqual(argv[1:3], ["CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE=3 days", "cargo"])
+                    argv = argv[2:]
+                if argv[1] == "generate-lockfile":  # the cut-off resolution
                     path.write_text(lock(("jiff", "1.0.2"), ("hyper", "1.13.0"), ("zip", "9.9.0"), ("crc", "2.0.0")))
                 elif argv[1] == "update":
                     current = lc.read_lock(path)
@@ -146,13 +149,15 @@ class UpdateCargo(unittest.TestCase):
 
             original_root, lc.ROOT = lc.ROOT, root
             try:
-                lines, skipped = lc.update_cargo("2026-11-22T00:00:00Z", run)
+                lines, skipped = lc.update_cargo(3, run)
             finally:
                 lc.ROOT = original_root
             self.assertEqual(lc.read_lock(path), {"jiff": {"1.0.3"}, "hyper": {"1.13.0"}, "zip": {"9.8.1"}, "crc": {"2.0.0"}})
             self.assertEqual(lines, ["`hyper` 1.12.0 → 1.13.0"])
             self.assertEqual(len(skipped), 1)
             self.assertIn("crc 2.1.0", skipped[0])
+            self.assertEqual(ran[0], lc.cargo_with_age(3, "generate-lockfile"))
+            self.assertIn(lc.cargo_with_age(3, "update", "-p", "hyper@1.12.0", "--precise", "1.13.0"), ran)
             self.assertEqual(ran[-1][:3], ["cargo", "tree", "--locked"])
 
 

@@ -5,11 +5,13 @@ at least N days old.
 
 What it does, for Cargo.lock, python/uv.lock and browser/uv.lock:
 
-1. Re-resolve everything, ignoring anything published after the cut-off (now minus N days):
-   `cargo generate-lockfile --publish-time` (unstable: needs a nightly cargo, e.g.
-   RUSTUP_TOOLCHAIN=nightly) and `uv lock --upgrade --exclude-newer`. Both resolve from
-   scratch, so on their own they would also take back anything locked that is newer than the
-   cut-off (a security fix, or whatever Renovate merged in the last N days).
+1. Re-resolve everything, ignoring anything published in the last N days: `cargo
+   generate-lockfile` with Cargo's own cool-down (`registry.global-min-publish-age`, stable
+   since Rust 1.100; .cargo/config.toml sets 3 days, and --days overrides it through
+   CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE) and `uv lock --upgrade --exclude-newer`. Both resolve
+   from scratch, so on their own they would also take back anything locked that is newer than
+   the cut-off (a security fix, or whatever Renovate merged in the last N days): Cargo's
+   cool-down does that too (a plain `cargo update` under it downgrades them).
 2. Cargo: that resolution only says which upgrades are old enough. The original lock is put
    back and each of those upgrades applied to it with `cargo update --precise`; one that
    would pull in anything newer than the cut-off is left out (and listed).
@@ -177,7 +179,12 @@ def not_allowed(old: Versions, allowed: Versions, now: Versions) -> list[str]:
     ]
 
 
-def update_cargo(cutoff: str, run: Run) -> Result:
+def cargo_with_age(days: int, *args: str) -> list[str]:
+    """A cargo command under a cool-down of `days` days, whatever .cargo/config.toml says."""
+    return ["env", f"CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE={days} days", "cargo", *args]
+
+
+def update_cargo(days: int, run: Run) -> Result:
     """The cut-off resolution only says which upgrades are old enough; they are then applied
     one by one to the lock as it was (`cargo update --precise`), like a plain `cargo update`
     would. Keeping the cut-off lock itself and restoring what went back is not enough: it
@@ -186,7 +193,7 @@ def update_cargo(cutoff: str, run: Run) -> Result:
     lock = ROOT / "Cargo.lock"
     original = lock.read_text("utf-8")
     old = read_lock(lock)
-    run(["cargo", "-Zunstable-options", "generate-lockfile", "--publish-time", cutoff])
+    run(cargo_with_age(days, "generate-lockfile"))
     allowed = read_lock(lock)
     lock.write_text(original, "utf-8")
 
@@ -198,7 +205,7 @@ def update_cargo(cutoff: str, run: Run) -> Result:
         tried.add(pending[0])
         before = lock.read_text("utf-8")
         try:
-            run(["cargo", "update", "-p", f"{name}@{have}", "--precise", want])
+            run(cargo_with_age(days, "update", "-p", f"{name}@{have}", "--precise", want))
         except subprocess.CalledProcessError:
             lock.write_text(before, "utf-8")
             skipped.append(f"`{name}` {have} → {want}: cargo could not apply it on its own")
@@ -257,7 +264,7 @@ def main(argv: list[str]) -> int:
     cutoff = cutoff_for(args.days)
     print(f"Cut-off: {cutoff}")
     try:
-        results = {"Cargo.lock": update_cargo(cutoff, run_command)}
+        results = {"Cargo.lock": update_cargo(args.days, run_command)}
         for project in UV_PROJECTS:
             results[f"{project}/uv.lock"] = update_uv(project, cutoff, run_command)
     except (CooldownError, subprocess.CalledProcessError) as e:

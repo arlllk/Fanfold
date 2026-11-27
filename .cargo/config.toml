@@ -1,0 +1,13 @@
+# Cargo's own cool-down (stable since Rust 1.100): `cargo add`, `cargo update` and
+# `cargo generate-lockfile` skip any crate version published in the last 3 days, the same
+# wait as Renovate (renovate.json) and lock-maintenance.yml. Most malicious releases are
+# found and yanked within hours to a few days. Builds from the lock (`--locked`) are not
+# affected, and neither is `cargo install`.
+#
+# Beware: under it a plain `cargo update` also moves back anything locked that is younger
+# than 3 days (a security fix, a fresh Renovate merge). Refresh the lock with
+# scripts/lock_cooldown.py, or update single crates (`cargo update -p name`).
+#
+# A release younger than that (a security fix): `just cargo-update-now name version`.
+[registry]
+global-min-publish-age = "3 days"
