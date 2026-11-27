@@ -83,7 +83,8 @@ tempfile = "3.27.0"
 zip = { version = "9.8.1", default-features = false, features = ["deflate"] }
 quick-xml = "0.42.0"
 resvg = { version = "0.50.0", default-features = false, features = ["text"] }
-ttf-parser = { version = "0.25.1", default-features = false, features = ["std"] }
+# text measurement for the cover; the font parser resvg (usvg) already uses
+skrifa = { version = "0.49.0", default-features = false, features = ["std"] }
 
 # library search: an in-memory index (no mmap, no compression: nothing is ever written to disk)
 tantivy = { version = "0.27.0", default-features = false }

@@ -14,7 +14,7 @@ fanfold-domain = { workspace = true }
 async-trait = { workspace = true }
 quick-xml = { workspace = true }
 resvg = { workspace = true }
-ttf-parser = { workspace = true }
+skrifa = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
