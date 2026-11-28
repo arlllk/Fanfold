@@ -18,6 +18,12 @@ use std::{fmt::Write as _, sync::Arc};
 use fanfold_app::ports::BookExtras;
 use fanfold_domain::metadata::TagKind;
 use resvg::{tiny_skia, usvg};
+use skrifa::{
+    FontRef, MetadataProvider as _,
+    charmap::Charmap,
+    instance::{LocationRef, Size},
+    metrics::GlyphMetrics,
+};
 
 use crate::{
     book::main_series,
@@ -61,8 +67,40 @@ fn stable_hash(text: &str) -> u64 {
 /// Fonts and the means to measure text with them.
 pub struct Renderer {
     fontdb: Arc<usvg::fontdb::Database>,
-    serif: ttf_parser::Face<'static>,
-    sans: ttf_parser::Face<'static>,
+    serif: Face,
+    sans: Face,
+}
+
+/// What measuring text needs from one font: its em, its character map and its advances,
+/// all in font units (unscaled), so a width is exactly the sum of the font's own numbers.
+struct Face {
+    units_per_em: f32,
+    charmap: Charmap<'static>,
+    advances: GlyphMetrics<'static>,
+}
+
+impl Face {
+    fn parse(data: &'static [u8]) -> Result<Self, String> {
+        let font = FontRef::new(data).map_err(|e| e.to_string())?;
+        let units_per_em = font
+            .metrics(Size::unscaled(), LocationRef::default())
+            .units_per_em;
+        if units_per_em == 0 {
+            return Err("no units per em (head table missing or invalid)".to_owned());
+        }
+        Ok(Self {
+            units_per_em: f32::from(units_per_em),
+            charmap: font.charmap(),
+            advances: font.glyph_metrics(Size::unscaled(), LocationRef::default()),
+        })
+    }
+
+    /// The advance of `c` in font units, or None if the font has no glyph for it.
+    fn advance(&self, c: char) -> Option<f32> {
+        self.charmap
+            .map(c)
+            .and_then(|g| self.advances.advance_width(g))
+    }
 }
 
 impl std::fmt::Debug for Renderer {
@@ -86,8 +124,8 @@ impl Renderer {
         db.set_sans_serif_family(SANS_FAMILY);
         Ok(Self {
             fontdb: Arc::new(db),
-            serif: ttf_parser::Face::parse(SERIF, 0).map_err(|e| format!("serif font: {e}"))?,
-            sans: ttf_parser::Face::parse(SANS, 0).map_err(|e| format!("sans font: {e}"))?,
+            serif: Face::parse(SERIF).map_err(|e| format!("serif font: {e}"))?,
+            sans: Face::parse(SANS).map_err(|e| format!("sans font: {e}"))?,
         })
     }
 
@@ -97,14 +135,10 @@ impl Renderer {
             Font::Serif => &self.serif,
             Font::Sans => &self.sans,
         };
-        let em = f32::from(face.units_per_em());
+        let em = face.units_per_em;
         let units: f32 = text
             .chars()
-            .map(|c| {
-                face.glyph_index(c)
-                    .and_then(|g| face.glyph_hor_advance(g))
-                    .map_or(em / 2.0, f32::from)
-            })
+            .map(|c| face.advance(c).unwrap_or(em / 2.0))
             .sum();
         units / em * size
     }
@@ -345,5 +379,73 @@ impl Renderer {
         );
         svg.push_str("</svg>\n");
         svg
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Widths at 48 px, as measured with ttf-parser before the move to skrifa: the cover's
+    /// line breaks depend on them, so a parser change must not move them.
+    #[test]
+    fn widths_are_the_fonts_own_advances() {
+        let r = Renderer::new().unwrap();
+        for (font, text, want) in [
+            (Font::Serif, "The Quick Brown Fox", 521.04),
+            (Font::Serif, "Ünïcødé — “quoted” …", 544.992),
+            (Font::Serif, "WWW iii", 216.816),
+            (Font::Sans, "The Quick Brown Fox", 475.872),
+            (Font::Sans, "Ünïcødé — “quoted” …", 505.824),
+            (Font::Sans, "WWW iii", 183.552),
+        ] {
+            let got = r.width(font, text, 48.0);
+            assert!(
+                (got - want).abs() < 1e-3,
+                "{font:?} {text:?}: {got}, want {want}"
+            );
+        }
+    }
+
+    /// Characters the fonts lack (CJK, emoji) count as half an em each.
+    #[test]
+    fn missing_characters_are_half_an_em() {
+        let r = Renderer::new().unwrap();
+        for font in [Font::Serif, Font::Sans] {
+            let space = r.width(font, " ", 48.0);
+            let got = r.width(font, "你好 🙂", 48.0);
+            assert!((got - (3.0 * 24.0 + space)).abs() < 1e-3, "{font:?}: {got}");
+            assert!(r.width(font, "", 48.0).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn long_titles_wrap_where_they_did() {
+        let r = Renderer::new().unwrap();
+        let title = "A Very Long Title That Has To Wrap Across Several Lines Supercalifragilisticexpialidocious";
+        assert_eq!(
+            r.wrap(Font::Serif, title, 64.0, 500.0),
+            [
+                "A Very Long",
+                "Title That Has",
+                "To Wrap",
+                "Across Several",
+                "Lines",
+                "Supercalifragil",
+                "isticexpialidoci",
+                "ous"
+            ]
+        );
+        assert_eq!(
+            r.wrap(Font::Sans, title, 64.0, 500.0),
+            [
+                "A Very Long",
+                "Title That Has",
+                "To Wrap Across",
+                "Several Lines",
+                "Supercalifragilis",
+                "ticexpialidocious"
+            ]
+        );
     }
 }
