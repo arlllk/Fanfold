@@ -57,10 +57,10 @@
 # binary links: glibc (Debian's, as the build stage), libm, libgcc_s. Keep the Python minor
 # version in step with ci.yml (uv sync --python), the justfile (venv) and
 # crates/adapters/fanficfare/worker/pyrefly.toml.
-FROM dhi.io/python:3.15.2-debian13@sha256:ac18385fab4463424ca98f364a8a5b904271dbf681f1c06b14b191108b4080ae AS python-base
+FROM dhi.io/python:3.15.2-debian13@sha256:41eb92496c2685833535984843c609368fa6e2b98dade88056ba425850288ba8 AS python-base
 
 # ----------------------------------------------------------------------------- chef
-FROM rust:1.100.0-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS chef
+FROM rust:1.100.0-trixie@sha256:e84068000361bf3d4a5ba2b7647f62893528b1eb9f847d7a23b493f5ce8ea254 AS chef
 # renovate: datasource=crate depName=cargo-chef
 ARG CARGO_CHEF_VERSION=0.1.78
 RUN cargo install cargo-chef --version "${CARGO_CHEF_VERSION}" --locked
